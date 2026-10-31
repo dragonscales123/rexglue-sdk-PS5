@@ -24,8 +24,8 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
-if(APPLE)
-    # Apple's libc++ still gates std::jthread/std::stop_token behind the
+if(APPLE OR PS5)
+    # Apple's libc++ (and the PS5 SDK's libc++ 18) still gates std::jthread/std::stop_token behind the
     # experimental-library feature flag. Only timer_queue.cpp uses them, and
     # neither type crosses a header boundary.
     set_source_files_properties(timer_queue.cpp PROPERTIES
@@ -33,6 +33,12 @@ if(APPLE)
 endif()
 
 # Platform-specific sources
+if(PS5)
+    # Guest memory in direct memory (ps5platform/shm.h), not shm_open files.
+    set(REX_CORE_MEMORY_SOURCE memory_ps5.cpp)
+else()
+    set(REX_CORE_MEMORY_SOURCE memory_posix.cpp)
+endif()
 if(WIN32)
     target_sources(rexcore PRIVATE
         atomic_win.cpp
@@ -66,7 +72,7 @@ elseif(UNIX)
         fiber_posix.cpp
         mapped_memory_posix.cpp
         math_gcc.cpp
-        memory_posix.cpp
+        ${REX_CORE_MEMORY_SOURCE}
         platform/console_posix.cpp
         platform/env_posix.cpp
         seh_posix.cpp
@@ -100,6 +106,8 @@ target_include_directories(rexcore PRIVATE
 
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(PS5)
+    # libc, libkernel and pthreads come with the title's link (ps5/link-title.sh).
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()

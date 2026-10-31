@@ -36,8 +36,9 @@
 #include <pwd.h>
 
 // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
-// explicit *64 forms for legacy 32-bit off_t distributions.
-#if defined(__APPLE__)
+// explicit *64 forms for legacy 32-bit off_t distributions. FreeBSD (the PS5)
+// is like macOS here.
+#if defined(__APPLE__) || defined(__PROSPERO__)
 using rex_off64_t = off_t;
 #define rex_fseeko64 fseeko
 #define rex_ftello64 ftello
@@ -91,6 +92,9 @@ std::filesystem::path GetExecutablePath() {
   std::error_code ec;
   std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
   return ec ? std::filesystem::path(executable_path) : canonical_path;
+#elif defined(__PROSPERO__)
+  // A PS5 title runs from its folder mounted at /app0 (no /proc).
+  return std::filesystem::path("/app0/eboot.bin");
 #else
   char buff[FILENAME_MAX] = "";
   readlink("/proc/self/exe", buff, FILENAME_MAX);

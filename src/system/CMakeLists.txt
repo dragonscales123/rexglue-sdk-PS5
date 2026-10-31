@@ -48,7 +48,19 @@ set(REXSYSTEM_SOURCES
     xex_module.cpp
 )
 
-add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+if(PS5)
+    # A PS5 title is one static executable (no dynamic loader for our code).
+    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
+    # The runtime's VMA stays its own (cmake/rex_ps5_isolate_vma.cmake).
+    add_custom_command(TARGET rexruntime POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -DARCHIVE=$<TARGET_FILE:rexruntime> -DNM=${CMAKE_NM}
+                -DAR=${CMAKE_AR} -DOBJCOPY=${CMAKE_OBJCOPY}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/isolate-vma
+                -P ${REXGLUE_ROOT}/cmake/rex_ps5_isolate_vma.cmake
+        VERBATIM)
+else()
+    add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+endif()
 add_library(rex::runtime ALIAS rexruntime)
 add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)

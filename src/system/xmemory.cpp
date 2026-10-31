@@ -16,6 +16,9 @@
 #if REX_PLATFORM_MAC
 #include <sys/mman.h>
 #endif
+#if REX_PLATFORM_PS5
+#include <ps5platform/shm.h>
+#endif
 
 #include <fmt/format.h>
 
@@ -123,6 +126,12 @@ Memory::~Memory() {
   if (mapping_ != rex::memory::kFileMappingHandleInvalid) {
     UnmapViews();
     rex::memory::CloseFileMappingHandle(mapping_, file_name_);
+#if REX_PLATFORM_PS5
+    if (ps5_reserved_base_) {
+      ps5_vrange_release(ps5_reserved_base_, ps5_reserved_size_);
+      ps5_reserved_base_ = nullptr;
+    }
+#endif
     mapping_base_ = nullptr;
     mapping_ = rex::memory::kFileMappingHandleInvalid;
   }
@@ -148,7 +157,16 @@ bool Memory::Initialize() {
     return false;
   }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_PS5
+  // On the PS5, reserve the whole arena in one range first (the console grants
+  // a large reservation at its hint), then place each view in it.
+  if (MapViewsPs5()) {
+    REXSYS_ERROR("Unable to reserve and map the guest arena in direct memory.");
+    assert_always();
+    return false;
+  }
+  mapping_base_ = views_.all_views[0];
+#elif REX_PLATFORM_MAC
   // On macOS, reserve a contiguous host range first, then carve guest views
   // into it with MAP_SHARED|MAP_FIXED so all views share the same backing fd.
   if (MapViewsMac()) {
@@ -357,6 +375,45 @@ int Memory::MapViewsMac() {
   return 0;
 }
 #endif  // REX_PLATFORM_MAC
+
+#if REX_PLATFORM_PS5
+int Memory::MapViewsPs5() {
+  assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+  const size_t total_size =
+      static_cast<size_t>(map_info[rex::countof(map_info) - 1].virtual_address_end -
+                          map_info[0].virtual_address_start + 1);
+  // 0x10_0000_0000 is where the Lost Odyssey port's 4 GiB arena landed; any
+  // base works, the guest only ever sees offsets.
+  void* reserved = nullptr;
+  int rc = ps5_vrange_reserve(total_size, reinterpret_cast<void*>(0x1000000000ull),
+                              system_allocation_granularity_, &reserved);
+  if (rc != 0 || !reserved) {
+    REXSYS_ERROR("MapViewsPs5: reserving 0x{:X} bytes failed: 0x{:08X}", total_size,
+                 uint32_t(rc));
+    return 1;
+  }
+  ps5_reserved_base_ = reserved;
+  ps5_reserved_size_ = total_size;
+  auto* mapping_base = static_cast<uint8_t*>(reserved);
+  const uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+  for (size_t n = 0; n < rex::countof(map_info); n++) {
+    views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
+        mapping_, mapping_base + map_info[n].virtual_address_start,
+        map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1,
+        rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
+    if (!views_.all_views[n]) {
+      REXSYS_ERROR("MapViewsPs5: view {} (guest 0x{:X}) failed", n,
+                   map_info[n].virtual_address_start);
+      UnmapViews();
+      ps5_vrange_release(ps5_reserved_base_, ps5_reserved_size_);
+      ps5_reserved_base_ = nullptr;
+      return 1;
+    }
+  }
+  REXSYS_INFO("Guest arena: 0x{:X} bytes reserved at {} (direct memory)", total_size, reserved);
+  return 0;
+}
+#endif  // REX_PLATFORM_PS5
 
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));

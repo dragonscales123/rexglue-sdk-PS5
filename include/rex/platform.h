@@ -32,6 +32,10 @@
 #define REX_PLATFORM_MAC 1
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
+#elif defined(__PROSPERO__)
+// PlayStation 5 homebrew, PS5 payload SDK (FreeBSD-derived libc, static title,
+// 16 KiB pages, direct memory). POSIX where its libc has it; see docs/PS5.md.
+#define REX_PLATFORM_PS5 1
 #elif defined(__ANDROID__)
 #define REX_PLATFORM_ANDROID 1
 #define REX_PLATFORM_LINUX 1
@@ -59,6 +63,17 @@
 #ifndef REX_PLATFORM_LINUX
 #define REX_PLATFORM_LINUX 0
 #endif
+#ifndef REX_PLATFORM_PS5
+#define REX_PLATFORM_PS5 0
+#endif
+
+// The POSIX sources (*_posix.cpp) serve Linux, macOS and the PS5.
+#define REX_PLATFORM_POSIX (REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5)
+
+// libc++ without floating-point std::from_chars or std::chrono::clock_cast, and
+// with std::jthread behind -fexperimental-library: Apple's, and the PS5 payload
+// SDK's (LLVM 18).
+#define REX_LIBCXX_LIMITED (REX_PLATFORM_MAC || REX_PLATFORM_PS5)
 
 #if defined(__clang__)
 #define REX_COMPILER_CLANG 1

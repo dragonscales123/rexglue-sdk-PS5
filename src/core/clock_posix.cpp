@@ -10,12 +10,18 @@
 #include <rex/chrono/clock.h>
 #include <rex/platform.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 
 #include <sys/time.h>
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#endif
+
+// FreeBSD (the PS5) has no CLOCK_MONOTONIC_RAW; its CLOCK_MONOTONIC is not
+// slewed by NTP either.
+#if defined(__PROSPERO__) && !defined(CLOCK_MONOTONIC_RAW)
+#define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
 #endif
 
 namespace rex::chrono {

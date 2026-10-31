@@ -38,8 +38,9 @@ namespace rex::memory::detail {
 ///   - macOS arm64:    16KB granularity  -> offset
 ///   - macOS x86_64:    4KB granularity  -> no offset
 ///   - Linux (any):     4KB granularity  -> no offset (mmap handles it natively)
+///   - PS5:            64KB granularity  -> offset (direct-memory units)
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_PS5 || (REX_PLATFORM_MAC && defined(__aarch64__))
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;
@@ -560,6 +561,11 @@ class Memory {
  private:
 #if REX_PLATFORM_MAC
   int MapViewsMac();
+#endif
+#if REX_PLATFORM_PS5
+  int MapViewsPs5();
+  void* ps5_reserved_base_ = nullptr;
+  size_t ps5_reserved_size_ = 0;
 #endif
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();

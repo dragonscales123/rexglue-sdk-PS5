@@ -72,6 +72,10 @@ elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_mac.cpp
     )
+elseif(PS5)
+    # No window system: the title presents through VK_KHR_display (SDL's PS5
+    # video driver), and the game renders and presents itself.
+    set(REXUI_PLATFORM_SOURCES)
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -146,7 +150,7 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 # Platform-specific dependencies
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT PS5)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every

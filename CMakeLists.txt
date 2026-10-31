@@ -162,6 +162,11 @@ if(WIN32)
         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+elseif(PS5)
+    # PS5 payload SDK toolchain (toolchain/prospero.cmake): CMAKE_SYSTEM_NAME is
+    # FreeBSD, so this has to come before the generic UNIX branch.
+    set(REX_PLATFORM "ps5-amd64")
+    add_compile_definitions(REX_PLATFORM_PS5=1)
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
@@ -264,8 +269,20 @@ add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
-add_subdirectory(src/codegen)
-add_subdirectory(src/rexglue)
+if(PS5)
+    # The recompiler runs on the build host, never on the console: a cross
+    # build imports the host's rexglue (built from this same tree) instead.
+    set(REXGLUE_HOST_TOOL "" CACHE FILEPATH "Host-built rexglue for a PS5 cross build")
+    if(NOT REXGLUE_HOST_TOOL)
+        message(FATAL_ERROR "PS5 build: set REXGLUE_HOST_TOOL to a host rexglue built from this tree")
+    endif()
+    add_executable(rexglue IMPORTED GLOBAL)
+    set_target_properties(rexglue PROPERTIES IMPORTED_LOCATION "${REXGLUE_HOST_TOOL}")
+    add_executable(rex::rexglue ALIAS rexglue)
+else()
+    add_subdirectory(src/codegen)
+    add_subdirectory(src/rexglue)
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)
@@ -293,7 +310,10 @@ message(STATUS "===========================================")
 include(cmake/rexglue_export_targets.cmake)
 
 # SDK install/export rules (skipped when consumed as a subdirectory)
-if(PROJECT_IS_TOP_LEVEL)
+if(PROJECT_IS_TOP_LEVEL AND PS5)
+    # A PS5 tree is only ever consumed as a subdirectory of a title; built on
+    # its own it just compiles the libraries (no install or package export).
+elseif(PROJECT_IS_TOP_LEVEL)
     include(cmake/rexglue_devenv.cmake)
     include(cmake/rexglue_install.cmake)
 else()

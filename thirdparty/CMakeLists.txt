@@ -290,7 +290,18 @@ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux video and audio backends. Both video drivers are always built so the
 # one in use stays a runtime choice.
-if(UNIX AND NOT APPLE)
+if(PS5)
+    # SDL's PS5 backends (tools/patches/sdl-ps5.patch): the console's display
+    # through the linked RADV (Vulkan, VK_KHR_display), scePad, sceAudioOut.
+    # Nothing of a desktop Unix exists on the console (as the Lost Odyssey port).
+    foreach(_rex_sdl_off SDL_X11 SDL_WAYLAND SDL_KMSDRM SDL_OPENGL SDL_OPENGLES SDL_HIDAPI SDL_DBUS
+            SDL_IBUS SDL_PIPEWIRE SDL_PULSEAUDIO SDL_ALSA SDL_JACK SDL_SNDIO SDL_OSS SDL_LIBUDEV
+            SDL_CAMERA SDL_DIALOG SDL_SENSOR SDL_HAPTIC SDL_POWER SDL_TRAY SDL_LIBURING
+            SDL_DLOPEN_NOTES SDL_DISKAUDIO SDL_DUMMYAUDIO SDL_DUMMYVIDEO SDL_OFFSCREEN SDL_INSTALL)
+        set(${_rex_sdl_off} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+elseif(UNIX AND NOT APPLE)
     set(SDL_X11               ON  CACHE BOOL "" FORCE)
     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)

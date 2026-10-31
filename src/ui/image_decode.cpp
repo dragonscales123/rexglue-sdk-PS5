@@ -8,8 +8,14 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */
+#include <rex/platform.h>
 #include <rex/ui/image_decode.h>
 
+#if REX_PLATFORM_PS5
+// A PS5 title links statically, and the title may compile stb_image itself
+// (re:Blue does): keep this copy private to the runtime's decoder.
+#define STB_IMAGE_STATIC
+#endif
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
 #define STBI_ONLY_PNG

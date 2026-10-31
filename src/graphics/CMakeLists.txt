@@ -98,6 +98,11 @@ endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+if(PS5)
+    # A loadable GPU plugin has no place in a static PS5 title; titles there
+    # render themselves (re:Blue through plume).
+    set_target_properties(rexgpu-xenos PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
 
 set_target_properties(rexgpu-xenos PROPERTIES
     EXPORT_NAME gpu-xenos

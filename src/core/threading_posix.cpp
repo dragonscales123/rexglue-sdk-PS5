@@ -9,7 +9,7 @@
 #include <rex/platform.h>
 #include <rex/thread.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 
 #include <signal.h>
 
@@ -41,6 +41,12 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <rex/thread/timer_queue.h>
 
 #include <sched.h>
+
+#if REX_PLATFORM_PS5
+// FreeBSD spells the Linux _np thread calls its own way.
+#include <pthread_np.h>
+#include <sys/cpuset.h>
+#endif
 
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
@@ -115,7 +121,7 @@ enum class SignalType {
 };
 
 int GetSystemSignal(SignalType num) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_PS5
   // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
   // signals onto the two user-defined signals.
   switch (num) {
@@ -135,7 +141,7 @@ int GetSystemSignal(SignalType num) {
 }
 
 SignalType GetSystemSignalType(int num) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_PS5
   switch (num) {
     case SIGUSR1:
       return SignalType::kThreadSuspend;
@@ -178,6 +184,8 @@ void EnableAffinityConfiguration() {}
 uint32_t current_thread_system_id() {
 #if defined(__APPLE__)
   return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+#elif REX_PLATFORM_PS5
+  return static_cast<uint32_t>(pthread_getthreadid_np());
 #else
   return static_cast<uint32_t>(syscall(SYS_gettid));
 #endif
@@ -718,6 +726,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
         std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
         rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
       }
+#elif REX_PLATFORM_PS5
+      pthread_get_name_np(thread_, result.data(), result.size() - 1);
 #else
       if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
         assert_always();
@@ -736,6 +746,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
       if (pthread_equal(thread_, pthread_self())) {
         pthread_setname_np(std::string(name).c_str());
       }
+#elif REX_PLATFORM_PS5
+      pthread_set_name_np(thread_, std::string(name).c_str());
 #else
       pthread_setname_np(thread_, std::string(name).c_str());
 #endif
@@ -758,6 +770,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
 #if defined(__APPLE__)
   uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
+#elif REX_PLATFORM_PS5
+  // pthread_t is a pointer on FreeBSD; its low bits identify the thread well
+  // enough for logs and the guest's thread ids.
+  uint32_t system_id() const { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thread_)); }
 #else
   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
 #endif
@@ -772,6 +788,19 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return std::numeric_limits<uint64_t>::max();
     }
     return (uint64_t(1) << cpu_count) - 1;
+#elif REX_PLATFORM_PS5
+    cpuset_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    if (pthread_getaffinity_np(thread_, sizeof(cpu_set), &cpu_set) != 0) {
+      return (uint64_t(1) << std::min<uint32_t>(logical_processor_count(), 63)) - 1;
+    }
+    uint64_t result = 0;
+    for (auto i = 0u; i < 64 && i < CPU_SETSIZE; i++) {
+      if (CPU_ISSET(i, &cpu_set)) {
+        result |= 1ULL << i;
+      }
+    }
+    return result;
 #else
     cpu_set_t cpu_set;
 #if REX_PLATFORM_ANDROID
@@ -799,6 +828,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
     // no-op so higher layers can build and run.
     (void)mask;
+#elif REX_PLATFORM_PS5
+    cpuset_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    for (auto i = 0u; i < 64 && i < CPU_SETSIZE; i++) {
+      if (mask & (1ULL << i)) {
+        CPU_SET(i, &cpu_set);
+      }
+    }
+    pthread_setaffinity_np(thread_, sizeof(cpu_set), &cpu_set);
 #else
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
@@ -868,7 +906,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || REX_PLATFORM_PS5
     // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
     // without the sigval payload.
     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
@@ -1511,6 +1549,8 @@ void Thread::Exit(int exit_code) {
 void set_current_thread_name(const std::string_view name) {
 #if defined(__APPLE__)
   pthread_setname_np(std::string(name).c_str());
+#elif REX_PLATFORM_PS5
+  pthread_set_name_np(pthread_self(), std::string(name).c_str());
 #else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
 #endif

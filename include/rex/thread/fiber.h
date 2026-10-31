@@ -14,7 +14,10 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_PS5
+#include <cstdint>
+#include <vector>
+#elif REX_PLATFORM_POSIX
 #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
 // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
 // before including <ucontext.h>.
@@ -56,7 +59,18 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#elif REX_PLATFORM_PS5
+  // The console's getcontext() writes a larger context than the SDK's
+  // ucontext_t declares, so fibers switch with a small routine of their own
+  // (fiber_posix.cpp) and keep only the suspended stack pointer.
+  void* sp_ = nullptr;
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+
+  static void Trampoline();
+#elif REX_PLATFORM_POSIX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;
