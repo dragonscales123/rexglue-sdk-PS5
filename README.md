@@ -1,21 +1,3 @@
-> [!CAUTION]
-> This project is in early development. Expect things to not work quite right and there to be significant changes and breaking public API updates as development progresses. Contributions and feedback are welcome, but please be aware that the codebase is still evolving rapidly.
-
-<h1 align="center">
-  <br>
-  <a href="https://github.com/rexglue/rexglue-sdk">
-    <img src="https://github.com/rexglue/rexglue-media/blob/main/ReX_Banner.png" alt="ReXGlue banner">
-  </a>
-  <br>
-  <br>
-  <a href="https://discord.gg/CNTxwSNZfT">
-    <img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white" alt="Discord">
-  </a>
-  <a href="https://github.com/rexglue/rexglue-sdk/stargazers">
-    <img src="https://img.shields.io/github/stars/rexglue/rexglue-sdk" alt="rexglue-sdk stargazers">
-  </a>
-</h1>
-
 ReXGlue converts Xbox 360 PowerPC code into portable C++ that runs natively on modern platforms.
 
 ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia-project), the Xbox 360 emulator. Rather than interpreting or JIT-compiling PPC instructions at runtime, ReXGlue takes a different path: it generates C++ source code ahead of time, an approach inspired by [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and [rexdex's recompiler](https://github.com/rexdex/recompiler).
