@@ -22,6 +22,43 @@ ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia
 
 Latest SDK builds and releases are published on [GitHub Releases](https://github.com/rexglue/rexglue-sdk/releases). Join the [Discord server](https://discord.gg/CNTxwSNZfT) for updates and share what you have created.
 
+## PS5 port (this branch)
+
+> [!NOTE]
+> This is the `ps5-port` branch of a fork. It adds a PS5 (homebrew) target to ReXGlue: titles built on it run natively on a jailbroken PS5, rendering through Vulkan on Mesa's RADV. It is unofficial and not supported by the ReXGlue team. The first title on it is [re:Blue PS5](https://github.com/dragonscales123/rebluePS5/tree/ps5-port) (Blue Dragon), which plays through its first disc.
+
+### What changed
+
+**Platform**
+- `REX_PLATFORM_PS5` (from prospero clang's `__PROSPERO__`) and `REX_PLATFORM_POSIX`, which Linux, macOS and the PS5 share, in `include/rex/platform.h`. CMake's `elseif(PS5)` branch sets the `ps5-amd64` platform.
+- The runtime builds as a static library: a PS5 title is one executable.
+- The code generator never runs on the console. A cross build imports a host-built `rexglue` through `REXGLUE_HOST_TOOL`.
+
+**Guest memory** (`src/core/memory_ps5.cpp`, `Memory::MapViewsPs5` in `src/system/xmemory.cpp`)
+- One direct-memory arena, reserved at `0x1000000000`, backs the 4 GiB guest space and its physical views. They're mapped at fixed addresses with 64 KiB allocation granularity, and page protection is tracked in a shadow table.
+
+**Exceptions, threads, clocks** (`*_posix.cpp`)
+- The MMIO and fault handler reads FreeBSD's `mcontext` (the `mc_*` registers, with XMM state in the FXSAVE area) and also handles SIGBUS.
+- Threads use `pthread_set_name_np`, `cpuset_t` affinity and SIGUSR1/SIGUSR2.
+
+**Fibers** (`src/core/fiber_posix.cpp`, `include/rex/thread/fiber.h`)
+- The console's `getcontext()` writes a larger context than the SDK's `ucontext_t` declares. That overran every thread's `Fiber` object and corrupted the heap at boot.
+- On PS5, fibers switch with their own small routine instead (`rex_ps5_fiber_switch`). It saves the callee-saved registers, MXCSR and the x87 control word on the fiber's stack, and doesn't use ucontext at all.
+
+**Physical-heap host offset** (`resources/templates/codegen/pch_h.inja`)
+- With allocation granularity above 4 KiB, guest addresses at `0xE0000000` and up sit `0x1000` higher in host memory. The runtime (`PhysicalHostOffset`) applied this on PS5, but the codegen template only enabled it for Windows and Apple arm64. Recompiled code therefore read the kernel's writes into that heap 4 KiB away.
+- In re:Blue this showed up as XMA contexts reading back as null and the audio mixer storing to address 0. The template now enables the offset on PS5. Any game must be regenerated after this change: the template isn't part of codegen's input fingerprint.
+
+**Libraries**
+- The SDK's VulkanMemoryAllocator is renamed to `rexsdk_*` in the static runtime (`cmake/rex_ps5_isolate_vma.cmake`), so it doesn't collide with an application's own VMA.
+- SDL3 and FFmpeg build for the PS5 with `tools/patches/sdl-ps5.patch` and `tools/patches/ffmpeg-ps5.patch`. The submodules point at upstream, so apply the patches to them before building.
+- The UI builds without X11 or Wayland. RenderDoc is off. `stb_image` is static, so it doesn't clash with a title's copy.
+- Smaller fixes: libc++ 18 gaps, endianness in `sha256.cpp`, the executable path (`/app0/eboot.bin`), and dynamic library names.
+
+### Building a title on it
+
+You need mihawk-99's [PS5_PayloadSDK](https://github.com/mihawk-99/PS5_PayloadSDK) and [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) (RADV), and clang/lld 20. The SDK is consumed as a subdirectory of the title, configured with the payload SDK's `toolchain/prospero.cmake` and `-DREXGLUE_HOST_TOOL=<host rexglue>`. [re:Blue PS5's `ps5/build.sh`](https://github.com/dragonscales123/rebluePS5/blob/ps5-port/ps5/build.sh) and [`docs/PS5.md`](https://github.com/dragonscales123/rebluePS5/blob/ps5-port/docs/PS5.md) are a complete example: host tools, shader cache, codegen, link and packaging.
+
 ## Builds
 
 | Channel | CI | Download |
