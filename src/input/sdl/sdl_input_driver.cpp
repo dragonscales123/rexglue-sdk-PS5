@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <string_view>
 
+#include <rex/platform.h>
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -222,8 +223,14 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
         if (!std::filesystem::exists(mappings_path)) {
+#if REX_PLATFORM_PS5
+          // The DualSense is built into SDL's mappings; an extra file is
+          // optional on the console.
+          REXLOG_DEBUG("SDL GameControllerDB: no file '{}'.", REXCVAR_GET(hid_mappings_file));
+#else
           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
                       REXCVAR_GET(hid_mappings_file));
+#endif
         } else {
           auto mappings_result =
               SDL_AddGamepadMappingsFromFile(REXCVAR_GET(hid_mappings_file).c_str());
