@@ -104,6 +104,16 @@ if(PS5)
     # themselves (re:Blue through plume) don't ask, and don't build it.
     add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
     set_target_properties(rexgpu-xenos PROPERTIES EXCLUDE_FROM_ALL ON)
+    # The runtime renames its VMA rexsdk_* (cmake/rex_ps5_isolate_vma.cmake);
+    # the Vulkan backend calls it, so its references take the same names.
+    add_dependencies(rexgpu-xenos rexruntime)
+    add_custom_command(TARGET rexgpu-xenos POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -DARCHIVE=$<TARGET_FILE:rexruntime> -DNM=${CMAKE_NM}
+                -DAR=${CMAKE_AR} -DOBJCOPY=${CMAKE_OBJCOPY}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/isolate-vma
+                -DALSO=$<TARGET_FILE:rexgpu-xenos>
+                -P ${REXGLUE_ROOT}/cmake/rex_ps5_isolate_vma.cmake
+        VERBATIM)
 else()
     add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 endif()

@@ -1,5 +1,10 @@
 # cmake -P rex_ps5_isolate_vma.cmake -DARCHIVE=<librexruntime.a> -DNM=<llvm-nm>
-#        -DAR=<llvm-ar> -DOBJCOPY=<llvm-objcopy> -DWORK=<dir>
+#        -DAR=<llvm-ar> -DOBJCOPY=<llvm-objcopy> -DWORK=<dir> [-DALSO=<archive;...>]
+#
+# ALSO: other SDK archives that call the runtime's VMA (librexgpu-xenos.a, the
+# Xenos GPU's Vulkan backend). They get the same renames, so their calls reach
+# the renamed definitions. The map is taken from the runtime's VMA unit each
+# time, renamed or not, so the step can run again for either archive.
 #
 # PS5 only. On the desktop the runtime is a shared library, so its own copy of
 # the Vulkan Memory Allocator (src/ui/vulkan/vulkan_mem_alloc.cpp, VMA 3.3) stays
@@ -45,19 +50,32 @@ foreach(line IN LISTS lines)
     if(line MATCHES "^[0-9a-fA-F]+ [A-Za-z] (.+)$")
         set(name "${CMAKE_MATCH_1}")
         string(TOLOWER "${name}" lower)
-        if(lower MATCHES "vma" AND NOT name MATCHES "^rexsdk_")
+        if(lower MATCHES "vma")
+            if(name MATCHES "^rexsdk_(.+)$")
+                set(name "${CMAKE_MATCH_1}") # this archive is already renamed
+            else()
+                set(runtime_needs_rename TRUE)
+            endif()
             string(APPEND map "${name} rexsdk_${name}\n")
             math(EXPR count "${count} + 1")
         endif()
     endif()
 endforeach()
 if(count EQUAL 0)
-    return() # already renamed
+    return()
 endif()
 file(WRITE "${WORK}/redefine.txt" "${map}")
-execute_process(COMMAND "${OBJCOPY}" "--redefine-syms=${WORK}/redefine.txt" "${ARCHIVE}"
-    RESULT_VARIABLE rc)
-if(NOT rc EQUAL 0)
-    message(FATAL_ERROR "rex_ps5_isolate_vma: renaming in ${ARCHIVE} failed")
+set(targets "")
+if(runtime_needs_rename)
+    list(APPEND targets "${ARCHIVE}")
 endif()
-message(STATUS "rex_ps5_isolate_vma: ${count} VMA symbols kept private to ${ARCHIVE}")
+list(APPEND targets ${ALSO})
+foreach(archive IN LISTS targets)
+    # A name that an archive neither defines nor uses is left alone.
+    execute_process(COMMAND "${OBJCOPY}" "--redefine-syms=${WORK}/redefine.txt" "${archive}"
+        RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR "rex_ps5_isolate_vma: renaming in ${archive} failed")
+    endif()
+    message(STATUS "rex_ps5_isolate_vma: ${count} VMA symbols kept private to ${archive}")
+endforeach()
