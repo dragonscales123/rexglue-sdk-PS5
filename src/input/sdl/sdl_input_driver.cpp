@@ -14,11 +14,13 @@
 #include <cctype>
 #include <filesystem>
 #include <string_view>
+#include <system_error>
 
 #include <rex/platform.h>
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
@@ -222,7 +224,17 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
-        if (!std::filesystem::exists(mappings_path)) {
+#if REX_PLATFORM_PS5
+        // A title has no working directory: stat() of a relative path fails
+        // with EINVAL, so the default name is looked for in the title folder.
+        if (mappings_path.is_relative()) {
+          mappings_path = rex::filesystem::GetExecutableFolder() / mappings_path;
+        }
+#endif
+        // The non-throwing form: an unusable path is a missing file, not an
+        // uncaught filesystem_error at startup.
+        std::error_code exists_error;
+        if (!std::filesystem::exists(mappings_path, exists_error)) {
 #if REX_PLATFORM_PS5
           // The DualSense is built into SDL's mappings; an extra file is
           // optional on the console.
@@ -233,7 +245,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 #endif
         } else {
           auto mappings_result =
-              SDL_AddGamepadMappingsFromFile(REXCVAR_GET(hid_mappings_file).c_str());
+              SDL_AddGamepadMappingsFromFile(mappings_path.string().c_str());
           if (mappings_result < 0) {
             REXLOG_ERROR("SDL GameControllerDB: error loading file '{}': {}.",
                          REXCVAR_GET(hid_mappings_file), SDL_GetError());
