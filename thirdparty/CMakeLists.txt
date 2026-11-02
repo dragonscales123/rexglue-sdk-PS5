@@ -32,7 +32,6 @@ endif()
 #=============================================================================
 set(REQUIRED_SUBMODULES
     cli11
-    libmspack
     FFmpeg
     tomlplusplus
     simde

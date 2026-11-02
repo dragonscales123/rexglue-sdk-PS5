@@ -64,12 +64,15 @@ inline AppNameParts parse_app_name(const std::string& input) {
 
   bool at_new_word = true;
   for (char c : input) {
+    // The original name is the name as given, separators included: it names
+    // the project's files and targets (fable_2_manifest.toml, fable_2_pch.h,
+    // fable_2_codegen), which an existing project already has.
+    parts.original += c;
     if (is_separator(c)) {
       at_new_word = true;
       continue;
     }
 
-    parts.original += c;
     parts.upper_case += to_upper(c);
     parts.pascal_case += at_new_word ? to_upper(c) : to_lower(c);
 
