@@ -27,6 +27,10 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_upload_first, false, "GPU/Vulkan",
+                    "Upload shared memory pages not yet accessed by the GPU in the current "
+                    "submission at its beginning instead of interrupting the render pass");
+
 namespace rex::graphics::vulkan {
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
@@ -161,6 +165,9 @@ bool VulkanSharedMemory::Initialize() {
   last_usage_ = Usage::kTransferDestination;
   last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
 
+  submission_accessed_pages_.assign(((kBufferSize >> page_size_log2()) + 63) >> 6, 0);
+  upload_first_used_ = false;
+
   upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
       rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
@@ -195,6 +202,35 @@ void VulkanSharedMemory::CompletedSubmissionUpdated() {
 
 void VulkanSharedMemory::EndSubmission() {
   upload_buffer_pool_->FlushWrites();
+  if (upload_first_used_) {
+    // Make the uploads done before the rest of the submission visible to it.
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    GetAllUsagesMasks(stage_mask, access_mask);
+    VkBufferMemoryBarrier barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                     nullptr,
+                                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     access_mask,
+                                     VK_QUEUE_FAMILY_IGNORED,
+                                     VK_QUEUE_FAMILY_IGNORED,
+                                     buffer_,
+                                     0,
+                                     VK_WHOLE_SIZE};
+    command_processor_.upload_command_buffer().CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, stage_mask, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+    upload_first_used_ = false;
+  }
+  std::fill(submission_accessed_pages_.begin(), submission_accessed_pages_.end(), 0);
+}
+
+void VulkanSharedMemory::RangeAccessedByGpu(uint32_t start, uint32_t length) {
+  if (!length || submission_accessed_pages_.empty()) {
+    return;
+  }
+  uint32_t page_last = (start + length - 1) >> page_size_log2();
+  for (uint32_t page = start >> page_size_log2(); page <= page_last; ++page) {
+    submission_accessed_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+  }
 }
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
@@ -273,15 +309,52 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  // Pages that no command in the current submission has accessed yet can be
+  // uploaded before all of them, in the upload command buffer, without ending
+  // the render pass. Pages already accessed (rewritten by the guest between
+  // two draws, for instance) must be uploaded in order.
+  bool upload_first = REXCVAR_GET(vulkan_shared_memory_upload_first);
+  for (auto upload_range : upload_page_ranges) {
+    for (uint32_t page = upload_range.first;
+         upload_first && page < upload_range.first + upload_range.second; ++page) {
+      upload_first = !(submission_accessed_pages_[page >> 6] & (uint64_t(1) << (page & 63)));
+    }
+  }
+  DeferredCommandBuffer* command_buffer_ptr;
+  if (upload_first) {
+    command_buffer_ptr = &command_processor_.upload_command_buffer();
+    if (!upload_first_used_) {
+      // Order the uploads after the accesses in the previous submissions. The
+      // usage tracking (Use) is only for the main command buffer, and the
+      // barrier in EndSubmission leaves the buffer readable and writable.
+      upload_first_used_ = true;
+      VkPipelineStageFlags stage_mask;
+      VkAccessFlags access_mask;
+      GetAllUsagesMasks(stage_mask, access_mask);
+      VkBufferMemoryBarrier barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                       nullptr,
+                                       VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_QUEUE_FAMILY_IGNORED,
+                                       VK_QUEUE_FAMILY_IGNORED,
+                                       buffer_,
+                                       0,
+                                       VK_WHOLE_SIZE};
+      command_buffer_ptr->CmdVkPipelineBarrier(stage_mask, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                               nullptr, 1, &barrier, 0, nullptr);
+    }
+  } else {
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+    command_buffer_ptr = &command_processor_.deferred_command_buffer();
+  }
+  DeferredCommandBuffer& command_buffer = *command_buffer_ptr;
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();
@@ -330,6 +403,20 @@ bool VulkanSharedMemory::UploadRanges(
     upload_regions_.clear();
   }
   return successful;
+}
+
+void VulkanSharedMemory::GetAllUsagesMasks(VkPipelineStageFlags& stage_mask,
+                                           VkAccessFlags& access_mask) const {
+  stage_mask = 0;
+  access_mask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  for (Usage usage : {Usage::kRead, Usage::kGuestDrawReadWrite, Usage::kComputeWrite,
+                      Usage::kTransferDestination}) {
+    VkPipelineStageFlags usage_stage_mask;
+    VkAccessFlags usage_access_mask;
+    GetUsageMasks(usage, usage_stage_mask, usage_access_mask);
+    stage_mask |= usage_stage_mask;
+    access_mask |= usage_access_mask;
+  }
 }
 
 void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,

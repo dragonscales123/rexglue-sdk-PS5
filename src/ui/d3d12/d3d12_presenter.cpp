@@ -1147,6 +1147,22 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
+  if (!VsyncPresentGateAllows()) {
+    // A frame was already presented on this host vblank (the `vsync` cvar is
+    // enabled). Skip this present: the swap chain keeps showing the last
+    // presented frame until the next paint presents the fresh content, which
+    // happens on the next vblank at the latest while any UI drawer is active
+    // (the continuous UI repaint is requested after every draw). This keeps
+    // the host present rate capped at the monitor refresh rate.
+    return PaintResult::kPresented;
+  }
+  if (!GuestVblankPaceAllows()) {
+    // The `pace_to_guest_vblank` cvar is enabled: at most one present per
+    // guest-refresh interval, so the game runs at its native guest vblank
+    // framerate. The swap chain keeps showing the last presented frame until
+    // the next allowed present.
+    return PaintResult::kPresented;
+  }
   // Present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
@@ -1162,6 +1178,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+  if (SUCCEEDED(present_result)) {
+    VsyncPresentGateNotePresent();
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;

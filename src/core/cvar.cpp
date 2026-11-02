@@ -14,8 +14,12 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <CLI/CLI.hpp>
 
@@ -53,6 +57,38 @@ std::vector<FlagEntry>& GetRegistryStorage() {
 std::unordered_map<std::string, size_t>& GetRegistryIndex() {
   static std::unordered_map<std::string, size_t> index;
   return index;
+}
+
+// Serialize a string cvar value as a TOML value. Let toml++ choose the
+// representation and do the escaping for us (it uses a literal '...' string
+// for values like Windows paths, e.g. 'X:\\Game', and a basic "..." string
+// otherwise). Writing the value raw instead would produce invalid TOML that
+// toml++ rejects on the next LoadConfig, silently discarding the whole file
+// and reverting the game to stock defaults.
+std::string FormatTomlString(std::string_view value) {
+  std::ostringstream oss;
+  toml::value v = toml::value<std::string>(std::string(value));
+  oss << v;
+  return oss.str();
+}
+
+// Format a parsed TOML scalar node back into its TOML literal form so an
+// existing config key that the cvar registry does not own can be written back
+// verbatim when saving. Returns an empty string for unsupported types.
+std::string FormatTomlNode(const toml::node& value) {
+  if (value.is_boolean()) {
+    return value.as_boolean()->get() ? "true" : "false";
+  }
+  if (value.is_integer()) {
+    return std::to_string(value.as_integer()->get());
+  }
+  if (value.is_floating_point()) {
+    return std::to_string(value.as_floating_point()->get());
+  }
+  if (value.is_string()) {
+    return FormatTomlString(value.as_string()->get());
+  }
+  return std::string();
 }
 
 // Values that arrived before their cvar was registered; runtime-loaded
@@ -535,13 +571,20 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
-std::string SerializeToTOML() {
+// Serialize the cvar registry to TOML. When `preserve_keys` is non-null, the
+// listed cvars are written even if they are currently at their default value.
+// SaveConfig uses this to keep keys that an external config file (for example
+// one written by the launcher) already had, so saving from the in-game menu
+// does not silently drop them.
+std::string SerializeCvars(const std::set<std::string>* preserve_keys) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
-    if (entry.getter() != entry.default_value) {
+    const bool preserved =
+        preserve_keys != nullptr && preserve_keys->count(entry.name) != 0;
+    if (entry.getter() != entry.default_value || preserved) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + FormatTomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -550,13 +593,17 @@ std::string SerializeToTOML() {
   return result;
 }
 
+std::string SerializeToTOML() {
+  return SerializeCvars(nullptr);
+}
+
 std::string SerializeToTOML(std::string_view category) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.category == category && entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + FormatTomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -691,9 +738,39 @@ bool IsFinalized() {
 }
 
 void SaveConfig(const std::filesystem::path& config_path) {
-  std::string content = SerializeToTOML();
+  // Preserve keys from the existing config file so saving here does not drop
+  // cvars that are currently at their default value (for example ones written
+  // by the launcher) and does not discard keys the registry does not own.
+  std::set<std::string> preserve_keys;
+  std::vector<std::pair<std::string, std::string>> preserved_unknowns;
+  if (std::filesystem::exists(config_path)) {
+    try {
+      for (const auto& [key, value] : toml::parse_file(config_path.string())) {
+        if (value.is_table()) {
+          continue;  // leave TOML sections as-is; only scalar cvars are merged
+        }
+        const std::string name(key);
+        preserve_keys.insert(name);
+        std::lock_guard lock(GetRegistryMutex());
+        if (GetRegistryIndex().find(name) == GetRegistryIndex().end()) {
+          const std::string value_text = FormatTomlNode(value);
+          if (!value_text.empty()) {
+            preserved_unknowns.emplace_back(name, value_text);
+          }
+        }
+      }
+    } catch (const toml::parse_error&) {
+      // An unparseable existing config is not preserved.
+    }
+  }
+
+  std::string content = SerializeCvars(&preserve_keys);
+  for (const auto& [name, text] : preserved_unknowns) {
+    content += name + " = " + text + "\n";
+  }
+
   if (content.empty()) {
-    REXLOG_DEBUG("SaveConfig: no modified flags to save");
+    REXLOG_DEBUG("SaveConfig: no flags to save");
     return;
   }
 

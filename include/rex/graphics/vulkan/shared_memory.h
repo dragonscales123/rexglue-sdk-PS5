@@ -54,10 +54,13 @@ class VulkanSharedMemory : public SharedMemory {
                                         uint32_t length_allocations) override;
 
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  void RangeAccessedByGpu(uint32_t start, uint32_t length) override;
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
+  // Stages and accesses of every usage, including writes.
+  void GetAllUsagesMasks(VkPipelineStageFlags& stage_mask, VkAccessFlags& access_mask) const;
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
@@ -72,6 +75,12 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+
+  // Pages requested or written by the GPU in the current submission. Pages not
+  // in it are uploaded in the command processor's upload command buffer,
+  // executed before the rest of the submission, without ending the render pass.
+  std::vector<uint64_t> submission_accessed_pages_;
+  bool upload_first_used_ = false;
 };
 
 }  // namespace rex::graphics::vulkan

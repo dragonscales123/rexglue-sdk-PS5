@@ -1529,6 +1529,31 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  // Present gates. Vsync present gate (see Presenter::VsyncPresentGateAllows):
+  // when the `vsync` cvar is enabled, at most one present into the swapchain
+  // is allowed per host vblank. Guest vblank pacer (see
+  // Presenter::GuestVblankPaceAllows): when the `pace_to_guest_vblank` cvar is
+  // enabled, at most one present per guest frame, so the game runs at its
+  // native guest vblank framerate. Decide before acquiring a swapchain image:
+  // an acquired image only goes back to the presentation engine by being
+  // presented, so skipping the present after the acquire leaks one image per
+  // suppressed paint, until every acquire fails and the window stops updating.
+  const bool vsync_gate_allows = VsyncPresentGateAllows();
+  if (!vsync_gate_allows || !GuestVblankPaceAllows()) {
+    // The UI drawers that would have requested the next paint don't run this
+    // time. Keep the continuous UI repaint going only for the vsync gate (the
+    // next host vblank lets it through); a pacer-suppressed paint is requested
+    // again by RefreshGuestOutput when the next guest frame lands. Requesting
+    // it here spins the UI thread where no vblank tick throttles paints
+    // (everything but Win32).
+    if (execute_ui_drawers && !vsync_gate_allows) {
+      RequestUIPaintFromUIThread();
+    }
+    // The swapchain keeps showing the last presented image until a later
+    // paint presents the fresh content.
+    return PaintResult::kPresented;
+  }
+
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
@@ -1840,6 +1865,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
+            } else {
+              // Remember the format, or the check above recreates the pipeline
+              // (after a full GPU wait) on every paint.
+              swapchain_effect_pipeline.swapchain_format =
+                  paint_context_.swapchain_render_pass_format;
             }
           }
         }
@@ -2241,6 +2271,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+  }
+  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    VsyncPresentGateNotePresent();
   }
   switch (present_result) {
     case VK_SUCCESS:

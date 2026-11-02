@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/filesystem/device.h>
+#include <rex/kernel/xboxkrnl/load_profile.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -213,9 +214,14 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
+      const bool profile = load_profile::ReadsTracked();
+      const uint64_t profile_start = profile ? load_profile::NowUs() : 0;
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                           &bytes_read, apc_context.guest_address());
+      if (profile) {
+        load_profile::AddRead(bytes_read, load_profile::NowUs() - profile_start);
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -316,9 +322,14 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
+      const bool profile = load_profile::ReadsTracked();
+      const uint64_t profile_start = profile ? load_profile::NowUs() : 0;
       result = file->ReadScatter(segment_array.guest_address(), length,
                                  byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                                  &bytes_read, apc_context.guest_address());
+      if (profile) {
+        load_profile::AddRead(bytes_read, load_profile::NowUs() - profile_start);
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;

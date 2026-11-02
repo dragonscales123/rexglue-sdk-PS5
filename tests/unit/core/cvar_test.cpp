@@ -194,6 +194,70 @@ TEST_CASE("cvar TOML config loading", "[cvar]") {
   }
 }
 
+TEST_CASE("cvar SaveConfig survives strings with backslashes and quotes", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto temp_dir = std::filesystem::temp_directory_path();
+  auto config_path = temp_dir / "test_save_config.toml";
+
+  // Like game_data_root: a Windows path with backslashes (plus a quote, to be
+  // thorough). Written raw this is invalid TOML ("\\" is not a valid escape),
+  // and a fresh LoadConfig would then discard the whole file, silently reverting
+  // the flag to its default.
+  const std::string path = std::string("X:") + "\\" + "Fable 2 \"Recomp\" 1.4.0";
+  REXCVAR_SET(test_string_flag, path);
+
+  rex::cvar::SaveConfig(config_path);
+  REQUIRE(std::filesystem::exists(config_path));
+
+  // The exact regression: a fresh load must recover the value.
+  rex::cvar::testing::ResetAllForTesting();
+  rex::cvar::LoadConfig(config_path);
+  CHECK(REXCVAR_GET(test_string_flag) == path);
+
+  std::filesystem::remove(config_path);
+}
+
+TEST_CASE("cvar SaveConfig preserves keys from an existing config", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_persist_config.toml";
+  std::filesystem::remove(config_path);
+
+  // A launcher-style config: a non-default cvar, cvars sitting at their default
+  // value, and a key the registry does not own.
+  {
+    std::ofstream file(config_path);
+    file << "test_int32_flag = 777\n";          // non-default (default 42)
+    file << "test_bool_flag = false\n";         // at default (default false)
+    file << "test_string_flag = \"default\"\n";   // at default (default "default")
+    file << "external_launcher_key = \"keepme\"\n";  // unknown to the registry
+  }
+
+  rex::cvar::LoadConfig(config_path);
+
+  // The in-game (F4) menu changes one cvar and saves, rewriting the whole file.
+  // Before this fix the at-default and unknown keys were silently dropped.
+  REQUIRE(rex::cvar::SetFlagByName("test_int32_flag", "888"));
+  rex::cvar::SaveConfig(config_path);
+
+  std::string content;
+  {
+    std::ifstream file(config_path);
+    content =
+        std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  }
+
+  // The F4 change is applied, and the at-default + unknown keys are preserved.
+  CHECK(content.find("test_int32_flag = 888") != std::string::npos);
+  CHECK(content.find("test_bool_flag = false") != std::string::npos);
+  CHECK(content.find("test_string_flag") != std::string::npos);
+  CHECK(content.find("external_launcher_key = \"keepme\"") != std::string::npos);
+
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
 TEST_CASE("cvar config replays values for flags registered after loading", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 

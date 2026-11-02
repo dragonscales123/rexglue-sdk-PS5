@@ -10,9 +10,12 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -37,6 +40,12 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
+                     "Host guest-frame swap limit in FPS (0 = unlimited). "
+                     "VSync and guest timing may impose a lower rate.")
+    .range(0, 240)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -54,9 +63,22 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
     .allowed({"none", "fast", "some", "full"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
+REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, true, "GPU",
                     "When draw resolution scaling is active, sample from the center of each "
-                    "scaled block during resolve readback downscale")
+                    "scaled block during resolve readback downscale. With the D3D9-style "
+                    "half-pixel offset, the content of each guest pixel starts at host pixel "
+                    "(scale/2, scale/2) of its block, so the block's top-left host pixel "
+                    "belongs to the previous guest pixel, and the first row and column of "
+                    "the resolve read the uncovered edge (a line along the top of the "
+                    "screen at 2x in Fable II)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(readback_resolve_force_addresses, "", "GPU",
+                      "Comma-separated guest base addresses whose render-to-texture resolve is "
+                      "force-read back to guest memory even when readback_resolve is disabled. "
+                      "Each entry (hex/decimal) matches [addr, addr + 1 MiB). E.g. Fable II's "
+                      "hero/dog face texture at 0x12704000 (approach from just-harry's "
+                      "unofficial Xenia femtofork for Fable II).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
@@ -69,6 +91,14 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "automatic fallback to full synchronous readback")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_memexport_fast_wait, true, "GPU",
+                    "With readback_memexport_fast, wait for the previous memexport copy when "
+                    "the GPU has not finished it yet, instead of reading the current draw. "
+                    "The guest then always sees the data from one memexport draw back, at any "
+                    "frame rate, rather than alternating between the previous and the current "
+                    "draw depending on how far the GPU is behind.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
                      "Fake sample count for occlusion queries")
     .range(1, 100000)
@@ -78,6 +108,19 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
                     "pipelines are being prepared.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(async_pipeline_wait, true, "GPU",
+                    "When a draw needs a pipeline that is still being created in the background, "
+                    "wait for it instead of skipping the draw. Skipped draws cause missing "
+                    "objects and corrupted textures, at the cost of a short stall the first time "
+                    "a pipeline is needed. Only used with async_shader_compilation.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(async_pipeline_wait_timeout_ms, 5000, "GPU",
+                     "Longest time, in milliseconds, to wait for one pipeline with "
+                     "async_pipeline_wait before skipping the draw anyway.")
+    .range(100, 60000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
@@ -179,6 +222,79 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
   }
   return legacy_readback_resolve_enabled ? ReadbackResolveMode::kFast
                                          : ReadbackResolveMode::kDisabled;
+}
+
+bool CommandProcessor::ShouldForceReadbackResolve(uint32_t base) const {
+  const std::string& spec = REXCVAR_GET(readback_resolve_force_addresses);
+  if (spec.empty()) {
+    return false;
+  }
+
+  // The hero/dog EDRAM-resolve copy is issued as a PM4_DRAW_INDX_2 draw (see the
+  // `may_require_readback_resolve_` set in the draw opcode dispatch). Regular
+  // PM4_DRAW_INDX draws can also be a kRectangleList/3 copy to the same
+  // destination (the game sampling that texture mid-frame); reading those back
+  // captures a mid-update state and makes the dog look red / shifting.
+  if (!may_require_readback_resolve_) {
+    return false;
+  }
+
+  // Only the full-texture blit should force a readback, matching the femtofork's
+  // detection: a fullscreen kRectangleList draw with 3 indices that copies to the
+  // texture base. The dog's texture is touched by extra / partial copies near the
+  // same region; reading those back mid-update makes it look glitchy / shifting.
+  const reg::VGT_DRAW_INITIATOR vgt = register_file_->Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt.prim_type != xenos::PrimitiveType::kRectangleList || vgt.num_indices != 0x03) {
+    return false;
+  }
+
+  // Each entry is a guest base address (hex with an optional 0x prefix, or
+  // decimal); it matches [addr, addr + kForceReadbackWindow). The window must be
+  // small: 0x12704000 sits in a densely-packed region with other EDRAM resolve
+  // targets (e.g. 0x12724000) blitted in rapid bursts. A wide window forces an
+  // immediate GPU-sync readback for each, stalling the GPU mid-frame (the dog
+  // looked glitchy / red / shifting). 64 KiB covers the target while the nearest
+  // unrelated target is 128 KiB away.
+  constexpr uint32_t kForceReadbackWindow = 1u << 16;  // 64 KiB
+  size_t start = 0;
+  while (start < spec.size()) {
+    size_t end = spec.find(',', start);
+    if (end == std::string::npos) {
+      end = spec.size();
+    }
+    std::string_view token = spec.substr(start, end - start);
+    // Trim surrounding whitespace.
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) {
+      token.remove_prefix(1);
+    }
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) {
+      token.remove_suffix(1);
+    }
+    if (!token.empty()) {
+      uint64_t addr = 0;
+      try {
+        size_t pos = 0;
+        addr = std::stoull(std::string(token), &pos, 0);  // base 0: 0x-hex or decimal
+      } catch (const std::exception&) {
+        addr = 0;  // Malformed token - ignore.
+      }
+      uint32_t a = static_cast<uint32_t>(addr);
+      if (base >= a && base - a < kForceReadbackWindow) {
+        // Throttled diagnostic: confirm the forced readback is triggering and on the
+        // expected address (helps discover a second address for the dog).
+        static int s_forced_readback_log = 0;
+        if (s_forced_readback_log < 24) {
+          REXGPU_INFO("Forced readback-resolve for RB_COPY_DEST_BASE={:#010x} "
+                      "(matched force address {:#010x})",
+                      base, a);
+          ++s_forced_readback_log;
+        }
+        return true;
+      }
+    }
+    start = end + 1;
+  }
+  return false;
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
@@ -930,18 +1046,15 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  {
-    static uint64_t last_frame_tick = 0;
-    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-    if (last_frame_tick) {
-      uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
-      int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
-      PROFILE_FRAME_TIME_US(dt_us);
-      PROFILE_FPS(freq / (now - last_frame_tick));
-    }
-    last_frame_tick = now;
-  }
+  frame_limiter_.Pace(REXCVAR_GET(frame_limit));
+
+  // The small guest FPS readout also works in Release, where the full
+  // profiling macros compile out. Shared runtime counters feed the F3 UI.
+  auto mean_us = guest_frame_meter_.Record(GuestFrameMeter::Clock::now());
+  rex::perf::SetCounter(rex::perf::CounterId::kFrameTimeUs, mean_us);
+  rex::perf::SetCounter(rex::perf::CounterId::kFps, mean_us > 0 ? 1000000 / mean_us : 0);
+#ifndef REXGLUE_ENABLE_PERF_COUNTERS
+  rex::perf::ResetFrameCounters();
 #endif
   rex::perf::Profiler::Flip();
 
@@ -1032,6 +1145,33 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     if (!matched) {
       // Wait.
       if (wait >= 0x100) {
+        // Diagnostic: per-second summary of WAIT_REG_MEM wait-hint sleeps
+        // (the vsync path that sleeps wait/0x100 ms). Long, frequent
+        // sleeps here mean the guest's own frame loop is pacing itself.
+        static uint64_t diag_waits = 0;
+        static uint64_t diag_sleep_ms = 0;
+        static auto diag_last_log =
+            std::chrono::steady_clock::now();
+        diag_waits++;
+        if (REXCVAR_GET(vsync)) {
+          diag_sleep_ms += wait / 0x100;
+        }
+        const auto now_log = std::chrono::steady_clock::now();
+        if (now_log - diag_last_log >= std::chrono::seconds(1)) {
+          const auto elapsed_ms = std::chrono::duration_cast<
+              std::chrono::milliseconds>(now_log - diag_last_log)
+                                      .count();
+          REXGPU_INFO(
+              "WAIT_REG_MEM long-waits: {} in {} ms "
+              "(~{:.1f}/s, total sleep {} ms/s, vsync={})",
+              diag_waits, elapsed_ms,
+              1000.0 * static_cast<double>(diag_waits) /
+                  static_cast<double>(elapsed_ms),
+              diag_sleep_ms, REXCVAR_GET(vsync) ? 1 : 0);
+          diag_waits = 0;
+          diag_sleep_ms = 0;
+          diag_last_log = now_log;
+        }
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
@@ -1416,6 +1556,10 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
   }
   uint32_t viz_query_condition = reader->ReadAndSwap<uint32_t>();
   --count_remaining;
+  // PM4_DRAW_INDX is a regular indexed draw (may carry a viz query token). The
+  // hero/dog EDRAM-resolve copy is NOT issued with this opcode, so never
+  // force-readback from it.
+  may_require_readback_resolve_ = false;
   return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX", viz_query_condition,
                                 count_remaining);
 }
@@ -1425,6 +1569,9 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
+  // This is the opcode the EDRAM-resolve copy (e.g. the hero/dog texture blit)
+  // is issued with, so it is the only one that may force a readback.
+  may_require_readback_resolve_ = true;
   return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0, count);
 }
 

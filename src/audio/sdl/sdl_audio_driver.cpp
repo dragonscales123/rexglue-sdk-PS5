@@ -37,6 +37,25 @@ SDLAudioDriver::~SDLAudioDriver() {
 }
 
 bool SDLAudioDriver::Initialize() {
+  if (InitializeDevice()) return true;
+  // Release only this driver's partial SDL resources. Do not switch the global
+  // backend: other clients may still have working devices.
+  Shutdown();
+  silent_sink_ = std::make_unique<ClockedAudioSink>([this] {
+    if (!semaphore_->Release(1, nullptr)) {
+      REXAPU_WARN("Silent audio: unable to return consumed frame permit");
+    }
+  });
+  if (!silent_sink_->Start()) {
+    silent_sink_.reset();
+    REXAPU_ERROR("Unable to start silent audio fallback worker");
+    return false;
+  }
+  REXAPU_WARN("Audio device unavailable; using clocked silent output for this client");
+  return true;
+}
+
+bool SDLAudioDriver::InitializeDevice() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
 
@@ -110,6 +129,12 @@ bool SDLAudioDriver::Initialize() {
 }
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+  if (silent_sink_) {
+    if (!silent_sink_->Submit()) {
+      REXAPU_WARN("Silent audio: frame queue is stopped or full");
+    }
+    return;
+  }
   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
   float* output_frame;
   {
@@ -139,6 +164,11 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 }
 
 void SDLAudioDriver::Shutdown() {
+  // Join before the owning AudioSystem destroys this client's semaphore.
+  if (silent_sink_) {
+    silent_sink_->Stop();
+    silent_sink_.reset();
+  }
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;

@@ -15,6 +15,7 @@
 #include <bitset>
 #include <memory>
 #include <utility>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -101,6 +102,10 @@ class InputSystem : public system::IInputSystem {
   std::atomic<int> ui_input_blockers_{0};
   // Masked out per user until the guest sees them released.
   std::array<uint16_t, kMaxGuestUsers> consumed_buttons_ = {};
+  // Xam input entries execute on whatever guest thread made the call, and
+  // several guest threads can enter RefreshDevices concurrently. Recursive
+  // because the locked public methods re-enter through RefreshDevices.
+  mutable std::recursive_mutex mutex_;
 };
 
 /// Create a default InputSystem with SDL + MnK + NOP drivers.

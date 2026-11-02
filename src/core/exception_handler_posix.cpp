@@ -477,6 +477,11 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // No handler took it: a real crash. Returning would re-run the faulting
+  // instruction forever (a silent hang at 100% CPU), so fall back to the
+  // default action and let the fault terminate the process with a report.
+  signal(signal_number, SIG_DFL);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {

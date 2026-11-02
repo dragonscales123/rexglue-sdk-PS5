@@ -12,10 +12,12 @@
 #pragma once
 
 #include <mutex>
+#include <memory>
 #include <queue>
 #include <stack>
 
 #include <rex/audio/audio_driver.h>
+#include <rex/audio/clocked_audio_sink.h>
 #include <rex/thread.h>
 
 #include <SDL3/SDL.h>
@@ -32,6 +34,7 @@ class SDLAudioDriver : public AudioDriver {
   void Shutdown();
 
  protected:
+  bool InitializeDevice();
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
 
@@ -39,6 +42,7 @@ class SDLAudioDriver : public AudioDriver {
 
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
+  std::unique_ptr<ClockedAudioSink> silent_sink_;
   uint8_t sdl_device_channels_ = 0;
 
   static const uint32_t frame_frequency_ = 48000;

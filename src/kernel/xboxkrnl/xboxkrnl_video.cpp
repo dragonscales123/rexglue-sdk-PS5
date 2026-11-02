@@ -21,6 +21,7 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/graphics/xenos.h>
+#include <rex/kernel/xboxkrnl/load_profile.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -423,6 +424,7 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  load_profile::NoteSwap();
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);

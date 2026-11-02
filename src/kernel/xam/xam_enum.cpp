@@ -25,6 +25,8 @@
 
 #include <fmt/format.h>
 
+#include "xam_diag.h"
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -79,6 +81,31 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
                      !overlapped.guest_address() ? &dummy : nullptr, overlapped.guest_address());
   if (!overlapped && items_returned) {
     *items_returned = dummy;
+  }
+  if (diag::enabled() && result == X_ERROR_SUCCESS && buffer && dummy > 0) {
+    // XAM_USER_EX: u32 type, u32 user_index, u64 xuid, char name[16] = 32 bytes.
+    // Guest memory is big-endian, so byteswap the 32-bit fields.
+    const auto* raw = buffer.as<uint8_t*>();
+    auto be32 = [](const uint8_t* p) {
+      return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    };
+    for (uint32_t i = 0; i < dummy && (i + 1) * 32 <= buffer_length; ++i) {
+      char m[160];
+      const uint8_t* it = raw + i * 32;
+      const uint32_t type = be32(it);
+      const uint32_t user = be32(it + 4);
+      const uint64_t xuid = (uint64_t(be32(it + 8)) << 32) | be32(it + 12);
+      char name[17] = {0};
+      memcpy(name, it + 16, 16);
+      std::snprintf(m, sizeof(m), "XamEnumerate item[%u] type=%u user=%u xuid=%llu name=%s",
+                    (unsigned)i, (unsigned)type, (unsigned)user,
+                    static_cast<unsigned long long>(xuid), name);
+      diag::trace(m);
+    }
+    char m[96];
+    std::snprintf(m, sizeof(m), "XamEnumerate handle=0x%08X flags=0x%X -> %u item(s)",
+                  (unsigned)handle, (unsigned)flags, (unsigned)dummy);
+    diag::trace(m);
   }
   return result;
 }

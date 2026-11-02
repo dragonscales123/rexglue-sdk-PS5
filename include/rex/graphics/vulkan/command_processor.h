@@ -149,6 +149,11 @@ class VulkanCommandProcessor : public CommandProcessor {
     assert_true(submission_open_);
     return deferred_command_buffer_;
   }
+  // Executed before deferred_command_buffer() in the same submission.
+  DeferredCommandBuffer& upload_command_buffer() {
+    assert_true(submission_open_);
+    return upload_command_buffer_;
+  }
 
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
@@ -552,6 +557,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  DeferredCommandBuffer upload_command_buffer_;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

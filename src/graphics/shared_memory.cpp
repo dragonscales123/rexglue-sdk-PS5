@@ -270,6 +270,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
   MakeRangeValid(start, length, true);
+  RangeAccessedByGpu(start, length);
 }
 
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -461,11 +462,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 
-  if (upload_ranges_.empty()) {
-    return true;
+  bool successful = upload_ranges_.empty() || UploadRanges(upload_ranges_);
+  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    RangeAccessedByGpu(range.first, range.second);
   }
-
-  return UploadRanges(upload_ranges_);
+  return successful;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {

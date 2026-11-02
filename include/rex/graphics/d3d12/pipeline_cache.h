@@ -97,6 +97,13 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  // Blocks until the pipeline, queued for background creation, has been created
+  // or its creation has failed, creating queued pipelines on the calling thread
+  // in priority order in the meantime. Used instead of skipping a draw whose
+  // pipeline isn't ready yet. Gives up after timeout_ms. Returns whether the
+  // pipeline is available.
+  bool WaitForPipeline(void* handle, uint32_t timeout_ms);
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;

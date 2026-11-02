@@ -164,7 +164,7 @@ bool ReXApp::SetupEnvironment() {
     log_level_str = "trace";
 
   auto log_config =
-      rex::BuildLogConfig(log_level_str, rex::ParseCategoryLevelsFromConfig(config_path_));
+      rex::BuildLogConfig(nullptr, log_level_str, rex::ParseCategoryLevelsFromConfig(config_path_));
   log_config.app_name = std::string(GetName());
   log_config.log_dir = exe_dir / "logs";
   OnConfigureLogging(log_config);
@@ -332,7 +332,7 @@ bool ReXApp::SetupPresentation() {
   }
 
   // Create window
-  window_ = rex::ui::Window::Create(app_context(), GetName());
+  window_ = rex::ui::Window::Create(app_context(), GetName(), 0, 0);
   if (!window_) {
     REXLOG_ERROR("Failed to create window");
     return false;

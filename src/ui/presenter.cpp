@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <utility>
 
 #include <rex/assert.h>
@@ -28,6 +29,15 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+
+REXCVAR_DEFINE_BOOL(pace_to_guest_vblank, false, "UI/Presenter",
+                    "Gate the host present (game frame) to the emulated guest "
+                    "vblank cadence - at most one present per guest vblank - so "
+                    "the display frame rate matches the guest vblank rate "
+                    "(the configured refresh rate, ~60 Hz) for profiling, rather "
+                    "than the slower render loop which may draw a new frame "
+                    "only every other vblank")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
@@ -567,6 +577,11 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+    // Increment the guest frame counter (the game's actual render rate, the
+    // source of the F3 FPS counter). The pacer (GuestVblankPaceAllows) gates
+    // the host present on this counter so the display cadence matches the
+    // guest's actual frame production.
+    guest_frame_count_.fetch_add(1, std::memory_order_relaxed);
   } else {
     // Request presenting a blank image if there was a true image previously,
     // but not now.
@@ -1610,6 +1625,123 @@ void Presenter::ForceUIThreadPaintTick() {
   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   dxgi_ui_tick_force_requested_ = true;
 #endif  // XE_PLATFORM
+}
+
+bool Presenter::VsyncPresentGateAllows() {
+#if REX_PLATFORM_WIN32
+  // The `vsync` cvar is owned by the GPU plugin, so query it by name instead
+  // of linking the plugin into the UI layer (returns false when the cvar -
+  // i.e. the plugin - isn't present).
+  if (!rex::cvar::Query<bool>("vsync")) {
+    return true;
+  }
+  std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+  if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
+    // Host vblank ticks are not being produced (no UI drawer active, or the
+    // output unavailable): there is no live refresh rate to gate against.
+    return true;
+  }
+  bool allows =
+      vsync_present_gate_last_present_tick_.load(std::memory_order_relaxed) !=
+      dxgi_ui_tick_last_vblank_;
+  if (!allows) {
+    // Rate-limited log so the capping is visible in the log without flooding.
+    uint64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    if (now_ms - vsync_present_gate_last_log_time_ms_ >= 1000) {
+      vsync_present_gate_last_log_time_ms_ = now_ms;
+      REXLOG_INFO("vsync present gate: suppressed {} host presents since the "
+                  "last second (capped at the monitor refresh rate)",
+                  vsync_present_gate_suppressed_.exchange(0, std::memory_order_relaxed));
+    }
+    vsync_present_gate_suppressed_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return allows;
+#else
+  return true;
+#endif  // REX_PLATFORM_WIN32
+}
+
+void Presenter::VsyncPresentGateNotePresent() {
+#if REX_PLATFORM_WIN32
+  std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+  if (AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
+    vsync_present_gate_last_present_tick_.store(dxgi_ui_tick_last_vblank_,
+                                                std::memory_order_relaxed);
+  }
+#endif  // REX_PLATFORM_WIN32
+}
+
+bool Presenter::GuestVblankPaceAllows() {
+  if (!REXCVAR_GET(pace_to_guest_vblank)) {
+    return true;
+  }
+  // Gate on the guest frame counter (incremented in RefreshGuestOutput once
+  // per rendered guest frame), so the host present rate exactly matches the
+  // guest's actual (varying) frame-production cadence - the source of the F3
+  // FPS counter. At most one host present is allowed per guest frame: claim
+  // the current count via a compare-and-swap so a given frame is only ever
+  // presented once, even if the UI thread and the guest output thread race to
+  // present it. UI/overlay repaints that carry no new guest frame are
+  // suppressed.
+  const uint64_t count = guest_frame_count_.load(std::memory_order_relaxed);
+  uint64_t last = guest_frame_pace_last_count_.load(std::memory_order_relaxed);
+  bool allowed = false;
+  while (count > last) {
+    if (guest_frame_pace_last_count_.compare_exchange_weak(last, count,
+                                                           std::memory_order_relaxed)) {
+      allowed = true;
+      break;
+    }
+  }
+  if (allowed) {
+    guest_frame_pace_present_count_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    guest_frame_pace_suppressed_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // Once per second, log the *measured* guest frame cadence, the emulated
+  // vblank cadence, and the resulting host present rate so the capping is
+  // verifiable without flooding.
+  const uint64_t now_ms =
+      uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+  const uint64_t window_start =
+      guest_frame_pace_window_start_ms_.load(std::memory_order_relaxed);
+  if (window_start == 0) {
+    // First call after enabling: open the first rate window.
+    guest_frame_pace_window_start_ms_.store(now_ms, std::memory_order_relaxed);
+    guest_frame_pace_window_start_vblank_count_.store(count, std::memory_order_relaxed);
+    guest_frame_pace_window_start_frame_count_.store(
+        guest_frame_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return allowed;
+  }
+  const uint64_t elapsed_ms = now_ms - window_start;
+  if (elapsed_ms >= 1000) {
+    const double elapsed_s = double(elapsed_ms) / 1000.0;
+    const uint64_t window_start_vblank_count =
+        guest_frame_pace_window_start_vblank_count_.load(std::memory_order_relaxed);
+    const uint64_t window_start_frame_count =
+        guest_frame_pace_window_start_frame_count_.load(std::memory_order_relaxed);
+    const uint64_t vblank_count = guest_vblank_count_.load(std::memory_order_relaxed);
+    const double guest_frame_hz = double(count - window_start_frame_count) / elapsed_s;
+    const double guest_vblank_hz = double(vblank_count - window_start_vblank_count) / elapsed_s;
+    const double present_hz =
+        double(guest_frame_pace_present_count_.exchange(0, std::memory_order_relaxed)) / elapsed_s;
+    const double suppressed_hz =
+        double(guest_frame_pace_suppressed_.exchange(0, std::memory_order_relaxed)) / elapsed_s;
+    REXLOG_INFO("guest vblank pacer: guest frame (gate) ~{:.1f} Hz, emulated "
+                "vblank ~{:.1f} Hz, host present ~{:.1f} Hz, suppressed ~{:.1f} Hz "
+                "({} ms window)",
+                guest_frame_hz, guest_vblank_hz, present_hz, suppressed_hz,
+                static_cast<unsigned>(elapsed_ms));
+    guest_frame_pace_window_start_ms_.store(now_ms, std::memory_order_relaxed);
+    guest_frame_pace_window_start_frame_count_.store(count, std::memory_order_relaxed);
+    guest_frame_pace_window_start_vblank_count_.store(vblank_count, std::memory_order_relaxed);
+  }
+  return allowed;
 }
 
 #if REX_PLATFORM_WIN32

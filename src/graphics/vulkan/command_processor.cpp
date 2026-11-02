@@ -580,6 +580,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
                                                system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state),
       deferred_command_buffer_(*this),
+      upload_command_buffer_(*this, 64 * 1024),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -2058,6 +2059,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   sparse_memory_binds_.clear();
 
   deferred_command_buffer_.Reset();
+  upload_command_buffer_.Reset();
   for (const auto& command_buffer_pair : command_buffers_submitted_) {
     dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
   }
@@ -4350,12 +4352,23 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   readback.written_size[write_index] = total_size;
 
   CheckSubmissionFenceAndDeviceLoss(0);
-  bool previous_slot_ready =
+  bool previous_slot_written =
       readback.buffers[read_index] != VK_NULL_HANDLE &&
       readback.memories[read_index] != VK_NULL_HANDLE &&
       readback.mapped_data[read_index] != nullptr && total_size <= readback.sizes[read_index] &&
-      total_size <= readback.written_size[read_index] && readback.submission_written[read_index] &&
-      readback.submission_written[read_index] <= submission_completed_;
+      total_size <= readback.written_size[read_index] && readback.submission_written[read_index] != 0;
+  if (previous_slot_written && REXCVAR_GET(readback_memexport_fast_wait) &&
+      readback.submission_written[read_index] > submission_completed_ &&
+      readback.submission_written[read_index] < GetCurrentSubmission()) {
+    // The previous copy was submitted but is still in flight. Wait for it
+    // instead of falling back to the current draw, so the data the guest reads
+    // is always one memexport draw old, whether or not the GPU has caught up.
+    // A copy recorded in the still-open submission is left to the full path
+    // below, as without this cvar, so the open submission is never ended here.
+    CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index]);
+  }
+  bool previous_slot_ready =
+      previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
@@ -4391,7 +4404,8 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (readback_mode == ReadbackResolveMode::kDisabled &&
+      !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
@@ -4420,7 +4434,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (readback_mode == ReadbackResolveMode::kDisabled &&
+      !ShouldForceReadbackResolve(written_address)) {
     return true;
   }
 
@@ -5136,6 +5151,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    upload_command_buffer_.Reset();
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -5385,6 +5401,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    upload_command_buffer_.Execute(command_buffer.buffer);
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");

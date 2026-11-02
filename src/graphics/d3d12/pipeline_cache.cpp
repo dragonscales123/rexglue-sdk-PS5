@@ -12,13 +12,16 @@
 #include "thirdparty/dxbc/DXBCChecksum.h"
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -61,6 +64,16 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
+
+REXCVAR_DEFINE_STRING(depth_bias_shader, "", "GPU/D3D12",
+                      "Guest pixel shader ucode hash (hex) whose draws get "
+                      "depth_bias_shader_units of extra host depth bias, for geometry that "
+                      "relies on exact ties in the guest's 24-bit float depth (Z fighting on "
+                      "the host's 32-bit depth). Host render target path only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(depth_bias_shader_units, 0, "GPU/D3D12",
+                     "Extra Direct3D 12 DepthBias units for depth_bias_shader.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
 
@@ -1424,6 +1437,12 @@ bool PipelineCache::GetCurrentStateDescription(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
     description_out.depth_bias_slope_scaled =
         polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+    const std::string& bias_shader = REXCVAR_GET(depth_bias_shader);
+    if (pixel_shader && !bias_shader.empty() &&
+        std::strtoull(bias_shader.c_str(), nullptr, 16) ==
+            pixel_shader->shader().ucode_data_hash()) {
+      description_out.depth_bias += REXCVAR_GET(depth_bias_shader_units);
+    }
   }
   if (tessellated && REXCVAR_GET(d3d12_tessellation_wireframe)) {
     description_out.fill_mode_wireframe = 1;
@@ -3263,6 +3282,67 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
     pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                     std::memory_order_release);
   }
+}
+
+bool PipelineCache::WaitForPipeline(void* handle, uint32_t timeout_ms) {
+  const Pipeline* target = reinterpret_cast<const Pipeline*>(handle);
+  if (target->state.load(std::memory_order_acquire) != nullptr) {
+    return true;
+  }
+  if (creation_threads_.empty()) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+  // Help creating the queued pipelines (highest priority first) until the needed
+  // one exists, or has been attempted.
+  while (target->state.load(std::memory_order_acquire) == nullptr &&
+         std::chrono::steady_clock::now() < deadline) {
+    Pipeline* pipeline_to_create;
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      if (creation_queue_.empty()) {
+        break;
+      }
+      pipeline_to_create = creation_queue_.top();
+      creation_queue_.pop();
+    }
+    PipelineRuntimeDescription runtime_description;
+    if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
+      pipeline_to_create->state.store(nullptr, std::memory_order_release);
+    } else {
+      pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
+                                      std::memory_order_release);
+    }
+    if (pipeline_to_create == target) {
+      break;
+    }
+  }
+  if (target->state.load(std::memory_order_acquire) != nullptr) {
+    return true;
+  }
+
+  // The pipeline may be being created by a background thread - wait for all
+  // threads to finish, the same way as when waiting for all queued pipelines.
+  bool await_creation_completion_event;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    await_creation_completion_event = creation_threads_busy_ != 0;
+    if (await_creation_completion_event) {
+      creation_completion_event_->Reset();
+      creation_completion_set_event_ = true;
+    }
+  }
+  if (await_creation_completion_event) {
+    creation_request_cond_.notify_one();
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining.count() < 0) {
+      remaining = std::chrono::milliseconds(0);
+    }
+    rex::thread::Wait(creation_completion_event_.get(), false, remaining);
+  }
+  return target->state.load(std::memory_order_acquire) != nullptr;
 }
 
 }  // namespace rex::graphics::d3d12

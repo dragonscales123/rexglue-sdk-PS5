@@ -50,6 +50,7 @@ set(REXKERNEL_SOURCES
     xboxkrnl/xboxkrnl_rtl.cpp
     xboxkrnl/xboxkrnl_strings.cpp
     xboxkrnl/xboxkrnl_threading.cpp
+    xboxkrnl/xboxkrnl_load_profile.cpp
     # xboxkrnl/xboxkrnl_usbcam.cpp  # TODO: lol eventually.
     xboxkrnl/xboxkrnl_video.cpp
     xboxkrnl/xboxkrnl_xconfig.cpp

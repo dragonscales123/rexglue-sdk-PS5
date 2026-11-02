@@ -82,9 +82,18 @@ MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
 
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                        const std::string_view title) {
-  uint32_t width = 0;
-  uint32_t height = 0;
-  ResolveConfiguredLogicalSize(width, height);
+  return Create(app_context, title, 0, 0);
+}
+
+std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
+                                       const std::string_view title,
+                                       uint32_t desired_logical_width,
+                                       uint32_t desired_logical_height) {
+  uint32_t width = desired_logical_width;
+  uint32_t height = desired_logical_height;
+  if (width == 0 || height == 0) {
+    ResolveConfiguredLogicalSize(width, height);
+  }
   return std::make_unique<WindowSDL>(app_context, title, width, height);
 }
 

@@ -28,6 +28,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+#include "xam_diag.h"
+
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 
 namespace rex {
@@ -62,6 +64,13 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
     result = X_E_INVALIDARG;
   }
   *xuid_ptr = xuid;
+  if (diag::enabled()) {
+    char m[128];
+    std::snprintf(m, sizeof(m), "XamUserGetXUID user=%u mask=%u xuid=%llu -> %d",
+                  (unsigned)user_index, (unsigned)type_mask,
+                  static_cast<unsigned long long>(xuid), (int)result);
+    diag::trace(m);
+  }
   return result;
 }
 
@@ -72,6 +81,12 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       signin_state = user_profile->signin_state();
     }
+  }
+  if (diag::enabled()) {
+    char m[64];
+    std::snprintf(m, sizeof(m), "XamUserGetSigninState user=%u -> %u",
+                  (unsigned)user_index, (unsigned)signin_state);
+    diag::trace(m);
   }
   return signin_state;
 }
@@ -93,6 +108,12 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
   if (user_index) {
+    if (diag::enabled()) {
+      char m[96];
+      std::snprintf(m, sizeof(m), "XamUserGetSigninInfo user=%u flags=0x%X -> X_E_NO_SUCH_USER",
+                    (unsigned)user_index, (unsigned)flags);
+      diag::trace(m);
+    }
     return X_E_NO_SUCH_USER;
   }
 
@@ -100,6 +121,12 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  if (diag::enabled()) {
+    char m[96];
+    std::snprintf(m, sizeof(m), "XamUserGetSigninInfo user=%u flags=0x%X -> X_E_SUCCESS",
+                  (unsigned)user_index, (unsigned)flags);
+    diag::trace(m);
+  }
   return X_E_SUCCESS;
 }
 
@@ -109,6 +136,12 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
   }
 
   if (user_index) {
+    if (diag::enabled()) {
+      char m[64];
+      std::snprintf(m, sizeof(m), "XamUserGetName user=%u -> X_E_NO_SUCH_USER",
+                    (unsigned)user_index);
+      diag::trace(m);
+    }
     return X_E_NO_SUCH_USER;
   }
 
@@ -288,8 +321,18 @@ u32 XamUserReadProfileSettings_entry(u32 title_id, u32 user_index, u32 xuid_coun
                                      u32 setting_count, mapped_u32 setting_ids,
                                      mapped_u32 buffer_size_ptr, mapped_void buffer_ptr,
                                      ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
-  return XamUserReadProfileSettingsEx(title_id, user_index, xuid_count, xuids, setting_count,
-                                      setting_ids, 0, buffer_size_ptr, buffer_ptr, overlapped);
+  uint32_t result = XamUserReadProfileSettingsEx(title_id, user_index, xuid_count, xuids,
+                                                 setting_count, setting_ids, 0, buffer_size_ptr,
+                                                 buffer_ptr, overlapped);
+  if (diag::enabled()) {
+    char m[128];
+    std::snprintf(m, sizeof(m),
+                  "XamUserReadProfileSettings title=0x%08X user=%u xuids=%u settings=%u -> 0x%X",
+                  (unsigned)title_id, (unsigned)user_index, (unsigned)xuid_count,
+                  (unsigned)setting_count, (unsigned)result);
+    diag::trace(m);
+  }
+  return result;
 }
 
 u32 XamUserReadProfileSettingsEx_entry(u32 title_id, u32 user_index, u32 xuid_count,
@@ -374,16 +417,34 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
   // checking all users?
   if (user_index != 0xFF) {
     if (user_index >= 4) {
+      if (diag::enabled()) {
+        char m[96];
+        std::snprintf(m, sizeof(m), "XamUserCheckPrivilege user=%u mask=0x%X -> INVALID_PARAM",
+                      (unsigned)user_index, (unsigned)mask);
+        diag::trace(m);
+      }
       return X_ERROR_INVALID_PARAMETER;
     }
 
     if (user_index) {
+      if (diag::enabled()) {
+        char m[96];
+        std::snprintf(m, sizeof(m), "XamUserCheckPrivilege user=%u mask=0x%X -> NO_SUCH_USER",
+                      (unsigned)user_index, (unsigned)mask);
+        diag::trace(m);
+      }
       return X_ERROR_NO_SUCH_USER;
     }
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
   *out_value = 0;
+  if (diag::enabled()) {
+    char m[96];
+    std::snprintf(m, sizeof(m), "XamUserCheckPrivilege user=%u mask=0x%X -> SUCCESS value=0",
+                  (unsigned)user_index, (unsigned)mask);
+    diag::trace(m);
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -459,6 +520,12 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
     }
   }
 
+  if (diag::enabled()) {
+    char m[96];
+    std::snprintf(m, sizeof(m), "XamUserAreUsersFriends user=%u u1=0x%X u2=0x%X -> 0x%X",
+                  (unsigned)user_index, (unsigned)unk1, (unsigned)unk2, (unsigned)result);
+    diag::trace(m);
+  }
   if (out_value) {
     assert_true(!overlapped_ptr);
     *out_value = result == X_ERROR_SUCCESS ? are_friends : 0;

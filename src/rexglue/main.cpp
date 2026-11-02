@@ -45,8 +45,8 @@ bool ColorEnabled(bool tty) {
 }
 
 void ConfigureLogging(const std::string& level, const std::string& log_file, bool verbose) {
-  auto config = rex::BuildLogConfig(verbose ? "trace" : level, {});
-  config.log_file = log_file;
+  auto config = rex::BuildLogConfig(log_file.empty() ? nullptr : log_file.c_str(),
+                                    verbose ? "trace" : level, {});
   config.log_to_console = true;
   rex::ApplyLogCvarOverrides(config);
   rex::InitLogging(config);

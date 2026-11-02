@@ -2400,7 +2400,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    return true;
+    // Skipping the draw leaves objects missing for that frame and corrupts any
+    // texture rendered by the skipped pass, so wait for the pipeline instead.
+    // Only the first use of a pipeline can stall, as without async compilation.
+    if (!REXCVAR_GET(async_pipeline_wait) ||
+        !pipeline_cache_->WaitForPipeline(
+            pipeline_handle,
+            uint32_t(std::max(100, REXCVAR_GET(async_pipeline_wait_timeout_ms))))) {
+      return true;
+    }
   }
 
   // Update the textures - this may bind pipelines.
@@ -2849,11 +2857,22 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   readback.written_size[write_index] = total_size;
 
   CheckSubmissionFence(0);
-  bool previous_slot_ready = readback.buffers[read_index] && readback.mapped_data[read_index] &&
-                             total_size <= readback.sizes[read_index] &&
-                             total_size <= readback.written_size[read_index] &&
-                             readback.submission_written[read_index] &&
-                             readback.submission_written[read_index] <= submission_completed_;
+  bool previous_slot_written = readback.buffers[read_index] && readback.mapped_data[read_index] &&
+                               total_size <= readback.sizes[read_index] &&
+                               total_size <= readback.written_size[read_index] &&
+                               readback.submission_written[read_index] != 0;
+  if (previous_slot_written && REXCVAR_GET(readback_memexport_fast_wait) &&
+      readback.submission_written[read_index] > submission_completed_ &&
+      readback.submission_written[read_index] < submission_current_) {
+    // The previous copy was submitted but is still in flight. Wait for it
+    // instead of falling back to the current draw, so the data the guest reads
+    // is always one memexport draw old, whether or not the GPU has caught up.
+    // A copy recorded in the still-open submission is left to the full path
+    // below, as without this cvar, so the open submission is never ended here.
+    CheckSubmissionFence(readback.submission_written[read_index]);
+  }
+  bool previous_slot_ready =
+      previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
     IssueDraw_MemexportReadbackFullPath(total_size);
     readback.current_index = read_index;
@@ -2878,7 +2897,8 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (readback_mode == ReadbackResolveMode::kDisabled &&
+      !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);

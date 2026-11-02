@@ -26,7 +26,16 @@ namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
 void DbgBreakPoint_entry() {
-  rex::debug::Break();
+  // Retail Xbox 360 DbgBreakPoint is a no-op that RETURNS: it only halts under a
+  // debugger. Fable 2 calls it from defensive "should not happen" checks at
+  // startup (e.g. sub_82B7D008 breaks when a global is 0), and the guest
+  // continues after the call. Honoring it unconditionally as a hard int 3
+  // (0x80000003) kills the retail game on startup. Match retail behavior: log
+  // and continue, only actually breaking if a debugger is attached.
+  REXKRNL_DEBUG("DbgBreakPoint called by guest (retail no-op; continuing)");
+  if (rex::debug::IsDebuggerAttached()) {
+    rex::debug::Break();
+  }
 }
 
 // https://msdn.microsoft.com/en-us/library/xcb2z8hs.aspx

@@ -245,6 +245,8 @@ spdlog::level::level_enum ParseLogLevelOr(const std::string& level_str,
  */
 LogConfig BuildLogConfig(const std::string& cli_level,
                          const std::map<std::string, std::string>& category_levels);
+LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
+                         const std::map<std::string, std::string>& category_levels);
 
 void ApplyLogCvarOverrides(LogConfig& config);
 

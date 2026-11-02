@@ -22,6 +22,8 @@
 #include <vector>
 
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/frame_limiter.h>
+#include <rex/graphics/guest_frame_meter.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -227,6 +229,9 @@ class CommandProcessor {
 
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
+  // True when a resolve to guest base address `base` should be force-read back to
+  // guest memory even with readback_resolve disabled (readback_resolve_force_addresses).
+  bool ShouldForceReadbackResolve(uint32_t base) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
@@ -236,6 +241,8 @@ class CommandProcessor {
   RegisterFile* register_file_ = nullptr;
 
   std::atomic<bool> worker_running_;
+  FrameLimiter frame_limiter_;
+  GuestFrameMeter guest_frame_meter_;
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
@@ -281,6 +288,14 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+
+  // Set by the PM4 draw opcode dispatch: true for PM4_DRAW_INDX_2 (the
+  // EDRAM-resolve copy the hero/dog texture blit uses), false for PM4_DRAW_INDX.
+  // The force-readback gate requires this, otherwise regular indexed draws that
+  // also happen to be a kRectangleList/3 copy to the same destination (the game
+  // sampling that texture mid-frame) would trigger a readback of a mid-update
+  // state, making the dog look red / shifting.
+  bool may_require_readback_resolve_ = false;
 };
 
 }  // namespace rex::graphics

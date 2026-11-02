@@ -20,6 +20,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/dbg.h>
+#include <rex/kernel/xboxkrnl/load_profile.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
@@ -380,7 +381,19 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
     thread->DeliverAPCs();
   }
 
+  const bool profile = load_profile::Active();
+  const uint64_t profile_start = profile ? load_profile::NowUs() : 0;
+  if (profile) {
+    const int64_t interval = static_cast<int64_t>(static_cast<uint64_t>(*interval_ptr));
+    load_profile::BeginWait(load_profile::kWaitSleep,
+                            interval < 0 ? uint32_t(-interval / 10000) : 0u, "sleep", 1);
+  }
   X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
+  if (profile) {
+    load_profile::EndWait();
+    load_profile::AddDelay(load_profile::NowUs() - profile_start,
+                           static_cast<int64_t>(static_cast<uint64_t>(*interval_ptr)));
+  }
 
   if (alertable && result == X_STATUS_USER_APC) {
     thread->DeliverAPCs();
@@ -390,6 +403,9 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
 }
 
 u32 NtYieldExecution_entry() {
+  if (load_profile::Enabled()) {
+    load_profile::AddYield();
+  }
   rex::thread::MaybeYield();
   return X_STATUS_SUCCESS;
 }
@@ -836,8 +852,92 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
   return result;
 }
 
+namespace {
+// Adds the time of the enclosing wait call to the load profile (diag_load_profile).
+const char* XObjectTypeName(XObject::Type type) {
+  switch (type) {
+    case XObject::Type::Event:
+      return "event";
+    case XObject::Type::File:
+      return "file";
+    case XObject::Type::IOCompletion:
+      return "io-completion";
+    case XObject::Type::Mutant:
+      return "mutant";
+    case XObject::Type::NotifyListener:
+      return "notify-listener";
+    case XObject::Type::Semaphore:
+      return "semaphore";
+    case XObject::Type::Socket:
+      return "socket";
+    case XObject::Type::Thread:
+      return "thread";
+    case XObject::Type::Timer:
+      return "timer";
+    default:
+      return "object";
+  }
+}
+
+// Type byte of an X_DISPATCHER_HEADER in guest memory.
+const char* DispatcherTypeName(const void* header) {
+  if (!header) {
+    return "null";
+  }
+  switch (*static_cast<const uint8_t*>(header)) {
+    case 0:
+      return "notification-event";
+    case 1:
+      return "sync-event";
+    case 2:
+      return "mutant";
+    case 4:
+      return "queue";
+    case 5:
+      return "semaphore";
+    case 6:
+      return "thread";
+    case 8:
+    case 9:
+      return "timer";
+    default:
+      return "dispatcher-object";
+  }
+}
+
+const char* HandleTypeName(uint32_t handle) {
+  auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(handle);
+  return object ? XObjectTypeName(object->type()) : "invalid-handle";
+}
+
+struct ProfileWaitScope {
+  bool profile = load_profile::Enabled();
+  uint64_t start = profile ? load_profile::NowUs() : 0;
+  // Waits on a guest dispatcher object (Ke*).
+  ProfileWaitScope(uint32_t kind, uint32_t object, const void* header, uint32_t count) {
+    if (profile) {
+      load_profile::BeginWait(kind, object, DispatcherTypeName(header), count);
+    }
+  }
+  // Waits on a handle (Nt*).
+  ProfileWaitScope(uint32_t kind, uint32_t handle, uint32_t count) {
+    if (profile) {
+      load_profile::BeginWait(kind, handle, HandleTypeName(handle), count);
+    }
+  }
+  ~ProfileWaitScope() {
+    if (profile) {
+      load_profile::AddWait(load_profile::NowUs() - start);
+      load_profile::EndWait();
+    }
+  }
+};
+}  // namespace
+
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
+  ProfileWaitScope profile_wait(load_profile::kWaitKeSingle, object_ptr.guest_address(),
+                                object_ptr.host_address(), 1);
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
   // timeout={}",
@@ -852,6 +952,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
+  ProfileWaitScope profile_wait(load_profile::kWaitNtSingle, object_handle, 1);
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
@@ -871,6 +972,9 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
 u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
+  ProfileWaitScope profile_wait(
+      load_profile::kWaitKeMultiple, count ? uint32_t(objects_ptr[0]) : 0u,
+      count ? REX_KERNEL_MEMORY()->TranslateVirtual(uint32_t(objects_ptr[0])) : nullptr, count);
   assert_true(wait_type <= 1);
 
   std::vector<object_ref<XObject>> objects;
@@ -919,6 +1023,8 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
 
 u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
                                      u32 alertable, mapped_u64 timeout_ptr) {
+  ProfileWaitScope profile_wait(load_profile::kWaitNtMultiple,
+                                count ? uint32_t(handles[0]) : 0u, count);
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                       timeout_ptr ? &timeout : nullptr);
@@ -926,6 +1032,7 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
 
 u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
                                            u32 r6, mapped_u64 timeout_ptr) {
+  ProfileWaitScope profile_wait(load_profile::kWaitSignalAndWait, wait_handle, 1);
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);

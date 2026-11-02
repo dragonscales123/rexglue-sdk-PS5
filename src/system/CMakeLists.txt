@@ -65,7 +65,32 @@ add_library(rex::runtime ALIAS rexruntime)
 add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)
 
-set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+# Curated export table: export exactly what the title (fable_2.exe) and the GPU
+# plugin import, rather than export-all. This keeps the PE export section small
+# and (importantly) guarantees the Xbox-360 kernel-stub __imp__* symbols are
+# exported even when the dual-backend (D3D12+Vulkan) build's full symbol set
+# would otherwise push them out of the linker's export table.
+set(REXRUNTIME_DEF "${CMAKE_CURRENT_SOURCE_DIR}/rexruntime.def")
+if(WIN32 AND NOT REXGLUE_USE_VULKAN)
+    # The curated table contains dual-backend imports. D3D12-only builds must
+    # not request exports whose Vulkan implementation is not compiled.
+    file(STRINGS "${REXRUNTIME_DEF}" REXRUNTIME_EXPORT_LINES)
+    list(FILTER REXRUNTIME_EXPORT_LINES EXCLUDE REGEX "@vulkan@|FLAGS_vulkan|^vma")
+    list(JOIN REXRUNTIME_EXPORT_LINES "\n" REXRUNTIME_EXPORT_TEXT)
+    set(REXRUNTIME_DEF "${CMAKE_CURRENT_BINARY_DIR}/rexruntime-d3d12.def")
+    file(WRITE "${REXRUNTIME_DEF}" "${REXRUNTIME_EXPORT_TEXT}\n")
+endif()
+# lld-link needs the /DEF: flag (a bare positional .def path is "unknown file
+# type"). The flag must reach lld-link (not clang++), so it is passed via
+# -Xlinker; and the path must be space-free (the project path contains spaces),
+# so it is made relative to the top-level build dir (the linker's working dir).
+# Windows only: ELF/Mach-O builds export with default visibility.
+if(WIN32)
+    file(RELATIVE_PATH REXRUNTIME_DEF_REL "${CMAKE_BINARY_DIR}" "${REXRUNTIME_DEF}")
+    set_target_properties(rexruntime PROPERTIES
+        LINK_DEPENDS "${REXRUNTIME_DEF}"
+        LINK_OPTIONS "-Xlinker;/DEF:${REXRUNTIME_DEF_REL}")
+endif()
 rexglue_add_version_resource(rexruntime DESCRIPTION "ReXGlue runtime")
 
 rex_target_pch(rexruntime

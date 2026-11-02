@@ -39,6 +39,12 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
 
+// Keep the legacy guest timing by default. Titles with their own host frame
+// limiter can disable this independently of tear-free host presentation.
+REXCVAR_DEFINE_BOOL(guest_vblank_pacing, true, "GPU",
+                    "Pace emulated vblank interrupts at the guest refresh rate when VSync is on")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace {
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
@@ -161,7 +167,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+              (REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_pacing))
+                  ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
@@ -323,6 +330,13 @@ void GraphicsSystem::MarkVblank() {
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {
     command_processor_->increment_counter();
+  }
+  // Notify the presenter of the guest vblank so the guest-vblank frame pacer
+  // (when enabled) can gate the host present rate on the actual vblank cadence.
+  // presenter_ is stable while the GPU VSync thread runs (SetupPresentation runs
+  // before SetupGuestGpu; Shutdown joins this thread before resetting it).
+  if (presenter_) {
+    presenter_->OnGuestVblank();
   }
 
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's

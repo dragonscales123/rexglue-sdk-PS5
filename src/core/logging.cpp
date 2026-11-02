@@ -542,7 +542,15 @@ spdlog::level::level_enum ParseLogLevelOr(const std::string& level_str,
 
 LogConfig BuildLogConfig(const std::string& cli_level,
                          const std::map<std::string, std::string>& category_levels) {
+  return BuildLogConfig(nullptr, cli_level, category_levels);
+}
+
+LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
+                         const std::map<std::string, std::string>& category_levels) {
   LogConfig config;
+  if (log_file) {
+    config.log_file = log_file;
+  }
 
   // Build-type default
   config.default_level = kDefaultLogLevel;

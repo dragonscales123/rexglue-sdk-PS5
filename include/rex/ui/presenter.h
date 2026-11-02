@@ -188,6 +188,18 @@ class Presenter {
       std::function<void(bool is_responsible, bool statically_from_ui_thread)>;
   static void FatalErrorHostGpuLossCallback(bool is_responsible, bool statically_from_ui_thread);
 
+  // Called by the GraphicsSystem on every emulated guest vblank (see
+  // GraphicsSystem::MarkVblank). Increments the guest vblank counter that the
+  // guest-vblank frame pacer (GuestVblankPaceAllows) gates on, so the host
+  // present rate tracks the *actual* guest vblank cadence. Thread-safe (atomic);
+  // called from the GPU VSync thread. Defined inline (not in presenter.cpp) so
+  // the GPU plugin - which holds the Presenter but does not link the rexui
+  // object library (symbols come via the curated rexruntime export table) - can
+  // call it without needing an exported symbol.
+  inline void OnGuestVblank() {
+    guest_vblank_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   class GuestOutputRefreshContext {
    public:
     GuestOutputRefreshContext(const GuestOutputRefreshContext& context) = delete;
@@ -862,6 +874,31 @@ class Presenter {
   // May be called from any thread.
   void ForceUIThreadPaintTick();
 
+ protected:
+  // Vsync present gate: when the guest `vsync` cvar (owned by the GPU plugin)
+  // is enabled, at most one present into the host swap chain is allowed per
+  // host vblank. Without this, the guest output paints (paced by the guest's
+  // own frame rate) and the continuous UI repaints (paced by the host refresh
+  // rate, every vblank while any dialog is active) each present independently,
+  // over-presenting at (guest rate + refresh rate) and defeating vsync. The
+  // gate only applies while the host vblank ticks are actually being produced
+  // (see AreDXGIUITicksWaitable); otherwise there is no live refresh rate to
+  // gate against. Called from the derived presenters' PaintAndPresentImpl.
+  bool VsyncPresentGateAllows();
+  // Call after a successful Present to record the current host vblank tick.
+  void VsyncPresentGateNotePresent();
+
+  // Guest vblank frame pacer: when the `pace_to_guest_vblank` cvar is enabled,
+  // at most one host present (game frame) is allowed per emulated guest vblank
+  // (see OnGuestVblank), so the actual frame rate matches the *actual* guest
+  // vblank cadence rather than the host display refresh rate. This is what a
+  // profiler needs: the frame rate is not a fixed constant but follows the
+  // guest vblank exactly. Call once per present attempt, after the vsync
+  // present gate allows; it claims the current guest vblank count so a given
+  // vblank is only ever presented once.
+  bool GuestVblankPaceAllows();
+
+ private:
   // Must be called only in the end of entry points - reinitialization of the
   // presenter may be done by the handler if it was called from the UI thread
   // (even if the UI thread argument is false - such as when the guest output is
@@ -1002,6 +1039,31 @@ class Presenter {
   // presentation requests to prevent adding arbitrary amounts of latency to it.
   // On Android and GTK, this is not needed, the frame rate of draw events is
   // limited to the display refresh rate internally.
+  // Emulated guest vblank counter (incremented by OnGuestVblank on every
+  // emulated vblank interrupt). This runs at the configured refresh rate
+  // (~60 Hz, or ~1000 Hz when guest_vblank_pacing is off), independent of how
+  // often the game actually renders a frame; reported in the pacer's rate
+  // diagnostic.
+  std::atomic<uint64_t> guest_vblank_count_{0};
+  // Guest frame counter (incremented by RefreshGuestOutput on every rendered
+  // guest frame). This is the game's *actual* render rate (the source of the
+  // F3 FPS counter) and the cadence the pacer (GuestVblankPaceAllows) gates
+  // the host present to.
+  std::atomic<uint64_t> guest_frame_count_{0};
+  // Pacer: at most one host present per rendered guest frame.
+  // `guest_frame_pace_last_count_` is the last-presented guest frame count,
+  // claimed from the UI / guest-output threads via a compare-and-swap.
+  std::atomic<uint64_t> guest_frame_pace_last_count_{0};
+  // Diagnostic rate window (sampled once per second): host presents and
+  // suppressed presents since the window start, plus the guest frame and vblank
+  // counts at the window start (to compute the actual cadences). Benign races;
+  // used only for the rate-limited info log.
+  std::atomic<uint64_t> guest_frame_pace_present_count_{0};
+  std::atomic<uint64_t> guest_frame_pace_suppressed_{0};
+  std::atomic<uint64_t> guest_frame_pace_window_start_ms_{0};
+  std::atomic<uint64_t> guest_frame_pace_window_start_frame_count_{0};
+  std::atomic<uint64_t> guest_frame_pace_window_start_vblank_count_{0};
+
 #if REX_PLATFORM_WIN32
   static Microsoft::WRL::ComPtr<IDXGIOutput> GetDXGIOutputForMonitor(IDXGIFactory1* factory,
                                                                      HMONITOR monitor);
@@ -1030,6 +1092,13 @@ class Presenter {
 
   std::mutex dxgi_ui_tick_mutex_;
   uint64_t dxgi_ui_tick_last_vblank_ = 1;
+  // Vsync present gate: the host vblank tick (dxgi_ui_tick_last_vblank_) on
+  // which the last present was made. Read/written from both the UI thread and
+  // the guest output thread (hence atomic); the log throttle state below is
+  // only touched under dxgi_ui_tick_mutex_.
+  std::atomic<uint64_t> vsync_present_gate_last_present_tick_{0};
+  std::atomic<uint64_t> vsync_present_gate_suppressed_{0};
+  uint64_t vsync_present_gate_last_log_time_ms_ = 0;
   // If output is null or shutdown is true, the signal may not be sent, either
   // don't limit the frame rate in this case (an exceptional situation, such as
   // a failure to find the output in DXGI), or don't draw at all if the window

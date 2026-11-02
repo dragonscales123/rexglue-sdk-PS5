@@ -197,8 +197,10 @@ uint32_t Clock::ScaleGuestDurationMillis(uint32_t guest_ms) {
   } else if (!guest_ms) {
     return 0;
   }
+  // Guest time runs guest_time_scalar_ times as fast as host time, so a guest
+  // duration takes 1/scalar of it on the host.
   uint64_t scaled_ms =
-      static_cast<uint64_t>((static_cast<uint64_t>(guest_ms) * guest_time_scalar_));
+      static_cast<uint64_t>((static_cast<uint64_t>(guest_ms) / guest_time_scalar_));
   return static_cast<uint32_t>(std::min(scaled_ms, max));
 }
 
@@ -213,12 +215,12 @@ int64_t Clock::ScaleGuestDurationFileTime(int64_t guest_file_time) {
     // Absolute time.
     uint64_t guest_time = Clock::QueryGuestSystemTime();
     int64_t relative_time = guest_file_time - static_cast<int64_t>(guest_time);
-    int64_t scaled_time = static_cast<int64_t>(relative_time * guest_time_scalar_);
+    int64_t scaled_time = static_cast<int64_t>(relative_time / guest_time_scalar_);
     return static_cast<int64_t>(guest_time) + scaled_time;
   } else {
     // Relative time.
     uint64_t scaled_file_time =
-        static_cast<uint64_t>((static_cast<uint64_t>(guest_file_time) * guest_time_scalar_));
+        static_cast<uint64_t>(static_cast<int64_t>(guest_file_time / guest_time_scalar_));
     // TODO(benvanik): check for overflow?
     return scaled_file_time;
   }
@@ -229,9 +231,9 @@ void Clock::ScaleGuestDurationTimeval(int32_t* tv_sec, int32_t* tv_usec) {
     return;
   }
 
-  uint64_t scaled_sec = static_cast<uint64_t>(static_cast<uint64_t>(*tv_sec) * guest_time_scalar_);
+  uint64_t scaled_sec = static_cast<uint64_t>(static_cast<uint64_t>(*tv_sec) / guest_time_scalar_);
   uint64_t scaled_usec =
-      static_cast<uint64_t>(static_cast<uint64_t>(*tv_usec) * guest_time_scalar_);
+      static_cast<uint64_t>(static_cast<uint64_t>(*tv_usec) / guest_time_scalar_);
   if (scaled_usec > std::numeric_limits<uint32_t>::max()) {
     uint64_t overflow_sec = scaled_usec / 1000000;
     scaled_usec -= overflow_sec * 1000000;
