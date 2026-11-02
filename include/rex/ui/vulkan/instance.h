@@ -106,6 +106,9 @@ class VulkanInstance {
 #ifdef VK_USE_PLATFORM_METAL_EXT
     bool ext_EXT_metal_surface = false;  // #217
 #endif
+#if REX_PLATFORM_PS5
+    bool ext_KHR_display = false;  // #3, SDL's PS5 display-plane surface
+#endif
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
     bool ext_EXT_debug_utils = false;                          // #129
     bool ext_KHR_portability_enumeration = false;              // #395

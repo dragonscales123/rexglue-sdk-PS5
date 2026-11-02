@@ -35,7 +35,8 @@
 
 #include <rex/ui/surface_mac.h>
 #elif REX_PLATFORM_PS5
-// No window system on the console; the game creates its own Vulkan surface.
+// No window system on the console: SDL makes the VK_KHR_display surface.
+#include <rex/ui/surface_ps5.h>
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -459,7 +460,9 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #elif REX_PLATFORM_PS5
-  (void)allowed_types;
+  if (allowed_types & Surface::kTypeFlag_SDLVulkan) {
+    return std::make_unique<SDLVulkanSurface>(sdl_window_);
+  }
 #else
   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {

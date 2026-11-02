@@ -27,6 +27,11 @@
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 
+#if REX_PLATFORM_PS5
+// RADV's ICD entry point, from the libvulkan_radeon archive linked into the title.
+extern "C" PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char* name);
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -74,6 +79,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     }
     return nullptr;
   }
+#elif REX_PLATFORM_PS5
+  // No loader on the console: RADV is linked into the title and is called
+  // directly through its ICD entry point (as SDL's PS5 driver and re:Blue do).
+  // vkDestroyInstance is resolved once the instance exists.
+  (void)loader_loaded;
+  ifn.vkGetInstanceProcAddr = vk_icdGetInstanceProcAddr;
 #else
   loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
   if (!loader_loaded) {
@@ -82,11 +93,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   }
 #endif
 
+#if !REX_PLATFORM_PS5
 #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
 #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+#endif
   if (!functions_loaded) {
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
     return nullptr;
@@ -164,6 +177,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     // #217.
     requested_extensions.emplace("VK_EXT_metal_surface",
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
+#endif
+#if REX_PLATFORM_PS5
+    // #3. SDL_Vulkan_CreateSurface makes a display-plane surface with it.
+    requested_extensions.emplace("VK_KHR_display", &vulkan_instance->extensions_.ext_KHR_display);
 #endif
   }
 
@@ -383,6 +400,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                  vk::to_string(vk::Result(instance_create_result)));
     return nullptr;
   }
+
+#if REX_PLATFORM_PS5
+  // An ICD has no global vkDestroyInstance; take the instance-level one.
+  ifn.vkDestroyInstance = PFN_vkDestroyInstance(
+      ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkDestroyInstance"));
+  functions_loaded &= ifn.vkDestroyInstance != nullptr;
+#endif
 
   // Load instance functions.
 

@@ -44,6 +44,11 @@
 #endif
 #if REX_PLATFORM_MAC
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_PS5
+#include <SDL3/SDL_error.h>
+#include <SDL3/SDL_vulkan.h>
+
+#include <rex/ui/surface_ps5.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
@@ -444,6 +449,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #if REX_PLATFORM_MAC
   if (instance_extensions.ext_EXT_metal_surface) {
     type_flags |= Surface::kTypeFlag_CAMetalLayer;
+  }
+#endif
+#if REX_PLATFORM_PS5
+  if (instance_extensions.ext_KHR_surface && instance_extensions.ext_KHR_display) {
+    type_flags |= Surface::kTypeFlag_SDLVulkan;
   }
 #endif
   return type_flags;
@@ -856,6 +866,19 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.pLayer = metal_surface.layer();
         vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
+#if REX_PLATFORM_PS5
+      case Surface::kTypeIndex_SDLVulkan: {
+        // SDL's PS5 driver makes the display-plane surface (VK_KHR_display)
+        // through the same RADV this instance comes from.
+        auto& sdl_surface = static_cast<const SDLVulkanSurface&>(new_surface);
+        if (SDL_Vulkan_CreateSurface(sdl_surface.window(), instance, nullptr,
+                                     &paint_context_.vulkan_surface)) {
+          vulkan_surface_create_result = VK_SUCCESS;
+        } else {
+          REXLOG_ERROR("VulkanPresenter: SDL_Vulkan_CreateSurface failed: {}", SDL_GetError());
+        }
       } break;
 #endif
       default:

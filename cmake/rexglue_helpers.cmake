@@ -157,12 +157,17 @@ function(rexglue_configure_target target_name)
                 "rexglue_configure_target: unknown GPU plugin '${_plugin}' "
                 "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
         endif()
-        add_custom_command(TARGET ${target_name} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:${_plugin_target}>
-                $<TARGET_FILE_DIR:${target_name}>
-            VERBATIM
-        )
+        if(PS5)
+            # Static on the console: link it in (LoadGpuPlugin calls it).
+            target_link_libraries(${target_name} PRIVATE ${_plugin_target})
+        else()
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:${_plugin_target}>
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+        endif()
         unset(_plugin_target)
     endforeach()
 

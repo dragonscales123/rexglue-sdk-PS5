@@ -36,6 +36,8 @@ class Surface {
     kTypeIndex_Win32Hwnd,
     // macOS — CAMetalLayer presented via MoltenVK (VK_EXT_metal_surface).
     kTypeIndex_CAMetalLayer,
+    // PS5: an SDL window whose VkSurfaceKHR SDL makes (VK_KHR_display).
+    kTypeIndex_SDLVulkan,
   };
   using TypeFlags = uint32_t;
   enum : TypeFlags {
@@ -44,6 +46,7 @@ class Surface {
     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
     kTypeFlag_CAMetalLayer = TypeFlags(1) << kTypeIndex_CAMetalLayer,
+    kTypeFlag_SDLVulkan = TypeFlags(1) << kTypeIndex_SDLVulkan,
   };
 
   Surface(const Surface& surface) = delete;

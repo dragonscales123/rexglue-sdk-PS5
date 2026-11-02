@@ -97,13 +97,17 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
 
-add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
-add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 if(PS5)
-    # A loadable GPU plugin has no place in a static PS5 title; titles there
-    # render themselves (re:Blue through plume).
+    # A PS5 title is one static executable, so the plugin is a static library
+    # linked into the titles that ask for it (GPU_PLUGINS xenos), and
+    # LoadGpuPlugin calls its rex_gpu_create directly. Titles that render
+    # themselves (re:Blue through plume) don't ask, and don't build it.
+    add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
     set_target_properties(rexgpu-xenos PROPERTIES EXCLUDE_FROM_ALL ON)
+else()
+    add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 endif()
+add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 
 set_target_properties(rexgpu-xenos PROPERTIES
     EXPORT_NAME gpu-xenos

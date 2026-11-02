@@ -74,8 +74,11 @@ elseif(APPLE)
     )
 elseif(PS5)
     # No window system: the title presents through VK_KHR_display (SDL's PS5
-    # video driver), and the game renders and presents itself.
-    set(REXUI_PLATFORM_SOURCES)
+    # video driver). A title on the SDK's Xenos GPU presents through an
+    # SDL-made surface (surface_ps5.cpp); others render and present themselves.
+    set(REXUI_PLATFORM_SOURCES
+        surface_ps5.cpp
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
