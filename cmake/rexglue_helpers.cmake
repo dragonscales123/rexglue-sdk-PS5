@@ -158,8 +158,13 @@ function(rexglue_configure_target target_name)
                 "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
         endif()
         if(PS5)
-            # Static on the console: link it in (LoadGpuPlugin calls it).
+            # Static on the console: link it in (LoadGpuPlugin calls it), and
+            # refer to its factory strongly so the linker takes it out of the
+            # archive (the loader's own reference is weak).
             target_link_libraries(${target_name} PRIVATE ${_plugin_target})
+            if(_plugin STREQUAL "xenos")
+                target_sources(${target_name} PRIVATE ${REXGLUE_SHARE_DIR}/gpu_plugin_link_ps5.cpp)
+            endif()
         else()
             add_custom_command(TARGET ${target_name} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
