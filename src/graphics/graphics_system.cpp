@@ -45,6 +45,14 @@ REXCVAR_DEFINE_BOOL(guest_vblank_pacing, true, "GPU",
                     "Pace emulated vblank interrupts at the guest refresh rate when VSync is on")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// A title that waits a fixed number of vblanks per frame (Fable II waits 2:
+// 30 fps at 60 Hz) runs at a proportionally higher capped rate when vblanks
+// come faster (2 -> 120 Hz -> 60 fps), keeping its own frame pacing.
+REXCVAR_DEFINE_UINT32(guest_vblank_multiplier, 1, "GPU",
+                      "With VSync and guest_vblank_pacing on, emulated vblanks come this many "
+                      "times per guest refresh (1-8). 2 doubles a vblank-paced title's frame cap.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace {
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
@@ -166,9 +174,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              (REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_pacing))
-                  ? vsync_interval_ticks : no_vsync_interval_ticks;
+          uint64_t interval_ticks = no_vsync_interval_ticks;
+          if (REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_pacing)) {
+            uint32_t multiplier = std::clamp(REXCVAR_GET(guest_vblank_multiplier), 1u, 8u);
+            interval_ticks = std::max(uint64_t(1), vsync_interval_ticks / multiplier);
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
