@@ -26,12 +26,12 @@ Counters& counters();
 // The thread registry runs always (cheap); sampling only with REX_PROFILE=1.
 void RegisterCurrentThread(const char* name);
 // CPU time consumed by the first registered thread whose name starts with
-// name_prefix. False if there is none.
+// name_prefix. False if there is none. The console cannot read another
+// thread's CPU clock (pthread_getcpuclockid gives the caller's), so the thread
+// is signalled and reads its own clock in the handler (costs nothing between
+// queries).
 bool ThreadCpuTimeNs(const char* name_prefix, uint64_t* cpu_ns);
-// The console cannot read another thread's CPU clock (pthread_getcpuclockid
-// gives the caller's), so threads publish their own: call from points a thread
-// passes often; only every 16th call reads the clock.
-void PublishSelfCpuTime();
+
 void SetThreadName(pthread_t thread, const char* name);
 void UnregisterCurrentThread();
 }  // namespace rex::ps5prof

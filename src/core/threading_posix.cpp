@@ -197,9 +197,6 @@ uint32_t current_thread_system_id() {
 }
 
 void MaybeYield() {
-#if REX_PLATFORM_PS5
-  rex::ps5prof::PublishSelfCpuTime();
-#endif
   sched_yield();
   __sync_synchronize();
 }
@@ -209,9 +206,6 @@ void SyncMemory() {
 }
 
 void Sleep(std::chrono::microseconds duration) {
-#if REX_PLATFORM_PS5
-  rex::ps5prof::PublishSelfCpuTime();
-#endif
   timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};
   auto p_rqtp = &rqtp;
@@ -229,9 +223,6 @@ void Sleep(std::chrono::microseconds duration) {
 thread_local bool alertable_state_ = false;
 bool DispatchCurrentThreadUserCallback();
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
-#if REX_PLATFORM_PS5
-  rex::ps5prof::PublishSelfCpuTime();
-#endif
   alertable_state_ = true;
   auto deadline = std::chrono::steady_clock::now() + duration;
   while (true) {
@@ -345,9 +336,6 @@ class PosixConditionBase {
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
                                                     bool wait_all,
                                                     std::chrono::milliseconds timeout) {
-#if REX_PLATFORM_PS5
-  rex::ps5prof::PublishSelfCpuTime();
-#endif
     assert_true(!handles.empty());
 
     if (handles.size() == 1) {
@@ -1226,9 +1214,6 @@ template <>
 PosixConditionHandle<Thread>::PosixConditionHandle(pthread_t thread) : handle_(thread) {}
 
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
-#if REX_PLATFORM_PS5
-  rex::ps5prof::PublishSelfCpuTime();
-#endif
   auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);
   if (posix_wait_handle == nullptr) {
     return WaitResult::kFailed;

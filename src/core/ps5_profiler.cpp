@@ -20,6 +20,7 @@
 #include <array>
 #include <map>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,7 +58,6 @@ struct Slot {
   bool used = false;
   pthread_t thread{};
   uint64_t stack_hi = 0;  // one past the highest stack byte, 0 if unknown
-  std::atomic<uint64_t> self_cpu_ns{0};  // published by the thread itself
   char name[32] = {};
   uint64_t total = 0;
   uint64_t outside = 0;
@@ -79,6 +79,7 @@ std::atomic<uint64_t> g_request_seq{0};
 std::atomic<uint64_t> g_sample_rip{0};
 std::atomic<uint64_t> g_sample_seq{0};
 std::atomic<uint64_t> g_sample_caller{0};
+std::atomic<uint64_t> g_sample_cpu_ns{0};  // the signalled thread's own CPU time
 uint64_t g_sample_chain[6];  // written by the handler before g_sample_seq is published
 uint64_t g_text_end = UINT64_MAX;  // set before the handler is installed
 std::atomic<uint64_t> g_target_stack_hi{0};  // stack top of the thread being sampled
@@ -90,6 +91,8 @@ uint64_t TextEnd() {
 }
 
 void SigprofHandler(int, siginfo_t*, void* context) {
+  // The interrupted code may be about to read errno; clock_gettime can set it.
+  const int saved_errno = errno;
   auto* uc = static_cast<ucontext_t*>(context);
   const uint64_t seq = g_request_seq.load(std::memory_order_acquire);
   const uint64_t rip = uint64_t(uc->uc_mcontext.mc_rip);
@@ -116,7 +119,13 @@ void SigprofHandler(int, siginfo_t*, void* context) {
   }
   g_sample_caller.store(caller, std::memory_order_relaxed);
   g_sample_rip.store(rip, std::memory_order_relaxed);
+  timespec cpu_ts;
+  g_sample_cpu_ns.store(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_ts) == 0
+                            ? uint64_t(cpu_ts.tv_sec) * 1000000000ull + uint64_t(cpu_ts.tv_nsec)
+                            : 0,
+                        std::memory_order_relaxed);
   g_sample_seq.store(seq, std::memory_order_release);
+  errno = saved_errno;
 }
 
 uint64_t NowNs() {
@@ -324,8 +333,6 @@ void* SamplerThread(void*) {
 }
 
 std::atomic<bool> g_registry_ready{false};
-thread_local Slot* t_self_slot = nullptr;
-thread_local uint32_t t_publish_calls = 0;
 
 void StartIfEnabled() {
   bool expected = false;
@@ -335,15 +342,16 @@ void StartIfEnabled() {
     return;
   }
   g_slots = new Slot[kMaxThreads];
-  g_registry_ready.store(true, std::memory_order_release);
-  const char* env = getenv("REX_PROFILE");
-  if (!env || !*env || *env == '0') return;
   g_text_end = TextEnd();
+  // SIGPROF serves both the sampler and per-thread CPU time queries.
   struct sigaction action{};
   action.sa_flags = SA_SIGINFO | SA_RESTART;
   action.sa_sigaction = SigprofHandler;
   sigemptyset(&action.sa_mask);
-  if (sigaction(SIGPROF, &action, nullptr) != 0) return;
+  const bool handler_installed = sigaction(SIGPROF, &action, nullptr) == 0;
+  g_registry_ready.store(true, std::memory_order_release);
+  const char* env = getenv("REX_PROFILE");
+  if (!env || !*env || *env == '0' || !handler_installed) return;
   g_enabled.store(true, std::memory_order_release);
   pthread_t thread;
   pthread_attr_t attr;
@@ -394,9 +402,6 @@ void RegisterCurrentThread(const char* name) {
     strncpy(slot->name, name, sizeof(slot->name) - 1);
     slot->name[sizeof(slot->name) - 1] = '\0';
   }
-  if (slot) {
-    t_self_slot = slot;
-  }
 }
 
 void SetThreadName(pthread_t thread, const char* name) {
@@ -410,11 +415,9 @@ void SetThreadName(pthread_t thread, const char* name) {
 
 void UnregisterCurrentThread() {
   if (!g_registry_ready.load(std::memory_order_acquire)) return;
-  t_self_slot = nullptr;
   std::lock_guard<std::mutex> lock(g_lock);
   if (Slot* slot = FindLocked(pthread_self())) {
     slot->used = false;
-    slot->self_cpu_ns.store(0, std::memory_order_relaxed);
     slot->total = slot->outside = 0;
     slot->hits.clear();
     slot->outside_hits.clear();
@@ -430,21 +433,27 @@ bool ThreadCpuTimeNs(const char* name_prefix, uint64_t* cpu_ns) {
   for (size_t i = 0; i < kMaxThreads; ++i) {
     Slot& s = g_slots[i];
     if (!s.used || strncmp(s.name, name_prefix, prefix_length) != 0) continue;
-    const uint64_t ns = s.self_cpu_ns.load(std::memory_order_relaxed);
+    if (pthread_equal(s.thread, pthread_self())) {
+      timespec ts;
+      if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return false;
+      *cpu_ns = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+      return true;
+    }
+    g_target_thread = s.thread;
+    g_target_stack_hi.store(s.stack_hi, std::memory_order_release);
+    const uint64_t seq = g_request_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (pthread_kill(s.thread, SIGPROF) != 0) return false;
+    const uint64_t wait_start = NowNs();
+    while (g_sample_seq.load(std::memory_order_acquire) != seq) {
+      if (NowNs() - wait_start > 5000000ull) return false;
+      sched_yield();
+    }
+    const uint64_t ns = g_sample_cpu_ns.load(std::memory_order_relaxed);
     if (!ns) return false;
     *cpu_ns = ns;
     return true;
   }
   return false;
-}
-
-void PublishSelfCpuTime() {
-  Slot* slot = t_self_slot;
-  if (!slot || (++t_publish_calls & 15) != 0) return;
-  timespec ts;
-  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return;
-  slot->self_cpu_ns.store(uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec),
-                          std::memory_order_relaxed);
 }
 
 }  // namespace rex::ps5prof
