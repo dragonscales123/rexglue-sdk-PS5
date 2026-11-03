@@ -448,22 +448,38 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
     return;
   }
   // Watch only the runs of pages that were made valid (not the hot ones).
-  uint32_t run_first = UINT32_MAX;
-  for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
-    bool valid = false;
-    if (page <= valid_page_last) {
-      auto global_lock = global_critical_region_.Acquire();
-      valid = (system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
-    }
-    if (valid) {
-      if (run_first == UINT32_MAX) {
-        run_first = page;
+  // Find the runs under one acquisition of the global lock (it is shared with
+  // the guest's threads), then protect them outside it.
+  std::pair<uint32_t, uint32_t> runs_local[16];
+  std::vector<std::pair<uint32_t, uint32_t>> runs_overflow;
+  size_t run_count = 0;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    uint32_t run_first = UINT32_MAX;
+    for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
+      const bool valid =
+          page <= valid_page_last && ((system_page_flags_valid_[page >> 6] >> (page & 63)) & 1);
+      if (valid) {
+        if (run_first == UINT32_MAX) {
+          run_first = page;
+        }
+      } else if (run_first != UINT32_MAX) {
+        const std::pair<uint32_t, uint32_t> run(run_first, page - run_first);
+        if (run_count < rex::countof(runs_local)) {
+          runs_local[run_count] = run;
+        } else {
+          runs_overflow.push_back(run);
+        }
+        ++run_count;
+        run_first = UINT32_MAX;
       }
-    } else if (run_first != UINT32_MAX) {
-      memory().EnablePhysicalMemoryAccessCallbacks(
-          run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
-      run_first = UINT32_MAX;
     }
+  }
+  for (size_t i = 0; i < run_count; ++i) {
+    const std::pair<uint32_t, uint32_t>& run =
+        i < rex::countof(runs_local) ? runs_local[i] : runs_overflow[i - rex::countof(runs_local)];
+    memory().EnablePhysicalMemoryAccessCallbacks(run.first << page_size_log2_,
+                                                 run.second << page_size_log2_, true, false);
   }
 }
 
