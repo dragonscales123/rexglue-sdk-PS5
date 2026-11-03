@@ -5509,6 +5509,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+  for (LastTextureDescriptorSet& last : last_texture_descriptor_sets_) {
+    last.set = VK_NULL_HANDLE;
+  }
   texture_transient_descriptor_sets_free_.clear();
   texture_transient_descriptor_sets_used_.clear();
   transient_descriptor_allocator_textures_.Reset();
@@ -6579,44 +6582,24 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-
-  // Make sure new descriptor sets are bound to the command buffer.
-
-  current_graphics_descriptor_sets_bound_up_to_date_ &=
-      current_graphics_descriptor_set_values_up_to_date_;
-
-  // Fill the texture and sampler write image infos.
-
-  bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-  bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Gather the texture and sampler bindings of both stages, then reuse the
+  // descriptor set of the previous draw of this frame where they are the same
+  // (most consecutive draws keep their textures), instead of allocating,
+  // writing and binding a new one for every draw.
   descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+  descriptor_write_image_info_.reserve(texture_count_vertex + sampler_count_vertex +
+                                       texture_count_pixel + sampler_count_pixel);
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
-    for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
+  for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+    VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+    descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+        texture_binding.fetch_constant, texture_binding.dimension, bool(texture_binding.is_signed));
+    descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                            ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                            : VK_IMAGE_LAYOUT_UNDEFINED;
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
+  if (sampler_count_vertex) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_vertex_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
@@ -6624,7 +6607,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
+  if (texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6636,13 +6619,59 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
+  if (sampler_count_pixel) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_pixel_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
     }
   }
+  size_t image_info_end = descriptor_write_image_info_.size();
+
+  const VkDescriptorSetLayout texture_set_layouts[2] = {
+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref()};
+  const uint32_t texture_set_indices[2] = {SpirvShaderTranslator::kDescriptorSetTexturesVertex,
+                                           SpirvShaderTranslator::kDescriptorSetTexturesPixel};
+  const uint32_t stage_texture_counts[2] = {texture_count_vertex, texture_count_pixel};
+  const uint32_t stage_sampler_counts[2] = {sampler_count_vertex, sampler_count_pixel};
+  const size_t stage_info_begin[2] = {vertex_texture_image_info_offset,
+                                      pixel_texture_image_info_offset};
+  const size_t stage_info_end[2] = {pixel_texture_image_info_offset, image_info_end};
+  bool texture_set_reused[2] = {false, false};
+  for (uint32_t stage = 0; stage < 2; ++stage) {
+    const uint32_t set_bit = UINT32_C(1) << texture_set_indices[stage];
+    const LastTextureDescriptorSet& last = last_texture_descriptor_sets_[stage];
+    const size_t info_count = stage_info_end[stage] - stage_info_begin[stage];
+    const bool same = info_count && last.set != VK_NULL_HANDLE && last.frame == frame_current_ &&
+                      last.layout == texture_set_layouts[stage] &&
+                      last.texture_count == stage_texture_counts[stage] &&
+                      last.sampler_count == stage_sampler_counts[stage] &&
+                      last.image_info.size() == info_count &&
+                      std::memcmp(last.image_info.data(),
+                                  descriptor_write_image_info_.data() + stage_info_begin[stage],
+                                  info_count * sizeof(VkDescriptorImageInfo)) == 0;
+    if (same) {
+      texture_set_reused[stage] = true;
+      if (current_graphics_descriptor_sets_[texture_set_indices[stage]] != last.set) {
+        current_graphics_descriptor_sets_[texture_set_indices[stage]] = last.set;
+        current_graphics_descriptor_sets_bound_up_to_date_ &= ~set_bit;
+      }
+      current_graphics_descriptor_set_values_up_to_date_ |= set_bit;
+    } else {
+      current_graphics_descriptor_set_values_up_to_date_ &= ~set_bit;
+    }
+  }
+
+  // Make sure new descriptor sets are bound to the command buffer.
+
+  current_graphics_descriptor_sets_bound_up_to_date_ &=
+      current_graphics_descriptor_set_values_up_to_date_;
+
+  bool write_vertex_textures =
+      (texture_count_vertex || sampler_count_vertex) && !texture_set_reused[0];
+  bool write_pixel_textures =
+      (texture_count_pixel || sampler_count_pixel) && !texture_set_reused[1];
 
   // Write the new descriptor sets.
 
@@ -6708,6 +6737,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
         write_textures[0].dstSet;
+    LastTextureDescriptorSet& last = last_texture_descriptor_sets_[0];
+    last.frame = frame_current_;
+    last.layout = texture_set_layouts[0];
+    last.texture_count = texture_count_vertex;
+    last.sampler_count = sampler_count_vertex;
+    last.image_info.assign(descriptor_write_image_info_.begin() + stage_info_begin[0],
+                           descriptor_write_image_info_.begin() + stage_info_end[0]);
+    last.set = write_textures[0].dstSet;
   }
   // Pixel shader textures and samplers.
   if (write_pixel_textures) {
@@ -6725,6 +6762,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
+    LastTextureDescriptorSet& last = last_texture_descriptor_sets_[1];
+    last.frame = frame_current_;
+    last.layout = texture_set_layouts[1];
+    last.texture_count = texture_count_pixel;
+    last.sampler_count = sampler_count_pixel;
+    last.image_info.assign(descriptor_write_image_info_.begin() + stage_info_begin[1],
+                           descriptor_write_image_info_.begin() + stage_info_end[1]);
+    last.set = write_textures[0].dstSet;
   }
   // Write.
   if (write_descriptor_set_count) {

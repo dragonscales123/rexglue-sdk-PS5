@@ -572,6 +572,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Temporary storage with reusable memory for writing image and sampler
   // descriptors.
   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
+  // The last texture/sampler descriptor set written for each stage (0 vertex,
+  // 1 pixel), reused by later draws of the same frame whose bindings are
+  // identical (transient sets are recycled only after their frame completes).
+  struct LastTextureDescriptorSet {
+    uint64_t frame = 0;
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    uint32_t texture_count = 0;
+    uint32_t sampler_count = 0;
+    std::vector<VkDescriptorImageInfo> image_info;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+  };
+  LastTextureDescriptorSet last_texture_descriptor_sets_[2];
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
