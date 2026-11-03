@@ -91,6 +91,34 @@ void Ps5FaultLine(const char* what, int signal_number, const siginfo_t* info, ui
     (void)write(fd, line, size_t(len));
   }
 }
+// The code addresses on the faulting thread's stack, for a backtrace of an
+// unhandled fault: symbolized offline against the linked ELF (the title is
+// loaded at 0x400000 and its code is the first, executable segment).
+// PS5_Vulkan's title layout (ps5-pie-unwind.ld) starts the read-only segment,
+// right after the code, with .eh_frame_hdr and names its start.
+extern "C" char __eh_frame_hdr_start[];
+void Ps5FaultStack(uint64_t rsp) {
+  static int fd = open("/app0/faults.txt", O_WRONLY | O_APPEND);
+  if (fd < 0 || !rsp) {
+    return;
+  }
+  const uint64_t lo = 0x400000;
+  const uint64_t hi = uint64_t(__eh_frame_hdr_start);
+  const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
+  char line[64];
+  int found = 0;
+  for (int i = 0; i < 4096 && found < 48; ++i) {
+    const uint64_t value = stack[i];
+    if (value >= lo && value < hi) {
+      const int len = std::snprintf(line, sizeof(line), "  stack[%d]=0x%llx\n", i,
+                                    (unsigned long long)value);
+      if (len > 0) {
+        (void)write(fd, line, size_t(len));
+      }
+      ++found;
+    }
+  }
+}
 }  // namespace
 #endif
 
@@ -535,6 +563,7 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   // which is otherwise the only trace a crash there leaves.
 #if REX_PLATFORM_PS5
   Ps5FaultLine("UNHANDLED", signal_number, signal_info, ps5_fault_rip, true);
+  Ps5FaultStack(uint64_t(reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext.mc_rsp));
 #endif
   const struct sigaction* original = nullptr;
   switch (signal_number) {
