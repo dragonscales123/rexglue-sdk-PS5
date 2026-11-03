@@ -20,6 +20,14 @@
 #if REX_PLATFORM_POSIX
 
 #include <signal.h>
+#if defined(__PROSPERO__)
+#include <fcntl.h>
+#include <pthread_np.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
+#endif
 
 #include <cstdint>
 #include <cstring>
@@ -54,8 +62,46 @@ constexpr size_t kFxsaveXmmOffset = 160;
 // Executed in order.
 std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
 
+#if REX_PLATFORM_PS5
+// PS5 diagnostics: the console's kernel reports a fatal fault but nothing of
+// the title's own state, so the first faults that reach this handler, and
+// every one it does not handle, are written to /app0/faults.txt with write(2).
+namespace {
+std::atomic<uint32_t> ps5_fault_count{0};
+constexpr uint32_t kPs5FaultsLogged = 200;
+void Ps5FaultLine(const char* what, int signal_number, const siginfo_t* info, uint64_t rip,
+                  bool always) {
+  const uint32_t n = ps5_fault_count.load(std::memory_order_relaxed);
+  if (!always && n > kPs5FaultsLogged) {
+    return;
+  }
+  static int fd = -2;
+  if (fd == -2) {
+    fd = open("/app0/faults.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  }
+  if (fd < 0) {
+    return;
+  }
+  char line[192];
+  const int len = std::snprintf(line, sizeof(line), "%u %s sig=%d code=%d addr=%p rip=0x%llx tid=%d\n",
+                                n, what, signal_number, info ? info->si_code : 0,
+                                info ? info->si_addr : nullptr, (unsigned long long)rip,
+                                (int)pthread_getthreadid_np());
+  if (len > 0) {
+    (void)write(fd, line, size_t(len));
+  }
+}
+}  // namespace
+#endif
+
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
+#if REX_PLATFORM_PS5
+  const uint64_t ps5_fault_rip =
+      uint64_t(reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext.mc_rip);
+  ps5_fault_count.fetch_add(1, std::memory_order_relaxed);
+  Ps5FaultLine("enter", signal_number, signal_info, ps5_fault_rip, false);
+#endif
 #if REX_PLATFORM_MAC
   // Darwin's mcontext_t is already a pointer (__darwin_mcontext64*); copy it.
   mcontext_t mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
@@ -299,6 +345,9 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   for (size_t i = 0; i < rex::countof(handlers_) && handlers_[i].first; ++i) {
     if (handlers_[i].first(&ex, handlers_[i].second)) {
       // Exception handled.
+#if REX_PLATFORM_PS5
+      Ps5FaultLine("handled", signal_number, signal_info, ps5_fault_rip, false);
+#endif
 #if REX_ARCH_AMD64
 #if REX_PLATFORM_MAC
       mcontext->__ss.__rip = thread_context.rip;
@@ -484,6 +533,9 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   // the default action (terminate with a report) unless the process had its
   // own crash reporter - a PS5 title records the crash in /app0/boot.txt,
   // which is otherwise the only trace a crash there leaves.
+#if REX_PLATFORM_PS5
+  Ps5FaultLine("UNHANDLED", signal_number, signal_info, ps5_fault_rip, true);
+#endif
   const struct sigaction* original = nullptr;
   switch (signal_number) {
     case SIGILL:
