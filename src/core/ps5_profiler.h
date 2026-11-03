@@ -20,6 +20,9 @@ struct Counters {
   std::atomic<uint64_t> upload_calls{0};     // shared-memory upload batches
   std::atomic<uint64_t> upload_bytes{0};
   std::atomic<uint64_t> hot_page_bytes{0};   // uploaded bytes left unwatched (hot pages)
+  std::atomic<uint64_t> hot_compared_bytes{0};  // hot-page bytes compared with the last upload
+  std::atomic<uint64_t> hot_skipped_bytes{0};   // ...skipped (already compared this epoch)
+  std::atomic<uint64_t> hot_check_epochs{0};    // guest CPU/GPU sync points
 };
 Counters& counters();
 

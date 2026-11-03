@@ -38,6 +38,12 @@ class SharedMemory {
   // Once per presented frame: periodically forgets which pages are "hot"
   // (see shared_memory_hot_pages).
   void OnFrameSwapped();
+  // Called by the command processor (on the GPU thread) at guest CPU/GPU
+  // synchronization points: a new batch from the ring buffer, GPU memory
+  // writes and fences, waits on guest memory, interrupts. Hot-page bytes
+  // already compared since the last one are not compared again until the
+  // next one (see shared_memory_hot_page_check_epochs).
+  void AdvanceHotCheckEpoch();
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -196,7 +202,19 @@ class SharedMemory {
   // Contents of each hot page as of its last upload, so unchanged hot pages
   // are not uploaded again (an upload in the middle of a submission ends the
   // render pass).
-  std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> hot_page_shadows_;
+  struct HotPageShadow {
+    std::unique_ptr<uint8_t[]> data;
+    // Bytes [verified_begin, verified_end) of the page were found equal to
+    // guest memory (or snapshotted) during check epoch verified_epoch, so
+    // requests in the same epoch skip comparing them again.
+    uint32_t verified_epoch = 0;
+    uint32_t verified_begin = 0;
+    uint32_t verified_end = 0;
+  };
+  std::unordered_map<uint32_t, HotPageShadow> hot_page_shadows_;
+  // Advanced at every point where the guest CPU may legitimately have changed
+  // memory the GPU already read (see AdvanceHotCheckEpoch). 0 = never.
+  uint32_t hot_check_epoch_ = 1;
   void FilterUnchangedHotPages(const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(

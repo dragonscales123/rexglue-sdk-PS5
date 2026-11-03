@@ -38,6 +38,12 @@ REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, REX_SHARED_MEMORY_HOT_PAGES_DEFAULT
                     "per frame; costs a page copy per request). Pages with texture watches stay "
                     "watched.");
 
+REXCVAR_DEFINE_BOOL(shared_memory_hot_page_check_epochs, true, "GPU",
+                    "With shared_memory_hot_pages, compare each requested hot-page byte with "
+                    "its last upload only once between guest CPU/GPU synchronization points "
+                    "(ring buffer batches, GPU fences and memory writes, waits, interrupts), "
+                    "instead of on every request. Turn off if geometry or textures look stale.");
+
 namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
@@ -379,11 +385,15 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
             snap &= ~(uint64_t(1) << snap_bit);
             uint32_t page = (i << 6) + snap_bit;
             auto& shadow = hot_page_shadows_[page];
-            if (!shadow) {
-              shadow = std::make_unique<uint8_t[]>(page_bytes);
+            if (!shadow.data) {
+              shadow.data = std::make_unique<uint8_t[]>(page_bytes);
             }
-            std::memcpy(shadow.get(), memory().TranslatePhysical(page << page_size_log2_),
+            std::memcpy(shadow.data.get(), memory().TranslatePhysical(page << page_size_log2_),
                         page_bytes);
+            // The whole page equals guest memory as of now.
+            shadow.verified_epoch = hot_check_epoch_;
+            shadow.verified_begin = 0;
+            shadow.verified_end = uint32_t(page_bytes);
           }
 #if REX_PLATFORM_PS5
           rex::ps5prof::counters().hot_page_bytes.fetch_add(
@@ -472,6 +482,15 @@ void SharedMemory::OnFrameSwapped() {
   hot_page_shadows_.clear();
 }
 
+void SharedMemory::AdvanceHotCheckEpoch() {
+  if (++hot_check_epoch_ == 0) {
+    hot_check_epoch_ = 1;
+  }
+#if REX_PLATFORM_PS5
+  rex::ps5prof::counters().hot_check_epochs.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
 void SharedMemory::FilterUnchangedHotPages(
     const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) {
   // Call in the global critical region, with upload_ranges_ filled from
@@ -483,6 +502,10 @@ void SharedMemory::FilterUnchangedHotPages(
     return;
   }
   const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+  const bool use_epochs = REXCVAR_GET(shared_memory_hot_page_check_epochs);
+  const uint32_t epoch = hot_check_epoch_;
+  uint64_t compared_bytes = 0;
+  uint64_t skipped_bytes = 0;
   size_t range_index = 0;
   std::vector<std::pair<uint32_t, uint32_t>> kept;
   kept.reserve(upload_ranges_.size());
@@ -506,17 +529,42 @@ void SharedMemory::FilterUnchangedHotPages(
             ++range_index;
           }
           bool unchanged = true;
+          HotPageShadow& shadow = it->second;
           const uint8_t* guest = memory().TranslatePhysical(page_start);
+          if (!use_epochs || shadow.verified_epoch != epoch) {
+            shadow.verified_epoch = epoch;
+            shadow.verified_begin = 0;
+            shadow.verified_end = 0;
+          }
           for (size_t r = range_index; r < byte_ranges.size() && unchanged; ++r) {
-            const uint32_t start = std::max(byte_ranges[r].first, page_start);
-            const uint32_t end =
-                std::min(byte_ranges[r].first + byte_ranges[r].second, page_end);
             if (byte_ranges[r].first >= page_end) {
               break;
             }
-            if (start < end) {
-              unchanged = std::memcmp(it->second.get() + (start - page_start),
-                                      guest + (start - page_start), end - start) == 0;
+            const uint32_t start =
+                std::max(byte_ranges[r].first, page_start) - page_start;
+            const uint32_t end =
+                std::min(byte_ranges[r].first + byte_ranges[r].second, page_end) - page_start;
+            if (start >= end) {
+              continue;
+            }
+            if (start >= shadow.verified_begin && end <= shadow.verified_end) {
+              // Already found equal since the last synchronization point.
+              skipped_bytes += end - start;
+              continue;
+            }
+            compared_bytes += end - start;
+            unchanged =
+                std::memcmp(shadow.data.get() + start, guest + start, end - start) == 0;
+            if (unchanged) {
+              if (start <= shadow.verified_end && end >= shadow.verified_begin &&
+                  shadow.verified_end > shadow.verified_begin) {
+                // Overlapping or adjacent: grow the verified span.
+                shadow.verified_begin = std::min(shadow.verified_begin, start);
+                shadow.verified_end = std::max(shadow.verified_end, end);
+              } else if (end - start > shadow.verified_end - shadow.verified_begin) {
+                shadow.verified_begin = start;
+                shadow.verified_end = end;
+              }
             }
           }
           if (unchanged) {
@@ -528,6 +576,19 @@ void SharedMemory::FilterUnchangedHotPages(
     }
   }
   upload_ranges_.swap(kept);
+#if REX_PLATFORM_PS5
+  if (compared_bytes) {
+    rex::ps5prof::counters().hot_compared_bytes.fetch_add(compared_bytes,
+                                                          std::memory_order_relaxed);
+  }
+  if (skipped_bytes) {
+    rex::ps5prof::counters().hot_skipped_bytes.fetch_add(skipped_bytes,
+                                                         std::memory_order_relaxed);
+  }
+#else
+  (void)compared_bytes;
+  (void)skipped_bytes;
+#endif
 }
 
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {

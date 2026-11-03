@@ -361,6 +361,9 @@ void CommandProcessor::WorkerThreadMain() {
     }
     assert_true(read_ptr_index_ != write_ptr_index);
 
+    // New commands from the CPU: data written for them may overwrite bytes
+    // earlier commands read.
+    OnGuestSyncPoint();
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
@@ -493,6 +496,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      OnGuestSyncPoint();
     }
   } else {
     switch (index) {
@@ -1014,6 +1018,23 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       REXGPU_INFO("Unimplemented GPU OPCODE: 0x{:02X}\t\tCOUNT: {}\n", opcode, count);
       assert_always();
       reader->AdvanceRead(count * sizeof(uint32_t));
+      break;
+  }
+  switch (opcode) {
+    // The GPU signalled the CPU (wrote memory, raised an interrupt, swapped)
+    // or waited for a value the CPU wrote.
+    case PM4_INTERRUPT:
+    case PM4_XE_SWAP:
+    case PM4_WAIT_REG_MEM:
+    case PM4_REG_TO_MEM:
+    case PM4_MEM_WRITE:
+    case PM4_COND_WRITE:
+    case PM4_EVENT_WRITE_SHD:
+    case PM4_EVENT_WRITE_EXT:
+    case PM4_EVENT_WRITE_ZPD:
+      OnGuestSyncPoint();
+      break;
+    default:
       break;
   }
 

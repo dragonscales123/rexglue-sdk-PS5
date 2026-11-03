@@ -173,6 +173,10 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // A point where the guest CPU may have changed memory the GPU already read
+  // (a new ring buffer batch, GPU memory writes and fences, waits on memory,
+  // interrupts, swaps).
+  virtual void OnGuestSyncPoint() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

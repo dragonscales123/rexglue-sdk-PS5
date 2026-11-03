@@ -192,6 +192,18 @@ void Dump(int fd, double seconds) {
                  double(c.upload_bytes.exchange(0)) * inv / 1048576.0,
                  double(c.hot_page_bytes.exchange(0)) * inv / 1048576.0);
     write(fd, header, size_t(n));
+    // Hot-page check volume (cumulative counters only read here).
+    static uint64_t previous_hot[3] = {};
+    const uint64_t hot_now[3] = {counters_now.hot_compared_bytes.load(),
+                                 counters_now.hot_skipped_bytes.load(),
+                                 counters_now.hot_check_epochs.load()};
+    n = snprintf(header, sizeof(header),
+                 "hot-check/s: compared %.1f MB, skipped %.1f MB, epochs %.0f\n",
+                 double(hot_now[0] - previous_hot[0]) * inv / 1048576.0,
+                 double(hot_now[1] - previous_hot[1]) * inv / 1048576.0,
+                 double(hot_now[2] - previous_hot[2]) * inv);
+    for (int k = 0; k < 3; ++k) previous_hot[k] = hot_now[k];
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;
