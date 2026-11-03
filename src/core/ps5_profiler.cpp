@@ -49,6 +49,7 @@ constexpr uint64_t kLoadBase = 0x400000;
 struct Slot {
   bool used = false;
   pthread_t thread{};
+  uint64_t stack_hi = 0;  // one past the highest stack byte, 0 if unknown
   char name[32] = {};
   uint64_t total = 0;
   uint64_t outside = 0;
@@ -72,6 +73,8 @@ std::atomic<uint64_t> g_sample_seq{0};
 std::atomic<uint64_t> g_sample_caller{0};
 uint64_t g_sample_chain[6];  // written by the handler before g_sample_seq is published
 uint64_t g_text_end = UINT64_MAX;  // set before the handler is installed
+std::atomic<uint64_t> g_target_stack_hi{0};  // stack top of the thread being sampled
+pthread_t g_target_thread{};  // so a late signal never uses another thread's stack top
 
 uint64_t TextEnd() {
   return __eh_frame_hdr_start ? reinterpret_cast<uint64_t>(__eh_frame_hdr_start)
@@ -88,8 +91,14 @@ void SigprofHandler(int, siginfo_t*, void* context) {
     // In a library or a system call: the title return addresses on the stack
     // name who made the call (heuristic, no frame pointers; 160 words above rsp).
     const uint64_t* sp = reinterpret_cast<const uint64_t*>(uc->uc_mcontext.mc_rsp);
+    // Never read past the thread's stack top; without one, stay in rsp's page.
+    uint64_t limit = g_target_stack_hi.load(std::memory_order_acquire);
+    if (!pthread_equal(pthread_self(), g_target_thread)) limit = 0;
+    const uint64_t rsp = uint64_t(uc->uc_mcontext.mc_rsp);
+    if (limit <= rsp) limit = (rsp | 0x3FFFull) + 1;
+    const int words = int(std::min<uint64_t>(160, (limit - rsp) / 8));
     int found = 0;
-    for (int i = 0; i < 160 && found < 6; ++i) {
+    for (int i = 0; i < words && found < 6; ++i) {
       const uint64_t v = sp[i];
       if (v >= kLoadBase && v < g_text_end) {
         if (!found) caller = v;
@@ -226,6 +235,8 @@ void SamplerMain() {
       for (size_t i = 0; i < kMaxThreads; ++i) {
         Slot& s = g_slots[i];
         if (!s.used || pthread_equal(s.thread, self)) continue;
+        g_target_thread = s.thread;
+        g_target_stack_hi.store(s.stack_hi, std::memory_order_release);
         const uint64_t seq = g_request_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (pthread_kill(s.thread, SIGPROF) != 0) continue;
         // The thread may be off-core; give it up to 2 ms to take the signal.
@@ -309,6 +320,17 @@ void RegisterCurrentThread(const char* name) {
         slot->used = true;
         slot->thread = self;
         slot->name[0] = '\0';
+        slot->stack_hi = 0;
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) == 0) {
+          void* stack_addr = nullptr;
+          size_t stack_size = 0;
+          if (pthread_attr_get_np(self, &attr) == 0 &&
+              pthread_attr_getstack(&attr, &stack_addr, &stack_size) == 0 && stack_addr) {
+            slot->stack_hi = reinterpret_cast<uint64_t>(stack_addr) + stack_size;
+          }
+          pthread_attr_destroy(&attr);
+        }
         break;
       }
     }
