@@ -267,8 +267,16 @@ extern PPCFuncMapping PPCFuncMappings[];
 //=============================================================================
 
 inline std::unordered_map<u32, jmp_buf>& get_jmp_buf_map() {
-  static thread_local std::unordered_map<u32, jmp_buf> map;
-  return map;
+  // A pointer, not the map itself: a thread_local with a destructor is unsafe
+  // under emulated TLS (the PS5's -femulated-tls), where the per-thread
+  // storage can be freed before the destructor runs at thread exit, which then
+  // walks freed nodes and damages the heap. The map is small and per thread;
+  // it is left to the thread's end, as the process's own exit would.
+  static thread_local std::unordered_map<u32, jmp_buf>* map = nullptr;
+  if (!map) {
+    map = new std::unordered_map<u32, jmp_buf>();
+  }
+  return *map;
 }
 
 #define ppc_setjmp(guest_buf_addr) (setjmp(::get_jmp_buf_map()[(guest_buf_addr)]))
