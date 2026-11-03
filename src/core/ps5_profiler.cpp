@@ -52,6 +52,7 @@ struct Slot {
   uint64_t outside = 0;
   std::unordered_map<uint64_t, uint32_t> hits;
   std::unordered_map<uint64_t, uint32_t> outside_hits;  // raw rips (libc, kernel)
+  std::unordered_map<uint64_t, uint32_t> outside_callers;  // first title address on the stack
 };
 
 std::mutex g_lock;
@@ -65,6 +66,8 @@ std::atomic<bool> g_started{false};
 std::atomic<uint64_t> g_request_seq{0};
 std::atomic<uint64_t> g_sample_rip{0};
 std::atomic<uint64_t> g_sample_seq{0};
+std::atomic<uint64_t> g_sample_caller{0};
+uint64_t g_text_end = UINT64_MAX;  // set before the handler is installed
 
 uint64_t TextEnd() {
   return __eh_frame_hdr_start ? reinterpret_cast<uint64_t>(__eh_frame_hdr_start)
@@ -74,7 +77,22 @@ uint64_t TextEnd() {
 void SigprofHandler(int, siginfo_t*, void* context) {
   auto* uc = static_cast<ucontext_t*>(context);
   const uint64_t seq = g_request_seq.load(std::memory_order_acquire);
-  g_sample_rip.store(uint64_t(uc->uc_mcontext.mc_rip), std::memory_order_relaxed);
+  const uint64_t rip = uint64_t(uc->uc_mcontext.mc_rip);
+  uint64_t caller = 0;
+  if (rip < kLoadBase || rip >= g_text_end) {
+    // In a library or a system call: the nearest title return address on the
+    // stack names who made the call (heuristic; 64 words above rsp).
+    const uint64_t* sp = reinterpret_cast<const uint64_t*>(uc->uc_mcontext.mc_rsp);
+    for (int i = 0; i < 64; ++i) {
+      const uint64_t v = sp[i];
+      if (v >= kLoadBase && v < g_text_end) {
+        caller = v;
+        break;
+      }
+    }
+  }
+  g_sample_caller.store(caller, std::memory_order_relaxed);
+  g_sample_rip.store(rip, std::memory_order_relaxed);
   g_sample_seq.store(seq, std::memory_order_release);
 }
 
@@ -139,12 +157,22 @@ void Dump(int fd, double seconds) {
                  (unsigned long long)outside[k].second);
         out += line;
       }
+      std::vector<std::pair<uint32_t, uint64_t>> callers;
+      for (auto& [caller, count] : s.outside_callers) callers.emplace_back(count, caller);
+      std::sort(callers.begin(), callers.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      for (size_t k = 0; k < std::min<size_t>(callers.size(), 40); ++k) {
+        snprintf(line, sizeof(line), "  c %u 0x%llx\n", callers[k].first,
+                 (unsigned long long)(callers[k].second ? callers[k].second - kLoadBase : 0));
+        out += line;
+      }
       write(fd, out.data(), out.size());
     }
     s.total = 0;
     s.outside = 0;
     s.hits.clear();
     s.outside_hits.clear();
+    s.outside_callers.clear();
   }
   (void)text_end;
 }
@@ -193,6 +221,7 @@ void SamplerMain() {
         if (rip < kLoadBase || rip >= text_end) {
           ++s.outside;
           ++s.outside_hits[rip];
+          ++s.outside_callers[g_sample_caller.load(std::memory_order_relaxed)];
         } else {
           ++s.hits[rip];
         }
@@ -220,6 +249,7 @@ void StartIfEnabled() {
   const char* env = getenv("REX_PROFILE");
   if (!env || !*env || *env == '0') return;
   g_slots = new Slot[kMaxThreads];
+  g_text_end = TextEnd();
   struct sigaction action{};
   action.sa_flags = SA_SIGINFO | SA_RESTART;
   action.sa_sigaction = SigprofHandler;
@@ -283,6 +313,7 @@ void UnregisterCurrentThread() {
     slot->total = slot->outside = 0;
     slot->hits.clear();
     slot->outside_hits.clear();
+    slot->outside_callers.clear();
   }
 }
 
