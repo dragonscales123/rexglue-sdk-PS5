@@ -706,6 +706,14 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
            pipeline_storage_file_);
   }
+  // C requires a file positioning call between input and output on an update
+  // stream. The stored pipelines are read by exact count, so EOF is never hit,
+  // and on strict libcs (PS5) every later append silently fails without this,
+  // so the pipeline storage never grows past what the first run wrote.
+  clearerr(pipeline_storage_file_);
+  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
+  clearerr(shader_storage_file_);
+  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
 
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
