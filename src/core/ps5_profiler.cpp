@@ -148,11 +148,14 @@ void Dump(int fd, double seconds) {
     Counters& c = counters();
     const double inv = seconds > 0 ? 1.0 / seconds : 0.0;
     n = snprintf(header, sizeof(header),
-                 "counters/s: mprotect %.0f (%.1f MB) invalidations %.0f uploads %.0f "
-                 "(%.1f MB, hot %.1f MB)\n",
+                 "counters/s: mprotect %.0f (%.1f MB) invalidations %.0f (fault %.1f MB, "
+                 "exact %.1f MB, gpu-written %.1f MB) uploads %.0f (%.1f MB, hot %.1f MB)\n",
                  double(c.mprotect_calls.exchange(0)) * inv,
                  double(c.mprotect_bytes.exchange(0)) * inv / 1048576.0,
                  double(c.invalidations.exchange(0)) * inv,
+                 double(c.invalidated_bytes_fault.exchange(0)) * inv / 1048576.0,
+                 double(c.invalidated_bytes_exact.exchange(0)) * inv / 1048576.0,
+                 double(c.gpu_written_bytes.exchange(0)) * inv / 1048576.0,
                  double(c.upload_calls.exchange(0)) * inv,
                  double(c.upload_bytes.exchange(0)) * inv / 1048576.0,
                  double(c.hot_page_bytes.exchange(0)) * inv / 1048576.0);

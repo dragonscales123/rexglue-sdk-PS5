@@ -354,6 +354,12 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         }
         valid_bits &= ~hot;
       }
+#if REX_PLATFORM_PS5
+      if (written_by_gpu) {
+        rex::ps5prof::counters().gpu_written_bytes.fetch_add(
+            uint64_t(rex::bit_count(valid_bits)) << page_size_log2_, std::memory_order_relaxed);
+      }
+#endif
       if (written_by_gpu && !hot_page_shadows_.empty()) {
         // The GPU copy now differs from what the shadow describes.
         uint64_t written = valid_bits;
@@ -713,6 +719,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
 #if REX_PLATFORM_PS5
   rex::ps5prof::counters().invalidations.fetch_add(1, std::memory_order_relaxed);
+  (exact_range ? rex::ps5prof::counters().invalidated_bytes_exact
+               : rex::ps5prof::counters().invalidated_bytes_fault)
+      .fetch_add(uint64_t(page_last - page_first + 1) << page_size_log2_,
+                 std::memory_order_relaxed);
 #endif
 
   FireWatches(page_first, page_last, false);
