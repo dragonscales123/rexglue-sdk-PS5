@@ -193,16 +193,24 @@ void Dump(int fd, double seconds) {
                  double(c.hot_page_bytes.exchange(0)) * inv / 1048576.0);
     write(fd, header, size_t(n));
     // Hot-page check volume (cumulative counters only read here).
-    static uint64_t previous_hot[3] = {};
-    const uint64_t hot_now[3] = {counters_now.hot_compared_bytes.load(),
+    static uint64_t previous_hot[8] = {};
+    const uint64_t hot_now[8] = {counters_now.hot_compared_bytes.load(),
                                  counters_now.hot_skipped_bytes.load(),
-                                 counters_now.hot_check_epochs.load()};
+                                 counters_now.hot_check_epochs.load(),
+                                 counters_now.sync_points[0].load(),
+                                 counters_now.sync_points[1].load(),
+                                 counters_now.sync_points[2].load(),
+                                 counters_now.sync_points[3].load(),
+                                 counters_now.sync_points[4].load()};
+    double d[8];
+    for (int k = 0; k < 8; ++k) {
+      d[k] = double(hot_now[k] - previous_hot[k]) * inv;
+      previous_hot[k] = hot_now[k];
+    }
     n = snprintf(header, sizeof(header),
-                 "hot-check/s: compared %.1f MB, skipped %.1f MB, epochs %.0f\n",
-                 double(hot_now[0] - previous_hot[0]) * inv / 1048576.0,
-                 double(hot_now[1] - previous_hot[1]) * inv / 1048576.0,
-                 double(hot_now[2] - previous_hot[2]) * inv);
-    for (int k = 0; k < 3; ++k) previous_hot[k] = hot_now[k];
+                 "hot-check/s: compared %.1f MB, skipped %.1f MB, epochs %.0f | sync points: "
+                 "batch %.0f, wait %.0f, interrupt %.0f, swap %.0f, gpu-signal %.0f\n",
+                 d[0] / 1048576.0, d[1] / 1048576.0, d[2], d[3], d[4], d[5], d[6], d[7]);
     write(fd, header, size_t(n));
   }
 

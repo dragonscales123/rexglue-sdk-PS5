@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/guest_sync.h>
 #include <rex/memory.h>
 #include <rex/thread/mutex.h>
 
@@ -39,11 +40,12 @@ class SharedMemory {
   // (see shared_memory_hot_pages).
   void OnFrameSwapped();
   // Called by the command processor (on the GPU thread) at guest CPU/GPU
-  // synchronization points: a new batch from the ring buffer, GPU memory
-  // writes and fences, waits on guest memory, interrupts. Hot-page bytes
-  // already compared since the last one are not compared again until the
-  // next one (see shared_memory_hot_page_check_epochs).
-  void AdvanceHotCheckEpoch();
+  // synchronization points. Hot-page bytes already compared since the last
+  // epoch are not compared again until the next one (see
+  // shared_memory_hot_page_check_epochs). GPU signals (fences, memory
+  // writes) only start an epoch with shared_memory_hot_page_epoch_on_gpu_signals:
+  // commands the CPU writes in response arrive in a later batch, which does.
+  void AdvanceHotCheckEpoch(GuestSyncPoint kind);
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,

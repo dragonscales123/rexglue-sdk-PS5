@@ -23,6 +23,7 @@
 
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/frame_limiter.h>
+#include <rex/graphics/guest_sync.h>
 #include <rex/graphics/guest_frame_meter.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
@@ -173,10 +174,8 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
-  // A point where the guest CPU may have changed memory the GPU already read
-  // (a new ring buffer batch, GPU memory writes and fences, waits on memory,
-  // interrupts, swaps).
-  virtual void OnGuestSyncPoint() {}
+  // A guest CPU/GPU synchronization point (see GuestSyncPoint).
+  virtual void OnGuestSyncPoint(GuestSyncPoint kind) {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

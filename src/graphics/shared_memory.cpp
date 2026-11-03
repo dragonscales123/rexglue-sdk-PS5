@@ -44,6 +44,10 @@ REXCVAR_DEFINE_BOOL(shared_memory_hot_page_check_epochs, true, "GPU",
                     "(ring buffer batches, GPU fences and memory writes, waits, interrupts), "
                     "instead of on every request. Turn off if geometry or textures look stale.");
 
+REXCVAR_DEFINE_BOOL(shared_memory_hot_page_epoch_on_gpu_signals, false, "GPU",
+                    "With shared_memory_hot_page_check_epochs, also start a new check epoch at "
+                    "every GPU fence or memory write (stricter, far less effective).");
+
 namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
@@ -482,7 +486,14 @@ void SharedMemory::OnFrameSwapped() {
   hot_page_shadows_.clear();
 }
 
-void SharedMemory::AdvanceHotCheckEpoch() {
+void SharedMemory::AdvanceHotCheckEpoch(GuestSyncPoint kind) {
+#if REX_PLATFORM_PS5
+  rex::ps5prof::counters().sync_points[uint32_t(kind)].fetch_add(1, std::memory_order_relaxed);
+#endif
+  if (kind == GuestSyncPoint::kGpuSignal &&
+      !REXCVAR_GET(shared_memory_hot_page_epoch_on_gpu_signals)) {
+    return;
+  }
   if (++hot_check_epoch_ == 0) {
     hot_check_epoch_ = 1;
   }

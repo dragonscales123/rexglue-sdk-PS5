@@ -363,7 +363,7 @@ void CommandProcessor::WorkerThreadMain() {
 
     // New commands from the CPU: data written for them may overwrite bytes
     // earlier commands read.
-    OnGuestSyncPoint();
+    OnGuestSyncPoint(GuestSyncPoint::kBatch);
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
@@ -496,7 +496,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
-      OnGuestSyncPoint();
+      OnGuestSyncPoint(GuestSyncPoint::kGpuSignal);
     }
   } else {
     switch (index) {
@@ -1021,18 +1021,22 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
   }
   switch (opcode) {
-    // The GPU signalled the CPU (wrote memory, raised an interrupt, swapped)
-    // or waited for a value the CPU wrote.
-    case PM4_INTERRUPT:
-    case PM4_XE_SWAP:
     case PM4_WAIT_REG_MEM:
+      OnGuestSyncPoint(GuestSyncPoint::kWait);
+      break;
+    case PM4_INTERRUPT:
+      OnGuestSyncPoint(GuestSyncPoint::kInterrupt);
+      break;
+    case PM4_XE_SWAP:
+      OnGuestSyncPoint(GuestSyncPoint::kSwap);
+      break;
     case PM4_REG_TO_MEM:
     case PM4_MEM_WRITE:
     case PM4_COND_WRITE:
     case PM4_EVENT_WRITE_SHD:
     case PM4_EVENT_WRITE_EXT:
     case PM4_EVENT_WRITE_ZPD:
-      OnGuestSyncPoint();
+      OnGuestSyncPoint(GuestSyncPoint::kGpuSignal);
       break;
     default:
       break;

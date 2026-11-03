@@ -3587,9 +3587,9 @@ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
-void VulkanCommandProcessor::OnGuestSyncPoint() {
+void VulkanCommandProcessor::OnGuestSyncPoint(GuestSyncPoint kind) {
   if (shared_memory_) {
-    shared_memory_->AdvanceHotCheckEpoch();
+    shared_memory_->AdvanceHotCheckEpoch(kind);
   }
 }
 
