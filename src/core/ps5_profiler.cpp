@@ -57,6 +57,7 @@ struct Slot {
   bool used = false;
   pthread_t thread{};
   uint64_t stack_hi = 0;  // one past the highest stack byte, 0 if unknown
+  std::atomic<uint64_t> self_cpu_ns{0};  // published by the thread itself
   char name[32] = {};
   uint64_t total = 0;
   uint64_t outside = 0;
@@ -323,6 +324,8 @@ void* SamplerThread(void*) {
 }
 
 std::atomic<bool> g_registry_ready{false};
+thread_local Slot* t_self_slot = nullptr;
+thread_local uint32_t t_publish_calls = 0;
 
 void StartIfEnabled() {
   bool expected = false;
@@ -391,6 +394,9 @@ void RegisterCurrentThread(const char* name) {
     strncpy(slot->name, name, sizeof(slot->name) - 1);
     slot->name[sizeof(slot->name) - 1] = '\0';
   }
+  if (slot) {
+    t_self_slot = slot;
+  }
 }
 
 void SetThreadName(pthread_t thread, const char* name) {
@@ -404,9 +410,11 @@ void SetThreadName(pthread_t thread, const char* name) {
 
 void UnregisterCurrentThread() {
   if (!g_registry_ready.load(std::memory_order_acquire)) return;
+  t_self_slot = nullptr;
   std::lock_guard<std::mutex> lock(g_lock);
   if (Slot* slot = FindLocked(pthread_self())) {
     slot->used = false;
+    slot->self_cpu_ns.store(0, std::memory_order_relaxed);
     slot->total = slot->outside = 0;
     slot->hits.clear();
     slot->outside_hits.clear();
@@ -422,14 +430,21 @@ bool ThreadCpuTimeNs(const char* name_prefix, uint64_t* cpu_ns) {
   for (size_t i = 0; i < kMaxThreads; ++i) {
     Slot& s = g_slots[i];
     if (!s.used || strncmp(s.name, name_prefix, prefix_length) != 0) continue;
-    clockid_t clock;
-    if (pthread_getcpuclockid(s.thread, &clock) != 0) return false;
-    timespec ts;
-    if (clock_gettime(clock, &ts) != 0) return false;
-    *cpu_ns = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+    const uint64_t ns = s.self_cpu_ns.load(std::memory_order_relaxed);
+    if (!ns) return false;
+    *cpu_ns = ns;
     return true;
   }
   return false;
+}
+
+void PublishSelfCpuTime() {
+  Slot* slot = t_self_slot;
+  if (!slot || (++t_publish_calls & 15) != 0) return;
+  timespec ts;
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return;
+  slot->self_cpu_ns.store(uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec),
+                          std::memory_order_relaxed);
 }
 
 }  // namespace rex::ps5prof

@@ -13,6 +13,7 @@
 #include <rex/platform.h>
 #include <rex/version.h>
 #include <imgui.h>
+#include <algorithm>
 #if REX_PLATFORM_PS5
 #include <time.h>
 
@@ -37,12 +38,19 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
 #elif REX_PLATFORM_PS5
-  ImGui::SetNextWindowSize(ImVec2(340, 230), ImGuiCond_FirstUseEver);
+  // TV output: scale with the screen (2.0 at 1080p, 3.0 at 4K, as a TV is
+  // viewed from across the room).
+  const float tv_scale = std::max(1.0f, io.DisplaySize.y / 720.0f);
+  ImGui::SetNextWindowPos(ImVec2(20 * tv_scale, 20 * tv_scale), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(360 * tv_scale, 200 * tv_scale), ImGuiCond_FirstUseEver);
 #else
   ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
 #endif
   ImGui::SetNextWindowBgAlpha(0.5f);
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
+#if REX_PLATFORM_PS5
+    ImGui::SetWindowFontScale(tv_scale);
+#endif
     if (stats_provider_) {
       auto stats = stats_provider_();
       if (stats.frame_count > 0) {
