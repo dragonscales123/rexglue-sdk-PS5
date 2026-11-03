@@ -479,9 +479,30 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
   }
 
   // No handler took it: a real crash. Returning would re-run the faulting
-  // instruction forever (a silent hang at 100% CPU), so fall back to the
-  // default action and let the fault terminate the process with a report.
-  signal(signal_number, SIG_DFL);
+  // instruction forever (a silent hang at 100% CPU), so put back the handler
+  // that was there before ours and return: the fault re-runs into it. That is
+  // the default action (terminate with a report) unless the process had its
+  // own crash reporter - a PS5 title records the crash in /app0/boot.txt,
+  // which is otherwise the only trace a crash there leaves.
+  const struct sigaction* original = nullptr;
+  switch (signal_number) {
+    case SIGILL:
+      original = &original_sigill_handler_;
+      break;
+    case SIGSEGV:
+      original = &original_sigsegv_handler_;
+      break;
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
+    case SIGBUS:
+      original = &original_sigbus_handler_;
+      break;
+#endif
+    default:
+      break;
+  }
+  if (!original || sigaction(signal_number, original, nullptr) != 0) {
+    signal(signal_number, SIG_DFL);
+  }
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
