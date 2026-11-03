@@ -69,16 +69,19 @@ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
 namespace {
 std::atomic<uint32_t> ps5_fault_count{0};
 constexpr uint32_t kPs5FaultsLogged = 200;
+// One descriptor for every line, in append mode, so the fault lines and the
+// stack lines can't overwrite each other.
+int Ps5FaultFd() {
+  static int fd = open("/app0/faults.txt", O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0666);
+  return fd;
+}
 void Ps5FaultLine(const char* what, int signal_number, const siginfo_t* info, uint64_t rip,
                   bool always) {
   const uint32_t n = ps5_fault_count.load(std::memory_order_relaxed);
   if (!always && n > kPs5FaultsLogged) {
     return;
   }
-  static int fd = -2;
-  if (fd == -2) {
-    fd = open("/app0/faults.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  }
+  const int fd = Ps5FaultFd();
   if (fd < 0) {
     return;
   }
@@ -98,7 +101,7 @@ void Ps5FaultLine(const char* what, int signal_number, const siginfo_t* info, ui
 // right after the code, with .eh_frame_hdr and names its start.
 extern "C" char __eh_frame_hdr_start[];
 void Ps5FaultStack(uint64_t rsp) {
-  static int fd = open("/app0/faults.txt", O_WRONLY | O_APPEND);
+  const int fd = Ps5FaultFd();
   if (fd < 0 || !rsp) {
     return;
   }

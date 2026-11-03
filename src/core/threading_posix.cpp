@@ -23,6 +23,7 @@ static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 #include <memory>
 
 #include <pthread.h>
+#include <csetjmp>
 #include <semaphore.h>
 
 #if defined(__APPLE__)
@@ -629,6 +630,16 @@ struct ThreadStartData {
   Thread* thread_obj;
 };
 
+#if REX_PLATFORM_PS5
+// PS5: where a guest thread's own Terminate() returns to. pthread_exit() there
+// unwinds the thread's stack like an exception, running cleanups for frames of
+// recompiled code and host setjmp state it cannot unwind correctly; it called
+// destructors on freed or foreign objects and damaged the heap whenever a
+// guest thread ended itself (ExTerminateThread). Jumping back to the start
+// routine instead skips those frames, as ExitThread does on Windows.
+thread_local jmp_buf* thread_exit_jump_ = nullptr;
+#endif
+
 template <>
 class PosixCondition<Thread> : public PosixConditionBase {
   enum class State {
@@ -1019,6 +1030,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
       cond_.notify_all();
     }
     if (is_current_thread) {
+#if REX_PLATFORM_PS5
+      if (thread_exit_jump_) {
+        longjmp(*thread_exit_jump_, 1);
+      }
+#endif
       pthread_exit(reinterpret_cast<void*>(exit_code));
     } else {
 #if REX_PLATFORM_ANDROID
@@ -1475,7 +1491,23 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
                                        [thread] { return thread->handle_.suspend_count_ == 0; });
   }
 
+#if REX_PLATFORM_PS5
+  // Terminate() on this thread longjmps back here (see thread_exit_jump_);
+  // it has already published the finished state and the exit code.
+  jmp_buf exit_jump;
+  bool terminated = false;
+  if (setjmp(exit_jump) == 0) {
+    thread_exit_jump_ = &exit_jump;
+    start_routine();
+  } else {
+    terminated = true;
+  }
+  thread_exit_jump_ = nullptr;
+  if (!terminated) {
+#else
   start_routine();
+  {
+#endif
 
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
@@ -1487,6 +1519,8 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
+  }
+
   }
 
   current_thread_ = nullptr;
