@@ -197,7 +197,7 @@ class SharedMemory {
   // are not uploaded again (an upload in the middle of a submission ends the
   // render pass).
   std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> hot_page_shadows_;
-  void FilterUnchangedHotPages();
+  void FilterUnchangedHotPages(const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

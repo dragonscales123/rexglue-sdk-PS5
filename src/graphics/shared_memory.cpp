@@ -428,12 +428,18 @@ void SharedMemory::OnFrameSwapped() {
   hot_page_shadows_.clear();
 }
 
-void SharedMemory::FilterUnchangedHotPages() {
-  // Call in the global critical region, with upload_ranges_ filled.
+void SharedMemory::FilterUnchangedHotPages(
+    const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) {
+  // Call in the global critical region, with upload_ranges_ filled from
+  // byte_ranges (sorted, non-overlapping). Only the requested bytes of a hot
+  // page are compared: the shadow always equals the GPU copy, so if those
+  // bytes match, the GPU copy is correct for this request; the rest of the
+  // page is checked when it is requested.
   if (hot_page_shadows_.empty() || upload_ranges_.empty()) {
     return;
   }
-  const size_t page_bytes = size_t(1) << page_size_log2_;
+  const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+  size_t range_index = 0;
   std::vector<std::pair<uint32_t, uint32_t>> kept;
   kept.reserve(upload_ranges_.size());
   auto keep = [&kept](uint32_t page) {
@@ -447,10 +453,31 @@ void SharedMemory::FilterUnchangedHotPages() {
     for (uint32_t page = range.first; page < range.first + range.second; ++page) {
       if ((hot_pages_[page >> 6] >> (page & 63)) & 1) {
         auto it = hot_page_shadows_.find(page);
-        if (it != hot_page_shadows_.end() &&
-            std::memcmp(it->second.get(), memory().TranslatePhysical(page << page_size_log2_),
-                        page_bytes) == 0) {
-          continue;  // unchanged since its last upload
+        if (it != hot_page_shadows_.end()) {
+          const uint32_t page_start = page << page_size_log2_;
+          const uint32_t page_end = page_start + page_bytes;
+          // Pages come in increasing order, so the range cursor only moves on.
+          while (range_index < byte_ranges.size() &&
+                 byte_ranges[range_index].first + byte_ranges[range_index].second <= page_start) {
+            ++range_index;
+          }
+          bool unchanged = true;
+          const uint8_t* guest = memory().TranslatePhysical(page_start);
+          for (size_t r = range_index; r < byte_ranges.size() && unchanged; ++r) {
+            const uint32_t start = std::max(byte_ranges[r].first, page_start);
+            const uint32_t end =
+                std::min(byte_ranges[r].first + byte_ranges[r].second, page_end);
+            if (byte_ranges[r].first >= page_end) {
+              break;
+            }
+            if (start < end) {
+              unchanged = std::memcmp(it->second.get() + (start - page_start),
+                                      guest + (start - page_start), end - start) == 0;
+            }
+          }
+          if (unchanged) {
+            continue;  // the requested bytes match the GPU copy
+          }
         }
       }
       keep(page);
@@ -598,7 +625,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       }
     }
     if (REXCVAR_GET(shared_memory_hot_pages)) {
-      FilterUnchangedHotPages();
+      FilterUnchangedHotPages(merged_ranges);
     }
   }
 
