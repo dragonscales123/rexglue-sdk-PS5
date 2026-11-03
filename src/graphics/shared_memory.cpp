@@ -44,6 +44,12 @@ REXCVAR_DEFINE_BOOL(shared_memory_hot_page_check_epochs, true, "GPU",
                     "(ring buffer batches, GPU fences and memory writes, waits, interrupts), "
                     "instead of on every request. Turn off if geometry or textures look stale.");
 
+REXCVAR_DEFINE_BOOL(shared_memory_widen_into_watched_pages, false, "GPU",
+                    "Let the widening of a CPU write fault's invalidation (up to 64 pages) cover "
+                    "pages that something (a texture) watches. Off: the widening stops at them, "
+                    "so a write next to a texture doesn't reload it; the texture's pages stay "
+                    "protected and still catch writes to them.");
+
 REXCVAR_DEFINE_BOOL(shared_memory_hot_page_epoch_on_gpu_signals, false, "GPU",
                     "With shared_memory_hot_page_check_epochs, also start a new check epoch at "
                     "every GPU fence or memory write (stricter, far less effective).");
@@ -307,6 +313,11 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
       // will be broken.
       node = node->bucket_node_next;
       if (page_first <= range->page_last && page_last >= range->page_first) {
+#if REX_PLATFORM_PS5
+        if (!invalidated_by_gpu) {
+          rex::ps5prof::counters().watch_fires.fetch_add(1, std::memory_order_relaxed);
+        }
+#endif
         range->callback(global_lock, range->callback_context, range->callback_data,
                         range->callback_argument, invalidated_by_gpu);
         UnlinkWatchRange(range);
@@ -798,11 +809,30 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;
       page_first = (page_first & ~uint32_t(63)) + (64 - rex::lzcnt(gpu_written_start));
     }
+    const uint32_t fault_page_first = physical_address_start >> page_size_log2_;
+    const uint32_t fault_page_last = physical_address_last >> page_size_log2_;
     if ((page_last & 63) != 63) {
       uint64_t gpu_written_end = system_page_flags_valid_and_gpu_written_[block_last];
       gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+    }
+    if (!REXCVAR_GET(shared_memory_widen_into_watched_pages)) {
+      // Don't widen into watched pages: they are protected (a write to them
+      // faults on its own), and invalidating them reloads their textures from
+      // unchanged data.
+      for (uint32_t page = fault_page_first; page > page_first; --page) {
+        if (PageHasRangeWatch(page - 1)) {
+          page_first = page;
+          break;
+        }
+      }
+      for (uint32_t page = fault_page_last; page < page_last; ++page) {
+        if (PageHasRangeWatch(page + 1)) {
+          page_last = page;
+          break;
+        }
+      }
     }
   }
 

@@ -26,6 +26,7 @@ struct Counters {
   // Guest CPU/GPU sync points by kind (graphics::GuestSyncPoint): batch,
   // wait, interrupt, swap, GPU signal.
   std::atomic<uint64_t> sync_points[5] = {};
+  std::atomic<uint64_t> watch_fires{0};  // range (texture) watches fired by CPU writes
 };
 Counters& counters();
 
