@@ -51,6 +51,7 @@ struct Slot {
   uint64_t total = 0;
   uint64_t outside = 0;
   std::unordered_map<uint64_t, uint32_t> hits;
+  std::unordered_map<uint64_t, uint32_t> outside_hits;  // raw rips (libc, kernel)
 };
 
 std::mutex g_lock;
@@ -127,11 +128,23 @@ void Dump(int fd, double seconds) {
                  (unsigned long long)(top[k].second - kLoadBase));
         out += line;
       }
+      // Outside the title: raw addresses (module code such as libc, or a
+      // kernel wait), so busy library time can be told from blocking.
+      std::vector<std::pair<uint32_t, uint64_t>> outside;
+      for (auto& [rip, count] : s.outside_hits) outside.emplace_back(count, rip);
+      std::sort(outside.begin(), outside.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      for (size_t k = 0; k < std::min<size_t>(outside.size(), 25); ++k) {
+        snprintf(line, sizeof(line), "  o %u 0x%llx\n", outside[k].first,
+                 (unsigned long long)outside[k].second);
+        out += line;
+      }
       write(fd, out.data(), out.size());
     }
     s.total = 0;
     s.outside = 0;
     s.hits.clear();
+    s.outside_hits.clear();
   }
   (void)text_end;
 }
@@ -179,6 +192,7 @@ void SamplerMain() {
         ++s.total;
         if (rip < kLoadBase || rip >= text_end) {
           ++s.outside;
+          ++s.outside_hits[rip];
         } else {
           ++s.hits[rip];
         }
@@ -268,6 +282,7 @@ void UnregisterCurrentThread() {
     slot->used = false;
     slot->total = slot->outside = 0;
     slot->hits.clear();
+    slot->outside_hits.clear();
   }
 }
 
