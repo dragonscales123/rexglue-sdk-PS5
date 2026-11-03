@@ -19,6 +19,10 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_PS5
+#include "../../core/ps5_profiler.h"
+#endif
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
@@ -356,6 +360,15 @@ bool VulkanSharedMemory::UploadRanges(
   }
   DeferredCommandBuffer& command_buffer = *command_buffer_ptr;
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+#if REX_PLATFORM_PS5
+  {
+    uint64_t pages = 0;
+    for (const auto& range : upload_page_ranges) pages += range.second;
+    rex::ps5prof::counters().upload_calls.fetch_add(1, std::memory_order_relaxed);
+    rex::ps5prof::counters().upload_bytes.fetch_add(pages << page_size_log2(),
+                                                   std::memory_order_relaxed);
+  }
+#endif
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;

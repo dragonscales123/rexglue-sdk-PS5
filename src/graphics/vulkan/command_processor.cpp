@@ -2276,6 +2276,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+  if (shared_memory_) {
+    shared_memory_->OnFrameSwapped();
+  }
 
   if (!graphics_system_)
     return;

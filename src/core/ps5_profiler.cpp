@@ -41,6 +41,12 @@
 extern "C" char __eh_frame_hdr_start[] __attribute__((weak));
 
 namespace rex::ps5prof {
+
+Counters& counters() {
+  static Counters c;
+  return c;
+}
+
 namespace {
 
 constexpr size_t kMaxThreads = 512;
@@ -134,10 +140,24 @@ void Dump(int fd, double seconds) {
   time_t wall = time(nullptr);
   struct tm tmv;
   localtime_r(&wall, &tmv);
-  char header[128];
+  char header[256];
   int n = snprintf(header, sizeof(header), "=== %02d:%02d:%02d interval %.1fs\n", tmv.tm_hour,
                    tmv.tm_min, tmv.tm_sec, seconds);
   write(fd, header, size_t(n));
+  {
+    Counters& c = counters();
+    const double inv = seconds > 0 ? 1.0 / seconds : 0.0;
+    n = snprintf(header, sizeof(header),
+                 "counters/s: mprotect %.0f (%.1f MB) invalidations %.0f uploads %.0f "
+                 "(%.1f MB, hot %.1f MB)\n",
+                 double(c.mprotect_calls.exchange(0)) * inv,
+                 double(c.mprotect_bytes.exchange(0)) * inv / 1048576.0,
+                 double(c.invalidations.exchange(0)) * inv,
+                 double(c.upload_calls.exchange(0)) * inv,
+                 double(c.upload_bytes.exchange(0)) * inv / 1048576.0,
+                 double(c.hot_page_bytes.exchange(0)) * inv / 1048576.0);
+    write(fd, header, size_t(n));
+  }
 
   size_t shown = 0;
   for (auto& [in_title, index] : busy) {

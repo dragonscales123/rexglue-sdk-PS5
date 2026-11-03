@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <mutex>
 #include <utility>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/memory.h>
@@ -33,6 +35,9 @@ class SharedMemory {
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
+  // Once per presented frame: periodically forgets which pages are "hot"
+  // (see shared_memory_hot_pages).
+  void OnFrameSwapped();
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -179,6 +184,20 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+
+  // shared_memory_hot_pages: pages the CPU keeps rewriting after the GPU read
+  // them. They are re-uploaded on every request instead of being write-watched,
+  // because a write fault plus re-protection costs far more than copying a page.
+  std::vector<uint64_t> hot_pages_;
+  // Write invalidations per 64-page block since the last reset.
+  std::vector<uint8_t> hot_block_invalidations_;
+  uint32_t hot_frames_ = 0;
+  bool PageHasRangeWatch(uint32_t page) const;
+  // Contents of each hot page as of its last upload, so unchanged hot pages
+  // are not uploaded again (an upload in the middle of a submission ends the
+  // render pass).
+  std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> hot_page_shadows_;
+  void FilterUnchangedHotPages();
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

@@ -46,6 +46,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
+#include "ps5_profiler.h"
 
 namespace rex {
 namespace memory {
@@ -139,6 +140,8 @@ bool InViews(uintptr_t address, size_t length) {
 std::atomic<bool> g_mprotect_warned{false};
 
 bool ChangeProtection(void* address, size_t length, PageAccess access) {
+  rex::ps5prof::counters().mprotect_calls.fetch_add(1, std::memory_order_relaxed);
+  rex::ps5prof::counters().mprotect_bytes.fetch_add(length, std::memory_order_relaxed);
   if (mprotect(address, length, int(ToPosixProtectFlags(access))) == 0) {
     return true;
   }

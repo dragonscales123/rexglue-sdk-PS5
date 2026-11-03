@@ -18,7 +18,18 @@
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
+#include <rex/cvar.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_PS5
+#include "../core/ps5_profiler.h"
+#endif
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, false, "GPU",
+                    "Re-upload pages the CPU keeps rewriting on every GPU request instead of "
+                    "write-watching them (saves a write fault and a protection change per page "
+                    "per frame; costs a page copy per request). Pages with texture watches stay "
+                    "watched.");
 
 namespace rex::graphics {
 
@@ -34,6 +45,8 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  hot_pages_.assign(num_system_page_flags_, 0);
+  hot_block_invalidations_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -292,6 +305,8 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
 
+  const bool hot_mode = !written_by_gpu && REXCVAR_GET(shared_memory_hot_pages);
+  bool any_hot = false;
   {
     auto global_lock = global_critical_region_.Acquire();
 
@@ -303,17 +318,145 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
+      if (hot_mode && (hot_pages_[i] & valid_bits)) {
+        // Hot pages that something (a texture) watches stay watched; the rest
+        // are left invalid, so every request uploads them again.
+        uint64_t hot = hot_pages_[i] & valid_bits;
+        uint64_t remaining = hot;
+        uint32_t bit;
+        while (rex::bit_scan_forward(remaining, &bit)) {
+          remaining &= ~(uint64_t(1) << bit);
+          if (PageHasRangeWatch((i << 6) + bit)) {
+            hot &= ~(uint64_t(1) << bit);
+          }
+        }
+        if (hot) {
+          any_hot = true;
+          // Snapshot before UploadRanges copies the page, so a CPU write in
+          // between only causes an extra upload later, never a missed one.
+          uint64_t snap = hot;
+          uint32_t snap_bit;
+          const size_t page_bytes = size_t(1) << page_size_log2_;
+          while (rex::bit_scan_forward(snap, &snap_bit)) {
+            snap &= ~(uint64_t(1) << snap_bit);
+            uint32_t page = (i << 6) + snap_bit;
+            auto& shadow = hot_page_shadows_[page];
+            if (!shadow) {
+              shadow = std::make_unique<uint8_t[]>(page_bytes);
+            }
+            std::memcpy(shadow.get(), memory().TranslatePhysical(page << page_size_log2_),
+                        page_bytes);
+          }
+#if REX_PLATFORM_PS5
+          rex::ps5prof::counters().hot_page_bytes.fetch_add(
+              uint64_t(rex::bit_count(hot)) << page_size_log2_, std::memory_order_relaxed);
+#endif
+        }
+        valid_bits &= ~hot;
+      }
+      if (written_by_gpu && !hot_page_shadows_.empty()) {
+        // The GPU copy now differs from what the shadow describes.
+        uint64_t written = valid_bits;
+        uint32_t written_bit;
+        while (rex::bit_scan_forward(written, &written_bit)) {
+          written &= ~(uint64_t(1) << written_bit);
+          hot_page_shadows_.erase((i << 6) + written_bit);
+        }
+      }
       system_page_flags_valid_[i] |= valid_bits;
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
     }
   }
 
-  if (memory_invalidation_callback_handle_) {
+  if (!memory_invalidation_callback_handle_) {
+    return;
+  }
+  if (!any_hot) {
     memory().EnablePhysicalMemoryAccessCallbacks(
         valid_page_first << page_size_log2_,
         (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    return;
   }
+  // Watch only the runs of pages that were made valid (not the hot ones).
+  uint32_t run_first = UINT32_MAX;
+  for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
+    bool valid = false;
+    if (page <= valid_page_last) {
+      auto global_lock = global_critical_region_.Acquire();
+      valid = (system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
+    }
+    if (valid) {
+      if (run_first == UINT32_MAX) {
+        run_first = page;
+      }
+    } else if (run_first != UINT32_MAX) {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
+      run_first = UINT32_MAX;
+    }
+  }
+}
+
+bool SharedMemory::PageHasRangeWatch(uint32_t page) const {
+  // Call in the global critical region.
+  uint32_t bucket = (page << page_size_log2_) >> kWatchBucketSizeLog2;
+  for (const WatchNode* node = watch_buckets_[bucket]; node != nullptr;
+       node = node->bucket_node_next) {
+    const WatchRange* range = node->range;
+    if (page >= range->page_first && page <= range->page_last) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SharedMemory::OnFrameSwapped() {
+  if (!REXCVAR_GET(shared_memory_hot_pages)) {
+    return;
+  }
+  // Every ~10 s forget the hot set, so pages that stopped changing (or got
+  // reused for something static) go back to being watched; pages that are
+  // still rewritten re-qualify after a few frames.
+  if (++hot_frames_ < 300) {
+    return;
+  }
+  hot_frames_ = 0;
+  auto global_lock = global_critical_region_.Acquire();
+  std::fill(hot_pages_.begin(), hot_pages_.end(), uint64_t(0));
+  std::fill(hot_block_invalidations_.begin(), hot_block_invalidations_.end(), uint8_t(0));
+  hot_page_shadows_.clear();
+}
+
+void SharedMemory::FilterUnchangedHotPages() {
+  // Call in the global critical region, with upload_ranges_ filled.
+  if (hot_page_shadows_.empty() || upload_ranges_.empty()) {
+    return;
+  }
+  const size_t page_bytes = size_t(1) << page_size_log2_;
+  std::vector<std::pair<uint32_t, uint32_t>> kept;
+  kept.reserve(upload_ranges_.size());
+  auto keep = [&kept](uint32_t page) {
+    if (!kept.empty() && kept.back().first + kept.back().second == page) {
+      ++kept.back().second;
+    } else {
+      kept.emplace_back(page, 1);
+    }
+  };
+  for (const auto& range : upload_ranges_) {
+    for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+      if ((hot_pages_[page >> 6] >> (page & 63)) & 1) {
+        auto it = hot_page_shadows_.find(page);
+        if (it != hot_page_shadows_.end() &&
+            std::memcmp(it->second.get(), memory().TranslatePhysical(page << page_size_log2_),
+                        page_bytes) == 0) {
+          continue;  // unchanged since its last upload
+        }
+      }
+      keep(page);
+    }
+  }
+  upload_ranges_.swap(kept);
 }
 
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
@@ -454,6 +597,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
         append_upload_range(range_start, page_last + 1 - range_start);
       }
     }
+    if (REXCVAR_GET(shared_memory_hot_pages)) {
+      FilterUnchangedHotPages();
+    }
   }
 
   COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
@@ -527,7 +673,20 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     }
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
+    if (REXCVAR_GET(shared_memory_hot_pages) && i < hot_block_invalidations_.size()) {
+      uint8_t& count = hot_block_invalidations_[i];
+      if (count < 255) {
+        ++count;
+      }
+      // Rewritten a few times since the last reset: stop watching it.
+      if (count >= 3) {
+        hot_pages_[i] |= invalidate_bits;
+      }
+    }
   }
+#if REX_PLATFORM_PS5
+  rex::ps5prof::counters().invalidations.fetch_add(1, std::memory_order_relaxed);
+#endif
 
   FireWatches(page_first, page_last, false);
 
