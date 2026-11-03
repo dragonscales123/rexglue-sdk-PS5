@@ -46,7 +46,14 @@ REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
     .range(0, 240)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+#if REX_PLATFORM_PS5
+// Off on the PS5: re-uploading every CPU-uploaded page each frame cost ~330 MB/s
+// of uploads there (Fable 2: 20.7 -> 21.5 fps with hot pages, movies intact).
+#define REX_CLEAR_MEMORY_PAGE_STATE_DEFAULT false
+#else
+#define REX_CLEAR_MEMORY_PAGE_STATE_DEFAULT true
+#endif
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, REX_CLEAR_MEMORY_PAGE_STATE_DEFAULT, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);

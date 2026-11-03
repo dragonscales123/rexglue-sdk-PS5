@@ -25,7 +25,14 @@
 #endif
 #include <rex/memory.h>
 
-REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, false, "GPU",
+#if REX_PLATFORM_PS5
+// On the PS5 a write fault plus re-protection (16 KiB pages, mprotect with TLB
+// shootdowns) costs far more than a page copy: on by default there.
+#define REX_SHARED_MEMORY_HOT_PAGES_DEFAULT true
+#else
+#define REX_SHARED_MEMORY_HOT_PAGES_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, REX_SHARED_MEMORY_HOT_PAGES_DEFAULT, "GPU",
                     "Re-upload pages the CPU keeps rewriting on every GPU request instead of "
                     "write-watching them (saves a write fault and a protection change per page "
                     "per frame; costs a page copy per request). Pages with texture watches stay "
