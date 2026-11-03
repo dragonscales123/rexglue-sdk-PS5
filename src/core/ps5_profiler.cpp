@@ -17,6 +17,8 @@
 #if defined(__PROSPERO__)
 
 #include <algorithm>
+#include <array>
+#include <map>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +55,7 @@ struct Slot {
   std::unordered_map<uint64_t, uint32_t> hits;
   std::unordered_map<uint64_t, uint32_t> outside_hits;  // raw rips (libc, kernel)
   std::unordered_map<uint64_t, uint32_t> outside_callers;  // first title address on the stack
+  std::map<std::array<uint64_t, 6>, uint32_t> outside_chains;  // first 6 title addresses
 };
 
 std::mutex g_lock;
@@ -67,6 +70,7 @@ std::atomic<uint64_t> g_request_seq{0};
 std::atomic<uint64_t> g_sample_rip{0};
 std::atomic<uint64_t> g_sample_seq{0};
 std::atomic<uint64_t> g_sample_caller{0};
+uint64_t g_sample_chain[6];  // written by the handler before g_sample_seq is published
 uint64_t g_text_end = UINT64_MAX;  // set before the handler is installed
 
 uint64_t TextEnd() {
@@ -79,15 +83,17 @@ void SigprofHandler(int, siginfo_t*, void* context) {
   const uint64_t seq = g_request_seq.load(std::memory_order_acquire);
   const uint64_t rip = uint64_t(uc->uc_mcontext.mc_rip);
   uint64_t caller = 0;
+  for (auto& v : g_sample_chain) v = 0;
   if (rip < kLoadBase || rip >= g_text_end) {
-    // In a library or a system call: the nearest title return address on the
-    // stack names who made the call (heuristic; 64 words above rsp).
+    // In a library or a system call: the title return addresses on the stack
+    // name who made the call (heuristic, no frame pointers; 160 words above rsp).
     const uint64_t* sp = reinterpret_cast<const uint64_t*>(uc->uc_mcontext.mc_rsp);
-    for (int i = 0; i < 64; ++i) {
+    int found = 0;
+    for (int i = 0; i < 160 && found < 6; ++i) {
       const uint64_t v = sp[i];
       if (v >= kLoadBase && v < g_text_end) {
-        caller = v;
-        break;
+        if (!found) caller = v;
+        g_sample_chain[found++] = v;
       }
     }
   }
@@ -134,7 +140,7 @@ void Dump(int fd, double seconds) {
       for (auto& [rip, count] : s.hits) top.emplace_back(count, rip);
       std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
       std::string out;
-      char line[160];
+      char line[256];
       snprintf(line, sizeof(line), "thread \"%s\" samples=%llu in-title=%llu outside=%llu\n",
                s.name, (unsigned long long)s.total, (unsigned long long)in_title,
                (unsigned long long)s.outside);
@@ -166,6 +172,19 @@ void Dump(int fd, double seconds) {
                  (unsigned long long)(callers[k].second ? callers[k].second - kLoadBase : 0));
         out += line;
       }
+      std::vector<std::pair<uint32_t, const std::array<uint64_t, 6>*>> chains;
+      for (auto& [chain, count] : s.outside_chains) chains.emplace_back(count, &chain);
+      std::sort(chains.begin(), chains.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      for (size_t k = 0; k < std::min<size_t>(chains.size(), 30); ++k) {
+        int m = snprintf(line, sizeof(line), "  k %u", chains[k].first);
+        for (uint64_t v : *chains[k].second) {
+          m += snprintf(line + m, sizeof(line) - size_t(m), " 0x%llx",
+                        (unsigned long long)(v ? v - kLoadBase : 0));
+        }
+        snprintf(line + m, sizeof(line) - size_t(m), "\n");
+        out += line;
+      }
       write(fd, out.data(), out.size());
     }
     s.total = 0;
@@ -173,6 +192,7 @@ void Dump(int fd, double seconds) {
     s.hits.clear();
     s.outside_hits.clear();
     s.outside_callers.clear();
+    s.outside_chains.clear();
   }
   (void)text_end;
 }
@@ -222,6 +242,9 @@ void SamplerMain() {
           ++s.outside;
           ++s.outside_hits[rip];
           ++s.outside_callers[g_sample_caller.load(std::memory_order_relaxed)];
+          std::array<uint64_t, 6> chain;
+          for (int k = 0; k < 6; ++k) chain[k] = g_sample_chain[k];
+          ++s.outside_chains[chain];
         } else {
           ++s.hits[rip];
         }
@@ -314,6 +337,7 @@ void UnregisterCurrentThread() {
     slot->hits.clear();
     slot->outside_hits.clear();
     slot->outside_callers.clear();
+    slot->outside_chains.clear();
   }
 }
 
