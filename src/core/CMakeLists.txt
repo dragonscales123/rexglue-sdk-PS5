@@ -35,7 +35,7 @@ endif()
 # Platform-specific sources
 if(PS5)
     # Guest memory in direct memory (ps5platform/shm.h), not shm_open files.
-    set(REX_CORE_MEMORY_SOURCE memory_ps5.cpp)
+    set(REX_CORE_MEMORY_SOURCE memory_ps5.cpp ps5_profiler.cpp)
 else()
     set(REX_CORE_MEMORY_SOURCE memory_posix.cpp)
 endif()

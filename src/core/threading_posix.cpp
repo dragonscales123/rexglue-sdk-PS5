@@ -56,6 +56,10 @@ static_assert(REX_PLATFORM_POSIX, "This file is POSIX-only");
 #include <rex/string.h>
 #endif
 
+#if REX_PLATFORM_PS5
+#include "ps5_profiler.h"
+#endif
+
 #if REX_PLATFORM_LINUX
 // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
 #define REX_HAS_SIGEV_THREAD_ID 1
@@ -759,6 +763,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       }
 #elif REX_PLATFORM_PS5
       pthread_set_name_np(thread_, std::string(name).c_str());
+      rex::ps5prof::SetThreadName(thread_, std::string(name).c_str());
 #else
       pthread_setname_np(thread_, std::string(name).c_str());
 #endif
@@ -1523,6 +1528,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   }
 
+#if REX_PLATFORM_PS5
+  rex::ps5prof::UnregisterCurrentThread();
+#endif
   current_thread_ = nullptr;
   current_thread_condition_ = nullptr;
   return nullptr;
@@ -1585,6 +1593,7 @@ void set_current_thread_name(const std::string_view name) {
   pthread_setname_np(std::string(name).c_str());
 #elif REX_PLATFORM_PS5
   pthread_set_name_np(pthread_self(), std::string(name).c_str());
+  rex::ps5prof::RegisterCurrentThread(std::string(name).c_str());
 #else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
 #endif
