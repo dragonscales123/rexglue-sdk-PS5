@@ -63,7 +63,12 @@ inline void write_line(const char* text, size_t len) {
 #if REX_PLATFORM_WIN32
     ::fopen_s(&f, "fable2_xam_trace.log", "a");
 #else
+#if defined(__PROSPERO__)
+    // No working directory on the console: the title folder.
+    f = std::fopen("/app0/fable2_xam_trace.log", "a");
+#else
     f = std::fopen("fable2_xam_trace.log", "a");
+#endif
 #endif
   }
 }

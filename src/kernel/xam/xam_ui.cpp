@@ -120,8 +120,10 @@ X_RESULT xeXamDispatchDialog(T* dialog, std::function<X_RESULT(T*)> close_callba
     if (app_context &&
         app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
       ++xam_dialogs_shown_;
+      REXKRNL_INFO("[XAM] dialog shown; guest input held until it closes");
       fence.Wait();
       --xam_dialogs_shown_;
+      REXKRNL_INFO("[XAM] dialog closed");
     } else {
       delete dialog;
     }
@@ -163,8 +165,10 @@ X_RESULT xeXamDispatchDialogEx(T* dialog,
     if (app_context &&
         app_context->CallInUIThreadSynchronous([&dialog, &fence]() { dialog->Then(&fence); })) {
       ++xam_dialogs_shown_;
+      REXKRNL_INFO("[XAM] dialog shown; guest input held until it closes");
       fence.Wait();
       --xam_dialogs_shown_;
+      REXKRNL_INFO("[XAM] dialog closed");
     } else {
       delete dialog;
     }

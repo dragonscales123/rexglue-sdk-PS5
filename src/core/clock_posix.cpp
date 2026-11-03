@@ -32,13 +32,11 @@ uint64_t Clock::host_tick_frequency_platform() {
   mach_timebase_info(&info);
   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
 #else
-  timespec res;
-  int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
-  assert_zero(error);
-  assert_zero(res.tv_sec);  // Sub second resolution is required.
-
-  // Convert nano seconds to hertz. Resolution is 1ns on most systems.
-  return 1000000000ull / res.tv_nsec;
+  // host_tick_count_platform() counts nanoseconds whatever the clock's
+  // resolution, so the tick rate is 1 GHz. (Deriving it from clock_getres was
+  // only right where the resolution is 1 ns: FreeBSD, and so the PS5, report
+  // a coarser one, and guest time ran that many times too fast.)
+  return 1000000000ull;
 #endif
 }
 
