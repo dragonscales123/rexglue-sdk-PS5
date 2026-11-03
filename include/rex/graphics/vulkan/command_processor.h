@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <cstring>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -617,6 +618,40 @@ class VulkanCommandProcessor : public CommandProcessor {
   // <Usage frame, set>.
   std::deque<std::pair<uint64_t, VkDescriptorSet>> constants_transient_descriptors_used_;
   std::vector<VkDescriptorSet> constants_transient_descriptors_free_;
+
+  // vulkan_dynamic_constant_buffers: the constants set uses dynamic uniform
+  // buffers with a fixed range per binding, so one set per combination of
+  // upload pool pages (which live until ClearCache) is written once and reused,
+  // and each draw only passes the offsets when binding it.
+  bool constants_dynamic_ = false;
+  // 256 float4 constants per stage: the fixed range of the float constant
+  // bindings in dynamic mode.
+  static constexpr size_t kFloatConstantsMaxSize = sizeof(float) * 4 * 256;
+  struct ConstantsDynamicSetKey {
+    VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount];
+    bool operator==(const ConstantsDynamicSetKey& other) const {
+      return std::memcmp(buffers, other.buffers, sizeof(buffers)) == 0;
+    }
+    struct Hasher {
+      size_t operator()(const ConstantsDynamicSetKey& key) const {
+        size_t hash = 0;
+        for (VkBuffer buffer : key.buffers) {
+          hash = hash * 0x100000001B3ull ^ std::hash<uint64_t>()(uint64_t(buffer));
+        }
+        return hash;
+      }
+    };
+  };
+  std::unordered_map<ConstantsDynamicSetKey, VkDescriptorSet, ConstantsDynamicSetKey::Hasher>
+      constants_dynamic_sets_;
+  std::vector<VkDescriptorPool> constants_dynamic_pools_;
+  // Sets the last pool still has room for.
+  uint32_t constants_dynamic_pool_sets_left_ = 0;
+  uint32_t current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount] =
+      {};
+  // The descriptor set for the buffers in current_constant_buffer_infos_
+  // (dynamic mode), allocated and written on first use.
+  VkDescriptorSet GetConstantsDynamicDescriptorSet();
 
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_textures_;
   std::deque<UsedTextureTransientDescriptorSet> texture_transient_descriptor_sets_used_;

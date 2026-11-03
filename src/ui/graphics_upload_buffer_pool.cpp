@@ -92,18 +92,20 @@ void GraphicsUploadBufferPool::FlushWrites() {
 
 GraphicsUploadBufferPool::Page* GraphicsUploadBufferPool::Request(uint64_t submission_index,
                                                                   size_t size, size_t alignment,
-                                                                  size_t& offset_out) {
+                                                                  size_t& offset_out,
+                                                                  size_t reserve_size) {
   alignment = std::max(alignment, size_t(1));
   assert_true(rex::is_pow2(alignment));
   size = rex::align(size, alignment);
-  assert_true(size <= page_size_);
-  if (size > page_size_) {
+  const size_t fit_size = std::max(size, reserve_size);
+  assert_true(fit_size <= page_size_);
+  if (fit_size > page_size_) {
     return nullptr;
   }
   assert_true(!current_page_used_ || submission_index >= writable_first_->last_submission_index_);
   assert_true(!submitted_last_ || submission_index >= submitted_last_->last_submission_index_);
   size_t current_page_used_aligned = rex::align(current_page_used_, alignment);
-  if (current_page_used_aligned + size > page_size_ || !writable_first_) {
+  if (current_page_used_aligned + fit_size > page_size_ || !writable_first_) {
     // Start a new page if can't fit all the bytes or don't have an open page.
     if (writable_first_) {
       // Close the page that was current.

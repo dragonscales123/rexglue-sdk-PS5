@@ -34,10 +34,11 @@ VulkanUploadBufferPool::VulkanUploadBufferPool(const VulkanDevice* const vulkan_
       usage_(usage) {}
 
 uint8_t* VulkanUploadBufferPool::Request(uint64_t submission_index, size_t size, size_t alignment,
-                                         VkBuffer& buffer_out, VkDeviceSize& offset_out) {
+                                         VkBuffer& buffer_out, VkDeviceSize& offset_out,
+                                         size_t reserve_size) {
   size_t offset;
-  const VulkanPage* page = static_cast<const VulkanPage*>(
-      GraphicsUploadBufferPool::Request(submission_index, size, alignment, offset));
+  const VulkanPage* page = static_cast<const VulkanPage*>(GraphicsUploadBufferPool::Request(
+      submission_index, size, alignment, offset, reserve_size));
   if (!page) {
     return nullptr;
   }

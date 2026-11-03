@@ -23,7 +23,7 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
                          size_t page_size = kDefaultPageSize);
 
   uint8_t* Request(uint64_t submission_index, size_t size, size_t alignment, VkBuffer& buffer_out,
-                   VkDeviceSize& offset_out);
+                   VkDeviceSize& offset_out, size_t reserve_size = 0);
   uint8_t* RequestPartial(uint64_t submission_index, size_t size, size_t alignment,
                           VkBuffer& buffer_out, VkDeviceSize& offset_out, VkDeviceSize& size_out);
 
