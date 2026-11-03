@@ -228,6 +228,37 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
     watch_buckets_[i] = node;
   }
 
+  // A texture is loaded by requesting its range first and watching it after,
+  // so its pages may have been taken as hot (left unwatched) in between. They
+  // must fault on CPU writes for this watch to fire: take them out of the hot
+  // set and protect them again. They stay invalid, so the next request still
+  // re-uploads them (the GPU copy matched guest memory for the bytes the
+  // texture was just loaded from).
+  if (REXCVAR_GET(shared_memory_hot_pages) && memory_invalidation_callback_handle_) {
+    uint32_t run_first = UINT32_MAX;
+    for (uint32_t page = watch_page_first; page <= watch_page_last + 1; ++page) {
+      bool hot = false;
+      if (page <= watch_page_last) {
+        uint64_t& block = hot_pages_[page >> 6];
+        const uint64_t bit = uint64_t(1) << (page & 63);
+        if (block & bit) {
+          hot = true;
+          block &= ~bit;
+          hot_page_shadows_.erase(page);
+        }
+      }
+      if (hot) {
+        if (run_first == UINT32_MAX) {
+          run_first = page;
+        }
+      } else if (run_first != UINT32_MAX) {
+        memory().EnablePhysicalMemoryAccessCallbacks(
+            run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
+        run_first = UINT32_MAX;
+      }
+    }
+  }
+
   return reinterpret_cast<WatchHandle>(range);
 }
 
