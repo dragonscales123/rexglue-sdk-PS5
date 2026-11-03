@@ -14,7 +14,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <mutex>
 
 #include <rex/platform.h>
 
@@ -42,23 +44,19 @@ inline uint64_t now_ms() {
 #if REX_PLATFORM_WIN32
   return static_cast<uint64_t>(::GetTickCount64());
 #else
-  return 0;
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
 #endif
 }
 
+// Called from any guest thread that enters XAM: serialized, and each line is
+// written and flushed at once (the old unlocked 64 KiB buffer could be
+// overrun by two threads at a time, and lost its tail on a crash).
 inline void write_line(const char* text, size_t len) {
+  static std::mutex mutex;
   static FILE* f = nullptr;
-  static char buf[64 * 1024];
-  static size_t used = 0;
-  if (used + len + 2 >= sizeof(buf)) {
-    if (f) std::fwrite(buf, 1, used, f);
-    used = 0;
-  }
-  if (used + len + 2 < sizeof(buf)) {
-    memcpy(buf + used, text, len);
-    buf[used + len] = '\n';
-    used += len + 1;
-  }
+  std::lock_guard<std::mutex> lock(mutex);
   if (!f) {
 #if REX_PLATFORM_WIN32
     ::fopen_s(&f, "fable2_xam_trace.log", "a");
@@ -71,6 +69,10 @@ inline void write_line(const char* text, size_t len) {
 #endif
 #endif
   }
+  if (!f) return;
+  std::fwrite(text, 1, len, f);
+  std::fputc('\n', f);
+  std::fflush(f);
 }
 
 // Formats and enqueues one line: "<ms> <tid> <msg>".
