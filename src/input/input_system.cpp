@@ -18,6 +18,8 @@
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
+#include <rex/input/overlay_combo.h>
+#include <atomic>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
@@ -30,6 +32,24 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+
+namespace rex::input {
+namespace {
+std::atomic<OverlayComboCallback> g_overlay_combo_callback{nullptr};
+std::atomic<void*> g_overlay_combo_context{nullptr};
+}  // namespace
+
+void SetOverlayComboCallback(OverlayComboCallback callback, void* context) {
+  g_overlay_combo_context.store(context, std::memory_order_relaxed);
+  g_overlay_combo_callback.store(callback, std::memory_order_release);
+}
+
+void FireOverlayCombo() {
+  if (OverlayComboCallback callback = g_overlay_combo_callback.load(std::memory_order_acquire)) {
+    callback(g_overlay_combo_context.load(std::memory_order_relaxed));
+  }
+}
+}  // namespace rex::input
 
 REXCVAR_DEFINE_BOOL(vibration, true, "Input", "Enable controller vibration");
 

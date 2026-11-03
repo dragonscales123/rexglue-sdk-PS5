@@ -23,6 +23,7 @@
 #include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/overlay_combo.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
@@ -767,6 +768,12 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     xbuttons |= xbutton;
   } else {
     xbuttons &= ~xbutton;
+  }
+  // L3 + R3 together toggles the performance overlay.
+  constexpr uint16_t kThumbs = X_INPUT_GAMEPAD_LEFT_THUMB | X_INPUT_GAMEPAD_RIGHT_THUMB;
+  if (event.gbutton.down && (xbutton & kThumbs) && (xbuttons & kThumbs) == kThumbs &&
+      (controller.state.gamepad.buttons & kThumbs) != kThumbs) {
+    FireOverlayCombo();
   }
   controller.state.gamepad.buttons = xbuttons;
   controller.state_changed = true;

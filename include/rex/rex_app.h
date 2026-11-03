@@ -271,6 +271,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   // independently of how the presenter/drawer were obtained. `presenter` may be
   // null (detached mode).
   void SetupOverlays(ui::Presenter* presenter, ui::ImmediateDrawer* drawer);
+  void ToggleDebugOverlay();
+  static void OnOverlayCombo(void* context);
 
   // WindowedApp overrides
   bool OnInitialize() override;

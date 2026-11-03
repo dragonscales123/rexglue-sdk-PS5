@@ -10,8 +10,16 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/platform.h>
 #include <rex/version.h>
 #include <imgui.h>
+#if REX_PLATFORM_PS5
+#include <time.h>
+
+#include <ps5platform/kernel.h>
+
+#include "../../core/ps5_profiler.h"
+#endif
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 #include <rex/perf/counter.h>
 #include <cinttypes>
@@ -28,6 +36,8 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   ImGui::SetNextWindowSize(ImVec2(280, 280), ImGuiCond_FirstUseEver);
+#elif REX_PLATFORM_PS5
+  ImGui::SetNextWindowSize(ImVec2(340, 230), ImGuiCond_FirstUseEver);
 #else
   ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
 #endif
@@ -39,6 +49,7 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
         ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
       }
     }
+    DrawPs5Stats();
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
     ImGui::Separator();
 
@@ -103,6 +114,84 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   }
   ImGui::End();
   ImGui::PopStyleColor();
+}
+
+void DebugOverlayDialog::DrawPs5Stats() {
+#if REX_PLATFORM_PS5
+  timespec now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &now_ts);
+  const uint64_t now = uint64_t(now_ts.tv_sec) * 1000000000ull + uint64_t(now_ts.tv_nsec);
+  Ps5Stats& p = ps5_;
+  if (!p.sample_time_ns || now - p.sample_time_ns >= 500000000ull) {
+    const double seconds = p.sample_time_ns ? double(now - p.sample_time_ns) / 1e9 : 0.0;
+    // Busy share of a thread: CPU time it used over the wall time elapsed.
+    auto load = [&](const char* prefix, uint64_t& last_cpu, double& out) {
+      uint64_t cpu = 0;
+      if (!rex::ps5prof::ThreadCpuTimeNs(prefix, &cpu)) {
+        out = -1;
+        return;
+      }
+      if (seconds > 0 && last_cpu) {
+        out = 100.0 * double(cpu - last_cpu) / (seconds * 1e9);
+      }
+      last_cpu = cpu;
+    };
+    load("GPU Commands", p.gpu_thread_cpu_ns, p.gpu_thread_load);
+    load("3D Engine", p.render_thread_cpu_ns, p.render_thread_load);
+    load("GameThread", p.game_thread_cpu_ns, p.game_thread_load);
+    rex::ps5prof::Counters& c = rex::ps5prof::counters();
+    const uint64_t upload_bytes = c.upload_bytes.load(std::memory_order_relaxed);
+    const uint64_t mprotect_calls = c.mprotect_calls.load(std::memory_order_relaxed);
+    const uint64_t invalidations = c.invalidations.load(std::memory_order_relaxed);
+    if (seconds > 0) {
+      p.upload_mb_per_s = double(upload_bytes - p.upload_bytes) / seconds / 1048576.0;
+      p.mprotect_per_s = double(mprotect_calls - p.mprotect_calls) / seconds;
+      p.invalidations_per_s = double(invalidations - p.invalidations) / seconds;
+    }
+    p.upload_bytes = upload_bytes;
+    p.mprotect_calls = mprotect_calls;
+    p.invalidations = invalidations;
+    // Direct memory: the console's physical pool for the title (guest memory,
+    // GPU resources). Flexible memory: its budget for heap and anonymous maps.
+    p.direct_total_mb = double(sceKernelGetDirectMemorySize()) / 1048576.0;
+    int64_t free_start = 0;
+    size_t direct_free = 0;
+    if (sceKernelAvailableDirectMemorySize(0, sceKernelGetDirectMemorySize(), 0, &free_start,
+                                           &direct_free) == 0) {
+      p.direct_free_mb = double(direct_free) / 1048576.0;
+    }
+    size_t flexible_free = 0, flexible_total = 0;
+    if (sceKernelAvailableFlexibleMemorySize(&flexible_free) == 0) {
+      p.flexible_free_mb = double(flexible_free) / 1048576.0;
+    }
+    if (sceKernelConfiguredFlexibleMemorySize(&flexible_total) == 0) {
+      p.flexible_total_mb = double(flexible_total) / 1048576.0;
+    }
+    p.sample_time_ns = now;
+  }
+  ImGui::Separator();
+  auto load_text = [](const char* label, double value) {
+    if (value < 0) {
+      ImGui::Text("%s: -", label);
+    } else {
+      ImGui::Text("%s: %.0f%%", label, value);
+    }
+  };
+  // The emulated GPU runs on the CPU: its thread's load is what limits the
+  // frame rate when it nears 100%.
+  load_text("GPU emulation thread", p.gpu_thread_load);
+  load_text("Render thread (game)", p.render_thread_load);
+  load_text("Game thread", p.game_thread_load);
+  ImGui::Text("GPU uploads: %.1f MB/s", p.upload_mb_per_s);
+  ImGui::Text("Write faults: %.0f/s  Protect: %.0f/s", p.invalidations_per_s, p.mprotect_per_s);
+  ImGui::Separator();
+  ImGui::Text("Direct memory: %.0f / %.0f MB used", p.direct_total_mb - p.direct_free_mb,
+              p.direct_total_mb);
+  if (p.flexible_total_mb > 0) {
+    ImGui::Text("Flexible memory: %.0f / %.0f MB used", p.flexible_total_mb - p.flexible_free_mb,
+                p.flexible_total_mb);
+  }
+#endif
 }
 
 }  // namespace rex::ui

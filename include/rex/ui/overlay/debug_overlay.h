@@ -37,6 +37,27 @@ class DebugOverlayDialog : public ImGuiDialog {
 
  private:
   FrameStatsProvider stats_provider_;
+  // PS5: memory, thread load and GPU-memory traffic, refreshed twice a second.
+  void DrawPs5Stats();
+  struct Ps5Stats {
+    uint64_t sample_time_ns = 0;
+    uint64_t gpu_thread_cpu_ns = 0;
+    uint64_t render_thread_cpu_ns = 0;
+    uint64_t game_thread_cpu_ns = 0;
+    uint64_t upload_bytes = 0;
+    uint64_t mprotect_calls = 0;
+    uint64_t invalidations = 0;
+    double gpu_thread_load = -1;
+    double render_thread_load = -1;
+    double game_thread_load = -1;
+    double upload_mb_per_s = 0;
+    double mprotect_per_s = 0;
+    double invalidations_per_s = 0;
+    double direct_total_mb = 0;
+    double direct_free_mb = 0;
+    double flexible_total_mb = 0;
+    double flexible_free_mb = 0;
+  } ps5_{};
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
   static constexpr size_t kFrameHistorySize = 120;
   std::array<float, kFrameHistorySize> frame_time_history_{};

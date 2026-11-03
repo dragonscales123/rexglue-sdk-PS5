@@ -23,7 +23,11 @@ struct Counters {
 };
 Counters& counters();
 
+// The thread registry runs always (cheap); sampling only with REX_PROFILE=1.
 void RegisterCurrentThread(const char* name);
+// CPU time consumed by the first registered thread whose name starts with
+// name_prefix. False if there is none.
+bool ThreadCpuTimeNs(const char* name_prefix, uint64_t* cpu_ns);
 void SetThreadName(pthread_t thread, const char* name);
 void UnregisterCurrentThread();
 }  // namespace rex::ps5prof

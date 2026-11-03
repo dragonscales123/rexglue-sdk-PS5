@@ -26,6 +26,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/input/overlay_combo.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
@@ -47,6 +48,10 @@
 #include <algorithm>
 #include <filesystem>
 #include <string_view>
+
+REXCVAR_DEFINE_BOOL(show_debug_overlay, false, "UI",
+                    "Open the performance/debug overlay at startup (toggle: F3, or L3 + R3 on a "
+                    "controller).");
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
@@ -421,14 +426,13 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
-  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
-    if (debug_overlay_) {
-      debug_overlay_.reset();
-    } else {
-      debug_overlay_ =
-          std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
-    }
-  });
+  rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay",
+                        [this] { ToggleDebugOverlay(); });
+  // Controllers (the PS5 has no keyboard): L3 + R3 toggles it too.
+  rex::input::SetOverlayComboCallback(&ReXApp::OnOverlayCombo, this);
+  if (REXCVAR_GET(show_debug_overlay) && !debug_overlay_) {
+    ToggleDebugOverlay();
+  }
   rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
     if (console_overlay_) {
       console_overlay_.reset();
@@ -452,6 +456,21 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   });
 
   OnCreateDialogs(imgui_drawer_.get());
+}
+
+void ReXApp::ToggleDebugOverlay() {
+  if (debug_overlay_) {
+    debug_overlay_.reset();
+  } else if (imgui_drawer_) {
+    debug_overlay_ =
+        std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+  }
+}
+
+void ReXApp::OnOverlayCombo(void* context) {
+  // Input thread: hand the toggle to the UI thread.
+  auto* app = static_cast<ReXApp*>(context);
+  app->app_context().CallInUIThreadDeferred([app]() { app->ToggleDebugOverlay(); });
 }
 
 void ReXApp::LaunchModule() {
@@ -585,6 +604,7 @@ void ReXApp::OnDestroy() {
   OnShutdown();
 
   // Unregister overlay keybinds before destroying dialogs
+  rex::input::SetOverlayComboCallback(nullptr, nullptr);
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");

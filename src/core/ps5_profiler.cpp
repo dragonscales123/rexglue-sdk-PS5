@@ -35,6 +35,7 @@
 #include <pthread_np.h>
 #include <signal.h>
 #include <sys/ucontext.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -145,7 +146,28 @@ void Dump(int fd, double seconds) {
                    tmv.tm_min, tmv.tm_sec, seconds);
   write(fd, header, size_t(n));
   {
-    Counters& c = counters();
+    // The counters are cumulative (the performance overlay reads them too).
+    struct Snapshot {
+      uint64_t v[9];
+    };
+    static Snapshot previous{};
+    Counters& counters_now = counters();
+    Snapshot now{{counters_now.mprotect_calls.load(), counters_now.mprotect_bytes.load(),
+                  counters_now.invalidations.load(), counters_now.invalidated_bytes_fault.load(),
+                  counters_now.invalidated_bytes_exact.load(), counters_now.gpu_written_bytes.load(),
+                  counters_now.upload_calls.load(), counters_now.upload_bytes.load(),
+                  counters_now.hot_page_bytes.load()}};
+    struct Delta {
+      std::atomic<uint64_t> mprotect_calls, mprotect_bytes, invalidations, invalidated_bytes_fault,
+          invalidated_bytes_exact, gpu_written_bytes, upload_calls, upload_bytes, hot_page_bytes;
+    } c;
+    std::atomic<uint64_t>* fields[9] = {&c.mprotect_calls,         &c.mprotect_bytes,
+                                        &c.invalidations,          &c.invalidated_bytes_fault,
+                                        &c.invalidated_bytes_exact, &c.gpu_written_bytes,
+                                        &c.upload_calls,           &c.upload_bytes,
+                                        &c.hot_page_bytes};
+    for (int k = 0; k < 9; ++k) fields[k]->store(now.v[k] - previous.v[k]);
+    previous = now;
     const double inv = seconds > 0 ? 1.0 / seconds : 0.0;
     n = snprintf(header, sizeof(header),
                  "counters/s: mprotect %.0f (%.1f MB) invalidations %.0f (fault %.1f MB, "
@@ -300,12 +322,19 @@ void* SamplerThread(void*) {
   return nullptr;
 }
 
+std::atomic<bool> g_registry_ready{false};
+
 void StartIfEnabled() {
   bool expected = false;
-  if (!g_started.compare_exchange_strong(expected, true)) return;
+  if (!g_started.compare_exchange_strong(expected, true)) {
+    // Another thread is setting up; registration needs the slots.
+    while (!g_registry_ready.load(std::memory_order_acquire)) sched_yield();
+    return;
+  }
+  g_slots = new Slot[kMaxThreads];
+  g_registry_ready.store(true, std::memory_order_release);
   const char* env = getenv("REX_PROFILE");
   if (!env || !*env || *env == '0') return;
-  g_slots = new Slot[kMaxThreads];
   g_text_end = TextEnd();
   struct sigaction action{};
   action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -332,7 +361,7 @@ Slot* FindLocked(pthread_t thread) {
 
 void RegisterCurrentThread(const char* name) {
   StartIfEnabled();
-  if (!g_enabled.load(std::memory_order_acquire)) return;
+  if (!g_registry_ready.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(g_lock);
   pthread_t self = pthread_self();
   Slot* slot = FindLocked(self);
@@ -365,7 +394,7 @@ void RegisterCurrentThread(const char* name) {
 }
 
 void SetThreadName(pthread_t thread, const char* name) {
-  if (!g_enabled.load(std::memory_order_acquire) || !name) return;
+  if (!g_registry_ready.load(std::memory_order_acquire) || !name) return;
   std::lock_guard<std::mutex> lock(g_lock);
   if (Slot* slot = FindLocked(thread)) {
     strncpy(slot->name, name, sizeof(slot->name) - 1);
@@ -374,7 +403,7 @@ void SetThreadName(pthread_t thread, const char* name) {
 }
 
 void UnregisterCurrentThread() {
-  if (!g_enabled.load(std::memory_order_acquire)) return;
+  if (!g_registry_ready.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(g_lock);
   if (Slot* slot = FindLocked(pthread_self())) {
     slot->used = false;
@@ -384,6 +413,23 @@ void UnregisterCurrentThread() {
     slot->outside_callers.clear();
     slot->outside_chains.clear();
   }
+}
+
+bool ThreadCpuTimeNs(const char* name_prefix, uint64_t* cpu_ns) {
+  if (!g_registry_ready.load(std::memory_order_acquire) || !name_prefix) return false;
+  std::lock_guard<std::mutex> lock(g_lock);
+  const size_t prefix_length = strlen(name_prefix);
+  for (size_t i = 0; i < kMaxThreads; ++i) {
+    Slot& s = g_slots[i];
+    if (!s.used || strncmp(s.name, name_prefix, prefix_length) != 0) continue;
+    clockid_t clock;
+    if (pthread_getcpuclockid(s.thread, &clock) != 0) return false;
+    timespec ts;
+    if (clock_gettime(clock, &ts) != 0) return false;
+    *cpu_ns = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace rex::ps5prof
