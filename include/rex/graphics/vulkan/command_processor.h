@@ -660,6 +660,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   std::unordered_map<ConstantsDynamicSetKey, VkDescriptorSet, ConstantsDynamicSetKey::Hasher>
       constants_dynamic_sets_;
+  ConstantsDynamicSetKey constants_dynamic_last_key_ = {};
+  VkDescriptorSet constants_dynamic_last_set_ = VK_NULL_HANDLE;
   std::vector<VkDescriptorPool> constants_dynamic_pools_;
   // Sets the last pool still has room for.
   uint32_t constants_dynamic_pool_sets_left_ = 0;

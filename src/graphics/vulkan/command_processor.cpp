@@ -80,7 +80,15 @@ REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 1, "GPU",
                       "draw when the GPU thread runs ahead; 2 rarely has to wait.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_UINT32(vulkan_submit_every_draws, 0, "GPU/Vulkan",
+#if REX_PLATFORM_PS5
+// Fable II's heavy scenes issue ~7,600 draws per frame; 512 measured best on
+// the PS5 (128: submission overhead outweighed the shorter readback waits).
+#define REX_VULKAN_SUBMIT_EVERY_DRAWS_DEFAULT 512
+#else
+#define REX_VULKAN_SUBMIT_EVERY_DRAWS_DEFAULT 0
+#endif
+REXCVAR_DEFINE_UINT32(vulkan_submit_every_draws, REX_VULKAN_SUBMIT_EVERY_DRAWS_DEFAULT,
+                      "GPU/Vulkan",
                       "End the submission after this many draws (0 = off), when that is safe, "
                       "so the GPU starts on the work sooner and a synchronous readback (such as "
                       "memexport) has less queued work to wait for.")
@@ -4217,8 +4225,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
-      !memexport_ranges_.empty()) {
+  // Check for memexport first: IsReadbackMemexportEnabled looks a cvar up by
+  // name under the cvar registry lock, too costly for every draw.
+  if (!memexport_ranges_.empty() &&
+      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
@@ -5779,6 +5789,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   // The cached dynamic constants sets reference upload pool pages, which may be
   // destroyed next (ClearCache); called with the GPU idle.
   constants_dynamic_sets_.clear();
+  constants_dynamic_last_set_ = VK_NULL_HANDLE;
   if (!constants_dynamic_pools_.empty()) {
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -7109,8 +7120,14 @@ VkDescriptorSet VulkanCommandProcessor::GetConstantsDynamicDescriptorSet() {
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
     key.buffers[i] = current_constant_buffer_infos_[i].buffer;
   }
+  // Consecutive draws mostly use the same upload pages.
+  if (constants_dynamic_last_set_ != VK_NULL_HANDLE && key == constants_dynamic_last_key_) {
+    return constants_dynamic_last_set_;
+  }
   auto it = constants_dynamic_sets_.find(key);
   if (it != constants_dynamic_sets_.end()) {
+    constants_dynamic_last_key_ = key;
+    constants_dynamic_last_set_ = it->second;
     return it->second;
   }
 
@@ -7191,6 +7208,8 @@ VkDescriptorSet VulkanCommandProcessor::GetConstantsDynamicDescriptorSet() {
   dfn.vkUpdateDescriptorSets(device, SpirvShaderTranslator::kConstantBufferCount, writes, 0,
                              nullptr);
   constants_dynamic_sets_.emplace(key, set);
+  constants_dynamic_last_key_ = key;
+  constants_dynamic_last_set_ = set;
   return set;
 }
 
