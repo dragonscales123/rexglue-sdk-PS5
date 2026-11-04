@@ -2182,6 +2182,14 @@ void VulkanCommandProcessor::ShutdownContext() {
   }
   fences_free_.clear();
 
+  if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyQueryPool(device, gpu_timestamp_pool_, nullptr);
+    gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  }
+  gpu_timestamp_pool_failed_ = false;
+  gpu_timestamp_slot_ = 0;
+  std::fill(std::begin(gpu_timestamp_slot_used_), std::end(gpu_timestamp_slot_used_), false);
+
   device_lost_ = false;
 
   CommandProcessor::ShutdownContext();
@@ -5674,8 +5682,37 @@ VkResult VulkanCommandProcessor::RecordAndSubmit(
   if (result != VK_SUCCESS) {
     return result;
   }
+  uint32_t timestamp_slot = UINT32_MAX;
+#if REX_PLATFORM_PS5
+  if (gpu_timestamp_pool_ == VK_NULL_HANDLE && !gpu_timestamp_pool_failed_) {
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = kGpuTimestampSlots * 2;
+    if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_timestamp_pool_) != VK_SUCCESS) {
+      gpu_timestamp_pool_ = VK_NULL_HANDLE;
+      gpu_timestamp_pool_failed_ = true;
+      REXGPU_WARN("VulkanCommandProcessor: failed to create the GPU timestamp query pool");
+    }
+  }
+  if (gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+    timestamp_slot = gpu_timestamp_slot_;
+    gpu_timestamp_slot_ = (timestamp_slot + 1) % kGpuTimestampSlots;
+    if (gpu_timestamp_slot_used_[timestamp_slot]) {
+      ReadGpuTimestampSlot(timestamp_slot);
+    }
+    dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_timestamp_pool_, timestamp_slot * 2, 2);
+    dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            gpu_timestamp_pool_, timestamp_slot * 2);
+  }
+#endif
   upload_command_buffer_.ExecuteStream(upload_stream, command_buffer.buffer);
   deferred_command_buffer_.ExecuteStream(deferred_stream, command_buffer.buffer);
+  if (timestamp_slot != UINT32_MAX) {
+    dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            gpu_timestamp_pool_, timestamp_slot * 2 + 1);
+    gpu_timestamp_slot_used_[timestamp_slot] = true;
+  }
   result = dfn.vkEndCommandBuffer(command_buffer.buffer);
   if (result != VK_SUCCESS) {
     return result;
@@ -5699,6 +5736,35 @@ VkResult VulkanCommandProcessor::RecordAndSubmit(
   rex::ps5prof::counters().queue_submits.fetch_add(1, std::memory_order_relaxed);
 #endif
   return result;
+}
+
+void VulkanCommandProcessor::ReadGpuTimestampSlot(uint32_t slot) {
+#if REX_PLATFORM_PS5
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  // Value and availability for the start and the end timestamp.
+  uint64_t results[4] = {};
+  const VkResult result = dfn.vkGetQueryPoolResults(
+      vulkan_device->device(), gpu_timestamp_pool_, slot * 2, 2, sizeof(results), results,
+      sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+  auto& counters = rex::ps5prof::counters();
+  if ((result == VK_SUCCESS || result == VK_NOT_READY) && results[1] && results[3] &&
+      results[2] >= results[0]) {
+    const uint64_t ns = uint64_t(double(results[2] - results[0]) *
+                                 double(vulkan_device->properties().timestampPeriod));
+    counters.gpu_busy_ns.fetch_add(ns, std::memory_order_relaxed);
+    counters.gpu_timed_submits.fetch_add(1, std::memory_order_relaxed);
+    uint64_t longest = counters.gpu_longest_submit_ns.load(std::memory_order_relaxed);
+    while (ns > longest &&
+           !counters.gpu_longest_submit_ns.compare_exchange_weak(longest, ns,
+                                                                 std::memory_order_relaxed)) {
+    }
+  } else {
+    counters.gpu_untimed_submits.fetch_add(1, std::memory_order_relaxed);
+  }
+#else
+  (void)slot;
+#endif
 }
 
 void VulkanCommandProcessor::SubmitThreadMain() {

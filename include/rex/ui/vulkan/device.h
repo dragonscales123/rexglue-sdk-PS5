@@ -52,6 +52,8 @@ class VulkanDevice {
     uint32_t driverVersion = 0;
     uint32_t vendorID = 0;
     uint32_t deviceID = 0;
+    // Nanoseconds per timestamp query tick.
+    float timestampPeriod = 1.0f;
     char deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
 
     uint32_t maxImageDimension2D = 4096;

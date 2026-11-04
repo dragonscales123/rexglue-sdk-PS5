@@ -246,6 +246,22 @@ void Dump(int fd, double seconds) {
     previous_fetch[0] = fetch_now[0];
     previous_fetch[1] = fetch_now[1];
     write(fd, header, size_t(n));
+    static uint64_t previous_gpu[3] = {};
+    const uint64_t gpu_now[3] = {counters_now.gpu_busy_ns.load(),
+                                 counters_now.gpu_timed_submits.load(),
+                                 counters_now.gpu_untimed_submits.load()};
+    const uint64_t gpu_longest_ns = counters_now.gpu_longest_submit_ns.exchange(0);
+    const double gpu_busy_ms = double(gpu_now[0] - previous_gpu[0]) * inv / 1e6;
+    n = snprintf(header, sizeof(header),
+                 "gpu-time/s: busy %.1f ms (%.0f%%), longest submission %.2f ms | timed %.0f, "
+                 "untimed %.0f\n",
+                 gpu_busy_ms, gpu_busy_ms / 10.0, double(gpu_longest_ns) / 1e6,
+                 double(gpu_now[1] - previous_gpu[1]) * inv,
+                 double(gpu_now[2] - previous_gpu[2]) * inv);
+    for (int k = 0; k < 3; ++k) {
+      previous_gpu[k] = gpu_now[k];
+    }
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;

@@ -520,6 +520,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   device->properties_.driverVersion = properties.driverVersion;
   device->properties_.vendorID = properties.vendorID;
   device->properties_.deviceID = properties.deviceID;
+  device->properties_.timestampPeriod = properties.limits.timestampPeriod;
   rex::string::copy_truncating(device->properties_.deviceName, properties.deviceName,
                                sizeof(device->properties_.deviceName));
 

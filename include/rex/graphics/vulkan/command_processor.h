@@ -614,6 +614,16 @@ class VulkanCommandProcessor : public CommandProcessor {
                            const std::vector<uintmax_t>& deferred_stream, VkFence fence,
                            const std::vector<VkSemaphore>& wait_semaphores,
                            const std::vector<VkPipelineStageFlags>& wait_stage_masks);
+  // GPU execution time measurement (PS5 profiler): a pair of timestamps
+  // around each command buffer, in a ring of slots read back when reused
+  // (long after the submission has completed). Only RecordAndSubmit touches
+  // these, and it never runs on two threads at once.
+  static constexpr uint32_t kGpuTimestampSlots = 256;
+  VkQueryPool gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  bool gpu_timestamp_pool_failed_ = false;
+  uint32_t gpu_timestamp_slot_ = 0;
+  bool gpu_timestamp_slot_used_[kGpuTimestampSlots] = {};
+  void ReadGpuTimestampSlot(uint32_t slot);
   DeferredCommandBuffer deferred_command_buffer_;
   DeferredCommandBuffer upload_command_buffer_;
 

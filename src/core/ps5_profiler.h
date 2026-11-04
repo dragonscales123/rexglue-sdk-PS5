@@ -37,6 +37,12 @@ struct Counters {
   std::atomic<uint64_t> fetch_dwords_changed{0};  // ...whose value actually changed
   std::atomic<uint64_t> memexport_delivered{0};  // async memexport ranges written to guest memory
   std::atomic<uint64_t> memexport_skipped{0};    // ...skipped (the CPU wrote that memory since)
+  // GPU execution time of queue submissions (timestamps at the start and end
+  // of each command buffer), and submissions measured / not measured.
+  std::atomic<uint64_t> gpu_busy_ns{0};
+  std::atomic<uint64_t> gpu_timed_submits{0};
+  std::atomic<uint64_t> gpu_untimed_submits{0};
+  std::atomic<uint64_t> gpu_longest_submit_ns{0};  // since the last profile interval
 };
 Counters& counters();
 
