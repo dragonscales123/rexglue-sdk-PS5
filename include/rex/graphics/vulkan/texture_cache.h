@@ -266,6 +266,12 @@ class VulkanTextureCache final : public TextureCache {
     Usage usage_ = Usage::kUndefined;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
+    // Arguments and result of the last successful GetView (views live as
+    // long as the texture).
+    VkImageView last_view_ = VK_NULL_HANDLE;
+    uint32_t last_view_host_swizzle_ = 0;
+    bool last_view_is_signed_ = false;
+    bool last_view_is_array_ = false;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;

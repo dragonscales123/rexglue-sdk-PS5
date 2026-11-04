@@ -1862,6 +1862,20 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
                                                        bool is_array) {
+  if (last_view_ != VK_NULL_HANDLE && last_view_is_signed_ == is_signed &&
+      last_view_host_swizzle_ == host_swizzle && last_view_is_array_ == is_array) {
+    return last_view_;
+  }
+  const bool requested_is_signed = is_signed;
+  const uint32_t requested_host_swizzle = host_swizzle;
+  const bool requested_is_array = is_array;
+  auto remember = [&](VkImageView view) {
+    last_view_ = view;
+    last_view_is_signed_ = requested_is_signed;
+    last_view_host_swizzle_ = requested_host_swizzle;
+    last_view_is_array_ = requested_is_array;
+    return view;
+  };
   xenos::DataDimension dimension = key().dimension;
   if (dimension == xenos::DataDimension::k3D || dimension == xenos::DataDimension::kCube) {
     is_array = false;
@@ -1899,7 +1913,7 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
   // Try to find an existing view.
   auto it = views_.find(view_key);
   if (it != views_.end()) {
-    return it->second;
+    return remember(it->second);
   }
 
   // Create a new view.
@@ -1941,7 +1955,7 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
     return VK_NULL_HANDLE;
   }
   views_.emplace(view_key, view);
-  return view;
+  return remember(view);
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool is_signed,

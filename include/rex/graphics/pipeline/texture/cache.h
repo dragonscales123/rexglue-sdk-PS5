@@ -604,6 +604,28 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // Recently found textures, checked before hashing into textures_ (draws in
+  // busy scenes switch between the same few materials constantly). Cleared
+  // whenever a texture is destroyed, so it never holds a dangling pointer.
+  struct RecentTexture {
+    TextureKey key;
+    Texture* texture = nullptr;
+  };
+  static constexpr uint32_t kRecentTextureCountLog2 = 8;
+  std::array<RecentTexture, size_t(1) << kRecentTextureCountLog2> recent_textures_;
+  static uint32_t RecentTextureIndex(const TextureKey& key) {
+    static_assert(sizeof(TextureKey) == 2 * sizeof(uint64_t));
+    uint64_t words[2];
+    std::memcpy(words, &key, sizeof(words));
+    const uint64_t mixed = (words[0] ^ (words[1] * UINT64_C(0x9E3779B97F4A7C15))) *
+                           UINT64_C(0xBF58476D1CE4E5B9);
+    return uint32_t(mixed >> (64 - kRecentTextureCountLog2));
+  }
+  void ClearRecentTextures() {
+    for (RecentTexture& recent : recent_textures_) {
+      recent.texture = nullptr;
+    }
+  }
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

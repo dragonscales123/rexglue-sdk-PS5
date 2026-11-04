@@ -292,6 +292,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       ResetTextureBindings();
     }
     // Remove the texture from the map and destroy it via its unique_ptr.
+    ClearRecentTextures();
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
@@ -757,6 +758,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  ClearRecentTextures();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -859,9 +861,15 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Try to find an existing texture.
   // TODO(Triang3l): Reuse a texture with mip_page unchanged, but base_page
   // previously 0, now not 0, to save memory - common case in streaming.
+  RecentTexture& recent = recent_textures_[RecentTextureIndex(key)];
+  if (recent.texture && recent.key == key) {
+    return recent.texture;
+  }
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
-    return found_texture_it->second.get();
+    recent.key = key;
+    recent.texture = found_texture_it->second.get();
+    return recent.texture;
   }
 
   // Create the texture and add it to the map.
@@ -875,6 +883,8 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
+  recent.key = key;
+  recent.texture = texture;
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
