@@ -94,7 +94,13 @@ REXCVAR_DEFINE_UINT32(vulkan_submit_every_draws, REX_VULKAN_SUBMIT_EVERY_DRAWS_D
                       "memexport) has less queued work to wait for.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_submit_thread, false, "GPU/Vulkan",
+#if REX_PLATFORM_PS5
+// Measured at Fable II's heavy Bowerstone spot: 25.8 -> 28.2 fps.
+#define REX_VULKAN_SUBMIT_THREAD_DEFAULT true
+#else
+#define REX_VULKAN_SUBMIT_THREAD_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_submit_thread, REX_VULKAN_SUBMIT_THREAD_DEFAULT, "GPU/Vulkan",
                     "Record command buffers and submit them on a separate thread, so the GPU "
                     "command thread doesn't wait for the Vulkan driver. Read at startup.");
 
