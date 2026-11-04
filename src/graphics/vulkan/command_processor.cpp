@@ -2253,6 +2253,24 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
   }
   uint32_t end_index = start_index + num_registers - 1;
 
+  // A range crossing a constant block boundary is split, so each part takes
+  // its block's fast path instead of the whole range going register by
+  // register through the virtual WriteRegister.
+  {
+    static constexpr uint32_t kBlockBoundaries[] = {
+        XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+        XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1, XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+        XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1};
+    for (uint32_t boundary : kBlockBoundaries) {
+      if (start_index < boundary && end_index >= boundary) {
+        const uint32_t first_count = boundary - start_index;
+        WriteRegistersFromMem(start_index, base, first_count);
+        WriteRegistersFromMem(boundary, base + first_count, num_registers - first_count);
+        return;
+      }
+    }
+  }
+
   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
                                          uint32_t last_constant) -> bool {
     if (first_constant > last_constant) {
@@ -2354,6 +2372,22 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
         }
       }
     }
+    return;
+  }
+
+  // Plain state registers (outside the constant blocks, handled above): only
+  // the scratch registers, COHER_STATUS_HOST and the gamma ramp LUT ports have
+  // write side effects (CommandProcessor::WriteRegister). A range without any
+  // of them is a straight copy - no per-register virtual calls or switch.
+  auto overlaps = [&](uint32_t first, uint32_t last) {
+    return start_index <= last && end_index >= first;
+  };
+  if (end_index < RegisterFile::kRegisterCount &&
+      !overlaps(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7) &&
+      !overlaps(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST) &&
+      !overlaps(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_30_COLOR) &&
+      !overlaps(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
     return;
   }
 
