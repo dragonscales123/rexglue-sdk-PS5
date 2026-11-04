@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/memory/bytes_equal.h>
 #include <chrono>
 #include <algorithm>
 #include <array>
@@ -7233,9 +7234,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                       last.texture_count == stage_texture_counts[stage] &&
                       last.sampler_count == stage_sampler_counts[stage] &&
                       last.image_info.size() == info_count &&
-                      std::memcmp(last.image_info.data(),
-                                  descriptor_write_image_info_.data() + stage_info_begin[stage],
-                                  info_count * sizeof(VkDescriptorImageInfo)) == 0;
+                      rex::memory::BytesEqual(
+                          last.image_info.data(),
+                          descriptor_write_image_info_.data() + stage_info_begin[stage],
+                          info_count * sizeof(VkDescriptorImageInfo));
     if (same) {
       texture_set_reused[stage] = true;
       if (current_graphics_descriptor_sets_[texture_set_indices[stage]] != last.set) {

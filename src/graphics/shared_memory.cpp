@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/memory/bytes_equal.h>
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -607,8 +608,8 @@ void SharedMemory::FilterUnchangedHotPages(
               continue;
             }
             compared_bytes += end - start;
-            unchanged =
-                std::memcmp(shadow.data.get() + start, guest + start, end - start) == 0;
+            unchanged = rex::memory::BytesEqual(shadow.data.get() + start, guest + start,
+                                                end - start);
             if (unchanged) {
               if (start <= shadow.verified_end && end >= shadow.verified_begin &&
                   shadow.verified_end > shadow.verified_begin) {
