@@ -590,6 +590,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
   }
   if (bindings_changed) {
+    ++texture_bindings_generation_;
     UpdateTextureBindingsImpl(bindings_changed);
   }
 }
@@ -1013,6 +1014,7 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
   }
   texture_bindings_in_sync_ &= ~bindings_reset;
   if (!from_destructor && bindings_reset) {
+    ++texture_bindings_generation_;
     UpdateTextureBindingsImpl(bindings_reset);
   }
 }

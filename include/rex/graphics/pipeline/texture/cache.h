@@ -91,6 +91,10 @@ class TextureCache {
 
   static uint32_t GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
 
+  // Incremented whenever any texture binding (texture, view, signedness) may
+  // have changed, so a user can tell its derived state is still current.
+  uint64_t texture_bindings_generation() const { return texture_bindings_generation_; }
+
   void TextureFetchConstantWritten(uint32_t index) { TextureFetchConstantsWritten(index, index); }
   void TextureFetchConstantsWritten(uint32_t first_index, uint32_t last_index) {
     if (first_index > last_index) {
@@ -641,6 +645,7 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  uint64_t texture_bindings_generation_ = 1;
 };
 
 }  // namespace rex::graphics

@@ -933,6 +933,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t sampler_memo_submission_[2] = {};
   uint32_t sampler_memo_fetch_mask_[2] = {};
   bool sampler_memo_valid_[2] = {};
+  // Whether this draw reused the previous samplers for the stage.
+  bool sampler_memo_hit_[2] = {};
+  // UpdateBindings: shader and texture binding generation the stage's last
+  // texture descriptor set was gathered for.
+  const VulkanShader* texture_set_last_shader_[2] = {};
+  uint64_t texture_set_last_generation_[2] = {};
   // Texture fetch constant slots changed since each stage's samplers were built.
   uint32_t sampler_fetch_dirty_[2] = {UINT32_MAX, UINT32_MAX};
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
