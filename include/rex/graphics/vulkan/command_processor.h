@@ -637,6 +637,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // upload pool pages (which live until ClearCache) is written once and reused,
   // and each draw only passes the offsets when binding it.
   bool constants_dynamic_ = false;
+  // vulkan_submit_every_draws bookkeeping.
+  uint64_t draws_submission_ = 0;
+  uint32_t draws_in_submission_ = 0;
   // 256 float4 constants per stage: the fixed range of the float constant
   // bindings in dynamic mode.
   static constexpr size_t kFloatConstantsMaxSize = sizeof(float) * 4 * 256;

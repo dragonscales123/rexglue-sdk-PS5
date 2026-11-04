@@ -66,16 +66,24 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_constant_buffers, true, "GPU/Vulkan",
                     "set of upload pages, reused with new offsets, instead of allocating and "
                     "writing a descriptor set whenever the constants change. Read at startup.");
 
-REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU",
+REXCVAR_DEFINE_BOOL(readback_memexport_async, false, "GPU",
                     "Read memexport writes back to guest memory without waiting: the copy is "
                     "written to guest memory once the GPU has finished it, if the CPU has not "
-                    "written that memory since. Takes precedence over readback_memexport_fast.")
+                    "written that memory since. Takes precedence over readback_memexport_fast. "
+                    "Off by default: Fable II needs some memexport data in the same frame (its "
+                    "glowing trail disappears with late data).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 2, "GPU",
+REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 1, "GPU",
                       "With readback_memexport_fast, how many memexport draws old the data the "
                       "guest reads back is (1-2). 1 waits for the GPU at almost every memexport "
                       "draw when the GPU thread runs ahead; 2 rarely has to wait.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_UINT32(vulkan_submit_every_draws, 0, "GPU/Vulkan",
+                      "End the submission after this many draws (0 = off), when that is safe, "
+                      "so the GPU starts on the work sooner and a synchronous readback (such as "
+                      "memexport) has less queued work to wait for.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
@@ -4223,6 +4231,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       } else {
         IssueDraw_MemexportReadbackFullPath(memexport_total_size);
       }
+    }
+  }
+
+#if REX_PLATFORM_PS5
+  rex::ps5prof::counters().draws.fetch_add(1, std::memory_order_relaxed);
+#endif
+  if (const uint32_t submit_every = REXCVAR_GET(vulkan_submit_every_draws)) {
+    const uint64_t submission = GetCurrentSubmission();
+    if (submission != draws_submission_) {
+      draws_submission_ = submission;
+      draws_in_submission_ = 0;
+    }
+    if (++draws_in_submission_ >= submit_every && submission_open_ &&
+        CanEndSubmissionImmediately()) {
+      EndSubmission(false);
     }
   }
 
