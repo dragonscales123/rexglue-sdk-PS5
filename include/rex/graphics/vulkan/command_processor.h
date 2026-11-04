@@ -883,6 +883,15 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
+  // Per stage (vertex, pixel): the samplers in current_samplers_* are reused
+  // for the next draw if the shader and submission are the same and none of
+  // the texture fetch constants they were built from changed since.
+  const VulkanShader* sampler_memo_shader_[2] = {};
+  uint64_t sampler_memo_submission_[2] = {};
+  uint32_t sampler_memo_fetch_mask_[2] = {};
+  bool sampler_memo_valid_[2] = {};
+  // Texture fetch constant slots changed since each stage's samplers were built.
+  uint32_t sampler_fetch_dirty_[2] = {UINT32_MAX, UINT32_MAX};
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
 
   // Cache render pass currently started in the command buffer with the

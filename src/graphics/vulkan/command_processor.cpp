@@ -2192,6 +2192,12 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     // derived from it stay valid.
     return;
   }
+  if (is_fetch_constant) {
+    const uint32_t texture_bit = UINT32_C(1)
+                                 << ((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+    sampler_fetch_dirty_[0] |= texture_bit;
+    sampler_fetch_dirty_[1] |= texture_bit;
+  }
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
     if (frame_open_) {
@@ -2322,6 +2328,8 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
                                                            std::memory_order_relaxed);
 #endif
     if (changed_textures) {
+      sampler_fetch_dirty_[0] |= changed_textures;
+      sampler_fetch_dirty_[1] |= changed_textures;
       current_constant_buffers_up_to_date_ &=
           ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
       if (texture_cache_) {
@@ -3871,11 +3879,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
+      const VulkanShader* shader = j ? pixel_shader : vertex_shader;
+      if (!i && shader && sampler_memo_valid_[j] && shader == sampler_memo_shader_[j] &&
+          sampler_memo_submission_[j] == GetCurrentSubmission() &&
+          !(sampler_fetch_dirty_[j] & sampler_memo_fetch_mask_[j])) {
+        // Same shader, same submission (the samplers are marked as used in
+        // it, so they stay alive), same fetch constants: same samplers.
+        continue;
+      }
       if (!i) {
         shader_samplers.clear();
       }
-      const VulkanShader* shader = j ? pixel_shader : vertex_shader;
       if (!shader) {
+        sampler_memo_valid_[j] = false;
         continue;
       }
       const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
@@ -3910,6 +3926,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           ++samplers_overflowed_count;
         }
       }
+      bool all_samplers_obtained = true;
+      uint32_t fetch_mask = 0;
+      for (size_t k = 0; k < shader_samplers.size(); ++k) {
+        all_samplers_obtained &= shader_samplers[k].second != VK_NULL_HANDLE;
+        fetch_mask |= UINT32_C(1) << (shader_sampler_bindings[k].fetch_constant & 31);
+      }
+      sampler_memo_valid_[j] = all_samplers_obtained;
+      sampler_memo_shader_[j] = shader;
+      sampler_memo_submission_[j] = GetCurrentSubmission();
+      sampler_memo_fetch_mask_[j] = fetch_mask;
+      sampler_fetch_dirty_[j] = 0;
     }
     if (!samplers_overflowed_count) {
       break;
