@@ -7296,8 +7296,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   // Write.
   if (write_descriptor_set_count) {
-    dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
-                               nullptr);
+    bool all_image_writes = true;
+    for (uint32_t i = 0; i < write_descriptor_set_count; ++i) {
+      all_image_writes &= write_descriptor_sets[i].pImageInfo != nullptr;
+    }
+    if (submit_thread_enabled_ && all_image_writes) {
+      // The sets are only referenced by commands recorded after this point, so
+      // the writes can be performed where the stream is executed (the submit
+      // thread), in order, before those commands are recorded.
+      deferred_command_buffer_.CmdVkUpdateDescriptorSetImages(write_descriptor_set_count,
+                                                              write_descriptor_sets.data());
+    } else {
+      dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(),
+                                 0, nullptr);
+    }
   }
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.

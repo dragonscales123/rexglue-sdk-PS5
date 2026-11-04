@@ -315,6 +315,48 @@ void DeferredCommandBuffer::ExecuteStream(const std::vector<uintmax_t>& command_
                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
       } break;
 
+      case Command::kVkUpdateDescriptorSetImages: {
+        using Args = ArgsVkUpdateDescriptorSetImages;
+        auto& args = *reinterpret_cast<const Args*>(stream);
+        const uint8_t* args_ptr = reinterpret_cast<const uint8_t*>(stream);
+        const size_t writes_offset = rex::align(sizeof(Args), alignof(Args::Write));
+        const size_t image_infos_offset =
+            rex::align(writes_offset + sizeof(Args::Write) * args.write_count,
+                       alignof(VkDescriptorImageInfo));
+        const auto* in_writes = reinterpret_cast<const Args::Write*>(args_ptr + writes_offset);
+        const auto* image_infos =
+            reinterpret_cast<const VkDescriptorImageInfo*>(args_ptr + image_infos_offset);
+        constexpr uint32_t kMaxWritesPerCall = 16;
+        VkWriteDescriptorSet writes[kMaxWritesPerCall];
+        uint32_t pending = 0;
+        auto flush = [&]() {
+          if (pending) {
+            dfn.vkUpdateDescriptorSets(command_processor_.GetVulkanDevice()->device(), pending,
+                                       writes, 0, nullptr);
+            pending = 0;
+          }
+        };
+        for (uint32_t i = 0; i < args.write_count; ++i) {
+          if (pending == kMaxWritesPerCall) {
+            flush();
+          }
+          const Args::Write& in_write = in_writes[i];
+          VkWriteDescriptorSet& write = writes[pending++];
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.pNext = nullptr;
+          write.dstSet = in_write.dst_set;
+          write.dstBinding = in_write.dst_binding;
+          write.dstArrayElement = in_write.dst_array_element;
+          write.descriptorCount = in_write.descriptor_count;
+          write.descriptorType = in_write.descriptor_type;
+          write.pImageInfo = image_infos;
+          write.pBufferInfo = nullptr;
+          write.pTexelBufferView = nullptr;
+          image_infos += in_write.descriptor_count;
+        }
+        flush();
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;
@@ -411,6 +453,39 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
   if (rendering_info->pStencilAttachment) {
     std::memcpy(args_ptr + stencil_attachment_offset, rendering_info->pStencilAttachment,
                 sizeof(VkRenderingAttachmentInfo));
+  }
+}
+
+void DeferredCommandBuffer::CmdVkUpdateDescriptorSetImages(uint32_t write_count,
+                                                           const VkWriteDescriptorSet* writes) {
+  using Args = ArgsVkUpdateDescriptorSetImages;
+  uint32_t image_info_count = 0;
+  for (uint32_t i = 0; i < write_count; ++i) {
+    assert_not_null(writes[i].pImageInfo);
+    image_info_count += writes[i].descriptorCount;
+  }
+  const size_t writes_offset = rex::align(sizeof(Args), alignof(Args::Write));
+  const size_t image_infos_offset = rex::align(writes_offset + sizeof(Args::Write) * write_count,
+                                               alignof(VkDescriptorImageInfo));
+  uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+      WriteCommand(Command::kVkUpdateDescriptorSetImages,
+                   image_infos_offset + sizeof(VkDescriptorImageInfo) * image_info_count));
+  auto& args = *reinterpret_cast<Args*>(args_ptr);
+  args.write_count = write_count;
+  args.image_info_count = image_info_count;
+  auto* out_writes = reinterpret_cast<Args::Write*>(args_ptr + writes_offset);
+  auto* out_image_infos = reinterpret_cast<VkDescriptorImageInfo*>(args_ptr + image_infos_offset);
+  for (uint32_t i = 0; i < write_count; ++i) {
+    const VkWriteDescriptorSet& write = writes[i];
+    Args::Write& out_write = out_writes[i];
+    out_write.dst_set = write.dstSet;
+    out_write.dst_binding = write.dstBinding;
+    out_write.dst_array_element = write.dstArrayElement;
+    out_write.descriptor_count = write.descriptorCount;
+    out_write.descriptor_type = write.descriptorType;
+    std::memcpy(out_image_infos, write.pImageInfo,
+                sizeof(VkDescriptorImageInfo) * write.descriptorCount);
+    out_image_infos += write.descriptorCount;
   }
 }
 

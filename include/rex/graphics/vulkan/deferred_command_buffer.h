@@ -359,6 +359,12 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + header_size, viewports, sizeof(VkViewport) * viewport_count);
   }
 
+  // Not a command buffer command: vkUpdateDescriptorSets for image and sampler
+  // descriptors (the writes must use pImageInfo), performed when the stream is
+  // executed, before the commands recorded after it. Lets descriptor writes
+  // happen wherever the stream is executed (the submit thread).
+  void CmdVkUpdateDescriptorSetImages(uint32_t write_count, const VkWriteDescriptorSet* writes);
+
  private:
   enum class Command {
     kVkBeginRenderPass,
@@ -389,6 +395,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kVkUpdateDescriptorSetImages,
   };
 
   struct CommandHeader {
@@ -427,6 +434,20 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t query;
     VkQueryControlFlags flags;
+  };
+
+  struct ArgsVkUpdateDescriptorSetImages {
+    uint32_t write_count;
+    uint32_t image_info_count;
+    struct Write {
+      VkDescriptorSet dst_set;
+      uint32_t dst_binding;
+      uint32_t dst_array_element;
+      uint32_t descriptor_count;
+      VkDescriptorType descriptor_type;
+    };
+    // Followed by aligned Write[write_count], then
+    // VkDescriptorImageInfo[image_info_count] (each write's in order).
   };
 
   struct ArgsVkBindDescriptorSets {
