@@ -107,6 +107,9 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  // True if every page of the range holds data the GPU wrote and the CPU has
+  // not written since (still valid and GPU-written).
+  bool IsRangeGpuWritten(uint32_t start, uint32_t length);
 
  protected:
   SharedMemory(memory::Memory& memory);

@@ -32,6 +32,8 @@ struct Counters {
   std::atomic<uint64_t> fence_waits[5] = {};
   std::atomic<uint64_t> fence_wait_ns[5] = {};
   std::atomic<uint64_t> queue_submits{0};
+  std::atomic<uint64_t> memexport_delivered{0};  // async memexport ranges written to guest memory
+  std::atomic<uint64_t> memexport_skipped{0};    // ...skipped (the CPU wrote that memory since)
 };
 Counters& counters();
 

@@ -817,6 +817,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
+  // readback_memexport_async: memexport copies are recorded without waiting
+  // and written to guest memory once their submission has completed.
+  struct MemexportAsyncBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapping = nullptr;
+    uint32_t capacity = 0;
+    VkDeviceSize memory_size = 0;
+    bool coherent = false;
+  };
+  struct MemexportAsyncPending {
+    MemexportAsyncBuffer buffer;
+    uint64_t submission = 0;
+    std::vector<draw_util::MemExportRange> ranges;
+  };
+  std::vector<MemexportAsyncBuffer> memexport_async_free_;
+  std::deque<MemexportAsyncPending> memexport_async_pending_;
+  bool IssueDraw_MemexportReadbackAsync(uint32_t total_size);
+  void DeliverCompletedMemexportReadbacks();
+  void DestroyMemexportAsyncBuffers();
+
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's
   // unused, like depth bias being disabled, but the values themselves still not

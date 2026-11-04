@@ -66,6 +66,12 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_constant_buffers, true, "GPU/Vulkan",
                     "set of upload pages, reused with new offsets, instead of allocating and "
                     "writing a descriptor set whenever the constants change. Read at startup.");
 
+REXCVAR_DEFINE_BOOL(readback_memexport_async, true, "GPU",
+                    "Read memexport writes back to guest memory without waiting: the copy is "
+                    "written to guest memory once the GPU has finished it, if the CPU has not "
+                    "written that memory since. Takes precedence over readback_memexport_fast.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 2, "GPU",
                       "With readback_memexport_fast, how many memexport draws old the data the "
                       "guest reads back is (1-2). 1 waits for the GPU at almost every memexport "
@@ -1958,6 +1964,7 @@ void VulkanCommandProcessor::ShutdownContext() {
     }
   }
   memexport_readback_buffers_.clear();
+  DestroyMemexportAsyncBuffers();
 
   resolve_downscale_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
@@ -4209,7 +4216,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size) {
-      if (REXCVAR_GET(readback_memexport_fast)) {
+      if (REXCVAR_GET(readback_memexport_async)) {
+        IssueDraw_MemexportReadbackAsync(memexport_total_size);
+      } else if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
         IssueDraw_MemexportReadbackFullPath(memexport_total_size);
@@ -4295,6 +4304,158 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
   dfn.vkFreeMemory(device, readback_memory, nullptr);
   return true;
+}
+
+bool VulkanCommandProcessor::IssueDraw_MemexportReadbackAsync(uint32_t total_size) {
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Deliver what has completed, and keep the number of copies in flight
+  // bounded (waits only if the GPU is that far behind).
+  CheckSubmissionFenceAndDeviceLoss(0);
+  constexpr size_t kMaxPending = 16;
+  if (memexport_async_pending_.size() >= kMaxPending) {
+    CheckSubmissionFenceAndDeviceLoss(memexport_async_pending_.front().submission,
+                                      FenceWaitReason::kMemexport);
+  }
+
+  MemexportAsyncBuffer buffer;
+  for (size_t i = 0; i < memexport_async_free_.size(); ++i) {
+    if (memexport_async_free_[i].capacity >= total_size) {
+      buffer = memexport_async_free_[i];
+      memexport_async_free_[i] = memexport_async_free_.back();
+      memexport_async_free_.pop_back();
+      break;
+    }
+  }
+  if (buffer.buffer == VK_NULL_HANDLE) {
+    const uint32_t capacity = AlignReadbackBufferSize(total_size);
+    uint32_t memory_type = UINT32_MAX;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, buffer.buffer, buffer.memory,
+            &memory_type, &buffer.memory_size)) {
+      REXGPU_ERROR("Failed to create a Vulkan memexport readback buffer");
+      return IssueDraw_MemexportReadbackFullPath(total_size);
+    }
+    if (dfn.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapping) !=
+        VK_SUCCESS) {
+      REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
+      dfn.vkDestroyBuffer(device, buffer.buffer, nullptr);
+      dfn.vkFreeMemory(device, buffer.memory, nullptr);
+      return IssueDraw_MemexportReadbackFullPath(total_size);
+    }
+    buffer.capacity = capacity;
+    buffer.coherent =
+        (vulkan_device->memory_types().host_coherent & (uint32_t(1) << memory_type)) != 0;
+  }
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    VkBufferCopy readback_region = {};
+    readback_region.srcOffset = memexport_range.base_address_dwords << 2;
+    readback_region.dstOffset = readback_offset;
+    readback_region.size = memexport_range.size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer.buffer, 1,
+                                             &readback_region);
+    readback_offset += memexport_range.size_bytes;
+  }
+  PushBufferMemoryBarrier(buffer.buffer, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+
+  MemexportAsyncPending& pending = memexport_async_pending_.emplace_back();
+  pending.buffer = buffer;
+  pending.submission = GetCurrentSubmission();
+  pending.ranges = memexport_ranges_;
+  return true;
+}
+
+void VulkanCommandProcessor::DeliverCompletedMemexportReadbacks() {
+  if (memexport_async_pending_.empty() ||
+      memexport_async_pending_.front().submission > submission_completed_) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  uint64_t delivered = 0, skipped = 0;
+  while (!memexport_async_pending_.empty() &&
+         memexport_async_pending_.front().submission <= submission_completed_) {
+    MemexportAsyncPending& pending = memexport_async_pending_.front();
+    if (!pending.buffer.coherent) {
+      VkMappedMemoryRange range = {};
+      range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      range.memory = pending.buffer.memory;
+      range.offset = 0;
+      range.size = VK_WHOLE_SIZE;
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    }
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(pending.buffer.mapping);
+    {
+      // Under the global lock so a guest thread can't write these pages
+      // between the check and the copy.
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      for (const draw_util::MemExportRange& memexport_range : pending.ranges) {
+        const uint32_t start = memexport_range.base_address_dwords << 2;
+        // Only where the GPU's data is still authoritative: if the CPU wrote
+        // these pages since, its data must not be overwritten with older GPU
+        // data. A newer memexport to the same range keeps them GPU-written,
+        // and marking them GPU-written again below keeps the GPU's (newer)
+        // copy from being replaced by this older data.
+        if (shared_memory_->IsRangeGpuWritten(start, memexport_range.size_bytes)) {
+          std::memcpy(memory_->TranslatePhysical(start), bytes, memexport_range.size_bytes);
+          shared_memory_->RangeWrittenByGpu(start, memexport_range.size_bytes);
+          ++delivered;
+        } else {
+          ++skipped;
+        }
+        bytes += memexport_range.size_bytes;
+      }
+    }
+    memexport_async_free_.push_back(pending.buffer);
+    memexport_async_pending_.pop_front();
+  }
+#if REX_PLATFORM_PS5
+  rex::ps5prof::counters().memexport_delivered.fetch_add(delivered, std::memory_order_relaxed);
+  rex::ps5prof::counters().memexport_skipped.fetch_add(skipped, std::memory_order_relaxed);
+#else
+  (void)delivered;
+  (void)skipped;
+#endif
+}
+
+void VulkanCommandProcessor::DestroyMemexportAsyncBuffers() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  auto destroy = [&](MemexportAsyncBuffer& buffer) {
+    if (buffer.mapping) {
+      dfn.vkUnmapMemory(device, buffer.memory);
+    }
+    if (buffer.buffer != VK_NULL_HANDLE) {
+      dfn.vkDestroyBuffer(device, buffer.buffer, nullptr);
+    }
+    if (buffer.memory != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, buffer.memory, nullptr);
+    }
+    buffer = MemexportAsyncBuffer();
+  };
+  for (MemexportAsyncPending& pending : memexport_async_pending_) {
+    destroy(pending.buffer);
+  }
+  memexport_async_pending_.clear();
+  for (MemexportAsyncBuffer& buffer : memexport_async_free_) {
+    destroy(buffer);
+  }
+  memexport_async_free_.clear();
 }
 
 bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_size) {
@@ -5115,6 +5276,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   render_target_cache_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+
+  DeliverCompletedMemexportReadbacks();
 
   // Destroy objects scheduled for destruction.
   while (!destroy_framebuffers_.empty()) {
