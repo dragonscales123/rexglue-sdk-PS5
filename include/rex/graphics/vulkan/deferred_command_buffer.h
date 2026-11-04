@@ -29,7 +29,15 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
-  void Execute(VkCommandBuffer command_buffer);
+  void Execute(VkCommandBuffer command_buffer) { ExecuteStream(command_stream_, command_buffer); }
+  // Records a command stream taken out with SwapStream (possibly on another
+  // thread - only the device functions are used).
+  void ExecuteStream(const std::vector<uintmax_t>& command_stream,
+                     VkCommandBuffer command_buffer) const;
+  // Exchanges the recorded commands with `stream`, so a finished stream can be
+  // executed elsewhere while recording continues into the other storage.
+  void SwapStream(std::vector<uintmax_t>& stream) { command_stream_.swap(stream); }
+  const std::vector<uintmax_t>& stream() const { return command_stream_; }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,

@@ -11,6 +11,10 @@
  */
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <climits>
 #include <cstdint>
@@ -571,6 +575,45 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
+
+  // vulkan_submit_thread: recording the deferred command streams into a
+  // Vulkan command buffer and vkQueueSubmit happen on a separate thread, so the
+  // GPU command thread moves on to the next packets right away. Submissions
+  // are still made in order; anything that needs them on the queue (blocking
+  // fence waits, swaps - the presenter submits right after - and sparse binds)
+  // drains the thread first. Fences are only polled once actually submitted.
+  struct SubmitJob {
+    std::vector<uintmax_t> upload_stream;
+    std::vector<uintmax_t> deferred_stream;
+    CommandBuffer command_buffer = {};
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+    uint64_t submission = 0;
+  };
+  bool submit_thread_enabled_ = false;
+  std::thread submit_thread_;
+  std::mutex submit_mutex_;
+  std::condition_variable submit_cv_;
+  std::condition_variable submit_done_cv_;
+  std::deque<SubmitJob> submit_jobs_;
+  bool submit_thread_busy_ = false;
+  bool submit_thread_exit_ = false;
+  // Highest submission index handed to vkQueueSubmit (by either thread).
+  std::atomic<uint64_t> submissions_queued_{0};
+  std::atomic<bool> submit_thread_device_lost_{false};
+  std::vector<std::vector<uintmax_t>> submit_streams_free_;
+  void SubmitThreadMain();
+  void DrainSubmitThread();
+  void StartSubmitThread();
+  void StopSubmitThread();
+  // Resets the pool, records both streams and submits. Returns the result of
+  // the failing call (VK_SUCCESS if all succeeded).
+  VkResult RecordAndSubmit(const CommandBuffer& command_buffer,
+                           const std::vector<uintmax_t>& upload_stream,
+                           const std::vector<uintmax_t>& deferred_stream, VkFence fence,
+                           const std::vector<VkSemaphore>& wait_semaphores,
+                           const std::vector<VkPipelineStageFlags>& wait_stage_masks);
   DeferredCommandBuffer deferred_command_buffer_;
   DeferredCommandBuffer upload_command_buffer_;
 

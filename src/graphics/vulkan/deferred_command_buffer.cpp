@@ -32,15 +32,16 @@ void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
 }
 
-void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+void DeferredCommandBuffer::ExecuteStream(const std::vector<uintmax_t>& command_stream,
+                                          VkCommandBuffer command_buffer) const {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
+  const uintmax_t* stream = command_stream.data();
+  size_t stream_remaining = command_stream.size();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
