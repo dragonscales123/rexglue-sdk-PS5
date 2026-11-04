@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -73,6 +74,10 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+#if REX_PLATFORM_PS5
+#include "../../core/ps5_profiler.h"
+#endif
 
 namespace rex::graphics::vulkan {
 
@@ -4247,7 +4252,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT);
 
-  if (!AwaitAllQueueOperationsCompletion()) {
+  if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kMemexport)) {
     REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
     dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
     dfn.vkFreeMemory(device, readback_memory, nullptr);
@@ -4322,7 +4327,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     }
 
     if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
-      if (!AwaitAllQueueOperationsCompletion()) {
+      if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kMemexport)) {
         dfn.vkUnmapMemory(device, new_memory);
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
@@ -4388,7 +4393,8 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     // is always one memexport draw old, whether or not the GPU has caught up.
     // A copy recorded in the still-open submission is left to the full path
     // below, as without this cvar, so the open submission is never ended here.
-    CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index]);
+    CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index],
+                                      FenceWaitReason::kMemexport);
   }
   bool previous_slot_ready =
       previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
@@ -4486,7 +4492,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
-      if (!AwaitAllQueueOperationsCompletion()) {
+      if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kResolveReadback)) {
         dfn.vkUnmapMemory(device, new_memory);
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
@@ -4571,7 +4577,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       }
       if (resolve_downscale_buffer_ != VK_NULL_HANDLE ||
           resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
-        if (!AwaitAllQueueOperationsCompletion()) {
+        if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kResolveReadback)) {
           dfn.vkDestroyBuffer(device, new_buffer, nullptr);
           dfn.vkFreeMemory(device, new_memory, nullptr);
           return true;
@@ -4692,7 +4698,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
+  } else if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kResolveReadback)) {
     return true;
   }
 
@@ -4702,7 +4708,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                            readback.mapped_data[read_index] == nullptr)) {
     is_cache_miss = true;
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
+    if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kResolveReadback)) {
       return true;
     }
   }
@@ -4924,7 +4930,7 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
   if (!EndSubmission(false)) {
     return false;
   }
-  if (!AwaitAllQueueOperationsCompletion()) {
+  if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kOcclusionQuery)) {
     return false;
   }
 
@@ -4981,7 +4987,8 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->StencilFail_B = 0;
 }
 
-void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission,
+                                                               FenceWaitReason reason) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
     return;
@@ -5008,9 +5015,24 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+#if REX_PLATFORM_PS5
+    const auto wait_start = std::chrono::steady_clock::now();
+#endif
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+#if REX_PLATFORM_PS5
+    {
+      const uint64_t wait_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - wait_start)
+                                            .count());
+      auto& counters = rex::ps5prof::counters();
+      counters.fence_waits[uint32_t(reason)].fetch_add(1, std::memory_order_relaxed);
+      counters.fence_wait_ns[uint32_t(reason)].fetch_add(wait_ns, std::memory_order_relaxed);
+    }
+#else
+    (void)reason;
+#endif
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5149,7 +5171,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
-  CheckSubmissionFenceAndDeviceLoss(await_submission);
+  CheckSubmissionFenceAndDeviceLoss(await_submission, FenceWaitReason::kFrameLimit);
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
   }
@@ -5458,6 +5480,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+#if REX_PLATFORM_PS5
+      rex::ps5prof::counters().queue_submits.fetch_add(1, std::memory_order_relaxed);
+#endif
     }
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");

@@ -27,6 +27,11 @@ struct Counters {
   // wait, interrupt, swap, GPU signal.
   std::atomic<uint64_t> sync_points[5] = {};
   std::atomic<uint64_t> watch_fires{0};  // range (texture) watches fired by CPU writes
+  // Blocking GPU fence waits on the GPU thread by reason (VulkanCommandProcessor::
+  // FenceWaitReason: other, frame limit, memexport, resolve readback, occlusion).
+  std::atomic<uint64_t> fence_waits[5] = {};
+  std::atomic<uint64_t> fence_wait_ns[5] = {};
+  std::atomic<uint64_t> queue_submits{0};
 };
 Counters& counters();
 

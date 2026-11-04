@@ -413,7 +413,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
-  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  // Why a blocking fence wait happens (counted in profile.txt on the PS5).
+  enum class FenceWaitReason : uint32_t {
+    kOther,
+    kFrameLimit,  // opening a frame: kMaxFramesInFlight frames already queued
+    kMemexport,
+    kResolveReadback,
+    kOcclusionQuery,
+    kCount,
+  };
+  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission,
+                                         FenceWaitReason reason = FenceWaitReason::kOther);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -423,8 +433,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
-  bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+  bool AwaitAllQueueOperationsCompletion(FenceWaitReason reason = FenceWaitReason::kOther) {
+    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission(), reason);
     return !submission_open_ && submissions_in_flight_fences_.empty();
   }
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit

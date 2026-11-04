@@ -214,6 +214,25 @@ void Dump(int fd, double seconds) {
                  "watches fired %.0f\n",
                  d[0] / 1048576.0, d[1] / 1048576.0, d[2], d[3], d[4], d[5], d[6], d[7], d[8]);
     write(fd, header, size_t(n));
+    // GPU fence waits: count/s and ms/s by reason, and queue submissions/s.
+    static uint64_t previous_fence[11] = {};
+    uint64_t fence_now[11];
+    for (int k = 0; k < 5; ++k) {
+      fence_now[k] = counters_now.fence_waits[k].load();
+      fence_now[5 + k] = counters_now.fence_wait_ns[k].load();
+    }
+    fence_now[10] = counters_now.queue_submits.load();
+    double f[11];
+    for (int k = 0; k < 11; ++k) {
+      f[k] = double(fence_now[k] - previous_fence[k]) * inv;
+      previous_fence[k] = fence_now[k];
+    }
+    n = snprintf(header, sizeof(header),
+                 "fence-wait/s (count, ms): frame-limit %.0f %.1f, memexport %.0f %.1f, "
+                 "resolve %.0f %.1f, occlusion %.0f %.1f, other %.0f %.1f | submits %.0f\n",
+                 f[1], f[6] / 1e6, f[2], f[7] / 1e6, f[3], f[8] / 1e6, f[4], f[9] / 1e6, f[0],
+                 f[5] / 1e6, f[10]);
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;
