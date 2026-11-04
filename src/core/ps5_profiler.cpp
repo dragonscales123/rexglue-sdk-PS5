@@ -237,6 +237,15 @@ void Dump(int fd, double seconds) {
                  f[1], f[6] / 1e6, f[2], f[7] / 1e6, f[3], f[8] / 1e6, f[4], f[9] / 1e6, f[0],
                  f[5] / 1e6, f[10], f[13], f[11], f[12]);
     write(fd, header, size_t(n));
+    static uint64_t previous_fetch[2] = {};
+    const uint64_t fetch_now[2] = {counters_now.fetch_dwords_written.load(),
+                                   counters_now.fetch_dwords_changed.load()};
+    n = snprintf(header, sizeof(header), "fetch-constants/s: dwords written %.0f, changed %.0f\n",
+                 double(fetch_now[0] - previous_fetch[0]) * inv,
+                 double(fetch_now[1] - previous_fetch[1]) * inv);
+    previous_fetch[0] = fetch_now[0];
+    previous_fetch[1] = fetch_now[1];
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;

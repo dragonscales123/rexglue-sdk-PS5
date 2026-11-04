@@ -2174,7 +2174,24 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  const bool is_fetch_constant = index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+                                 index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5;
+  const bool fetch_constant_unchanged =
+      is_fetch_constant && register_file_->values[index] == value;
   CommandProcessor::WriteRegister(index, value);
+#if REX_PLATFORM_PS5
+  if (is_fetch_constant) {
+    rex::ps5prof::counters().fetch_dwords_written.fetch_add(1, std::memory_order_relaxed);
+    if (!fetch_constant_unchanged) {
+      rex::ps5prof::counters().fetch_dwords_changed.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+#endif
+  if (fetch_constant_unchanged) {
+    // Same value: textures, vertex buffers and the fetch constant buffer
+    // derived from it stay valid.
+    return;
+  }
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
     if (frame_open_) {
@@ -2281,15 +2298,41 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    current_constant_buffers_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
-    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    if (texture_cache_) {
-      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    // Games often rewrite fetch constants with the values they already have;
+    // only what actually changed invalidates the textures, vertex buffers and
+    // fetch constant buffer derived from them.
+    uint32_t* values = register_file_->values + start_index;
+    const uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t changed_textures = 0;
+    uint32_t changed_dword_count = 0;
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      const uint32_t value = rex::byte_swap(base[i]);
+      if (values[i] != value) {
+        values[i] = value;
+        const uint32_t fetch_dword = first_fetch_dword + i;
+        changed_textures |= UINT32_C(1) << (fetch_dword / 6);
+        InvalidateVertexBufferResidency(fetch_dword / 2);
+        ++changed_dword_count;
+      }
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+#if REX_PLATFORM_PS5
+    rex::ps5prof::counters().fetch_dwords_written.fetch_add(num_registers,
+                                                           std::memory_order_relaxed);
+    rex::ps5prof::counters().fetch_dwords_changed.fetch_add(changed_dword_count,
+                                                           std::memory_order_relaxed);
+#endif
+    if (changed_textures) {
+      current_constant_buffers_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+      if (texture_cache_) {
+        uint32_t index;
+        uint32_t remaining = changed_textures;
+        while (rex::bit_scan_forward(remaining, &index)) {
+          remaining &= ~(UINT32_C(1) << index);
+          texture_cache_->TextureFetchConstantWritten(index);
+        }
+      }
+    }
     return;
   }
 
