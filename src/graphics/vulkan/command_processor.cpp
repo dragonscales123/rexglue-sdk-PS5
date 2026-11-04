@@ -4315,66 +4315,81 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackAsync(uint32_t total_siz
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  // Deliver what has completed, and keep the number of copies in flight
-  // bounded (waits only if the GPU is that far behind).
+  // Deliver what has completed (never ends the open submission).
   CheckSubmissionFenceAndDeviceLoss(0);
-  constexpr size_t kMaxPending = 16;
-  if (memexport_async_pending_.size() >= kMaxPending) {
-    CheckSubmissionFenceAndDeviceLoss(memexport_async_pending_.front().submission,
-                                      FenceWaitReason::kMemexport);
-  }
 
-  MemexportAsyncBuffer buffer;
-  for (size_t i = 0; i < memexport_async_free_.size(); ++i) {
-    if (memexport_async_free_[i].capacity >= total_size) {
-      buffer = memexport_async_free_[i];
-      memexport_async_free_[i] = memexport_async_free_.back();
-      memexport_async_free_.pop_back();
-      break;
+  // Append to this submission's batch if it has room, otherwise start one.
+  const uint64_t submission = GetCurrentSubmission();
+  MemexportAsyncPending* batch = nullptr;
+  if (!memexport_async_pending_.empty()) {
+    MemexportAsyncPending& last = memexport_async_pending_.back();
+    if (last.submission == submission && last.used + total_size <= last.buffer.capacity) {
+      batch = &last;
     }
   }
-  if (buffer.buffer == VK_NULL_HANDLE) {
-    const uint32_t capacity = AlignReadbackBufferSize(total_size);
-    uint32_t memory_type = UINT32_MAX;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device, capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kReadback, buffer.buffer, buffer.memory,
-            &memory_type, &buffer.memory_size)) {
-      REXGPU_ERROR("Failed to create a Vulkan memexport readback buffer");
-      return IssueDraw_MemexportReadbackFullPath(total_size);
+  if (!batch) {
+    // Bound the copies in flight; only ever waits for an already submitted
+    // batch, and only if the GPU is that far behind.
+    constexpr size_t kMaxPending = 64;
+    if (memexport_async_pending_.size() >= kMaxPending &&
+        memexport_async_pending_.front().submission < submission) {
+      CheckSubmissionFenceAndDeviceLoss(memexport_async_pending_.front().submission,
+                                        FenceWaitReason::kMemexport);
     }
-    if (dfn.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapping) !=
-        VK_SUCCESS) {
-      REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
-      dfn.vkDestroyBuffer(device, buffer.buffer, nullptr);
-      dfn.vkFreeMemory(device, buffer.memory, nullptr);
-      return IssueDraw_MemexportReadbackFullPath(total_size);
+    MemexportAsyncBuffer buffer;
+    for (size_t i = 0; i < memexport_async_free_.size(); ++i) {
+      if (memexport_async_free_[i].capacity >= total_size) {
+        buffer = memexport_async_free_[i];
+        memexport_async_free_[i] = memexport_async_free_.back();
+        memexport_async_free_.pop_back();
+        break;
+      }
     }
-    buffer.capacity = capacity;
-    buffer.coherent =
-        (vulkan_device->memory_types().host_coherent & (uint32_t(1) << memory_type)) != 0;
+    if (buffer.buffer == VK_NULL_HANDLE) {
+      // At least 1 MB, so a submission's copies usually share one buffer.
+      const uint32_t capacity = AlignReadbackBufferSize(std::max(total_size, 1u << 20));
+      uint32_t memory_type = UINT32_MAX;
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              vulkan_device, capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+              ui::vulkan::util::MemoryPurpose::kReadback, buffer.buffer, buffer.memory,
+              &memory_type, &buffer.memory_size)) {
+        REXGPU_ERROR("Failed to create a Vulkan memexport readback buffer");
+        return IssueDraw_MemexportReadbackFullPath(total_size);
+      }
+      if (dfn.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &buffer.mapping) !=
+          VK_SUCCESS) {
+        REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
+        dfn.vkDestroyBuffer(device, buffer.buffer, nullptr);
+        dfn.vkFreeMemory(device, buffer.memory, nullptr);
+        return IssueDraw_MemexportReadbackFullPath(total_size);
+      }
+      buffer.capacity = capacity;
+      buffer.coherent =
+          (vulkan_device->memory_types().host_coherent & (uint32_t(1) << memory_type)) != 0;
+    }
+    batch = &memexport_async_pending_.emplace_back();
+    batch->buffer = buffer;
+    batch->submission = submission;
   }
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   SubmitBarriers(true);
-  uint32_t readback_offset = 0;
+  const uint32_t batch_offset = batch->used;
+  uint32_t readback_offset = batch_offset;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     VkBufferCopy readback_region = {};
     readback_region.srcOffset = memexport_range.base_address_dwords << 2;
     readback_region.dstOffset = readback_offset;
     readback_region.size = memexport_range.size_bytes;
-    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer.buffer, 1,
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), batch->buffer.buffer, 1,
                                              &readback_region);
     readback_offset += memexport_range.size_bytes;
+    batch->ranges.push_back(memexport_range);
   }
-  PushBufferMemoryBarrier(buffer.buffer, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                          VK_ACCESS_HOST_READ_BIT);
-
-  MemexportAsyncPending& pending = memexport_async_pending_.emplace_back();
-  pending.buffer = buffer;
-  pending.submission = GetCurrentSubmission();
-  pending.ranges = memexport_ranges_;
+  PushBufferMemoryBarrier(batch->buffer.buffer, batch_offset, total_size,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  batch->used = readback_offset;
   return true;
 }
 

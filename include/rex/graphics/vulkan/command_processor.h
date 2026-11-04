@@ -827,9 +827,13 @@ class VulkanCommandProcessor : public CommandProcessor {
     VkDeviceSize memory_size = 0;
     bool coherent = false;
   };
+  // One batch per submission (or per buffer, when one fills up): every
+  // memexport copy recorded in it, delivered together once it completes.
   struct MemexportAsyncPending {
     MemexportAsyncBuffer buffer;
     uint64_t submission = 0;
+    uint32_t used = 0;
+    // Guest ranges in buffer order (their bytes are packed back to back).
     std::vector<draw_util::MemExportRange> ranges;
   };
   std::vector<MemexportAsyncBuffer> memexport_async_free_;
