@@ -460,13 +460,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
+  // Resolve readback uses slots 0 and 1; memexport readback uses up to all
+  // three (readback_memexport_fast_latency).
+  static constexpr uint32_t kReadbackSlots = 3;
   struct ReadbackBuffer {
-    VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    void* mapped_data[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    uint64_t submission_written[2] = {0, 0};
-    uint32_t written_size[2] = {0, 0};
+    VkBuffer buffers[kReadbackSlots] = {};
+    VkDeviceMemory memories[kReadbackSlots] = {};
+    void* mapped_data[kReadbackSlots] = {};
+    uint32_t sizes[kReadbackSlots] = {};
+    uint64_t submission_written[kReadbackSlots] = {};
+    uint32_t written_size[kReadbackSlots] = {};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };

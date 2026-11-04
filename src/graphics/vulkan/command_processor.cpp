@@ -66,6 +66,12 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_constant_buffers, true, "GPU/Vulkan",
                     "set of upload pages, reused with new offsets, instead of allocating and "
                     "writing a descriptor set whenever the constants change. Read at startup.");
 
+REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 2, "GPU",
+                      "With readback_memexport_fast, how many memexport draws old the data the "
+                      "guest reads back is (1-2). 1 waits for the GPU at almost every memexport "
+                      "draw when the GPU thread runs ahead; 2 rarely has to wait.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1924,7 +1930,7 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   for (auto& readback_pair : readback_buffers_) {
     ReadbackBuffer& readback = readback_pair.second;
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
       if (readback.mapped_data[i] && readback.memories[i] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[i]);
       }
@@ -1939,7 +1945,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   readback_buffers_.clear();
   for (auto& readback_pair : memexport_readback_buffers_) {
     ReadbackBuffer& readback = readback_pair.second;
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
       if (readback.mapped_data[i] && readback.memories[i] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[i]);
       }
@@ -4353,8 +4359,13 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     return true;
   };
 
-  const uint32_t write_index = readback.current_index;
-  const uint32_t read_index = 1 - write_index;
+  // Ring of latency + 1 buffers: this draw's copy goes to write_index, and the
+  // guest gets the copy made `latency` memexport draws ago (the oldest slot),
+  // which the GPU has most likely finished by now.
+  const uint32_t slot_count =
+      std::clamp(REXCVAR_GET(readback_memexport_fast_latency), 1u, kReadbackSlots - 1) + 1;
+  const uint32_t write_index = readback.current_index % slot_count;
+  const uint32_t read_index = (write_index + 1) % slot_count;
   const uint32_t readback_size = AlignReadbackBufferSize(total_size);
   if (!ensure_readback_slot(write_index, readback_size)) {
     return IssueDraw_MemexportReadbackFullPath(total_size);
@@ -4388,9 +4399,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   if (previous_slot_written && REXCVAR_GET(readback_memexport_fast_wait) &&
       readback.submission_written[read_index] > submission_completed_ &&
       readback.submission_written[read_index] < GetCurrentSubmission()) {
-    // The previous copy was submitted but is still in flight. Wait for it
+    // The oldest copy was submitted but is still in flight. Wait for it
     // instead of falling back to the current draw, so the data the guest reads
-    // is always one memexport draw old, whether or not the GPU has caught up.
+    // is always readback_memexport_fast_latency memexport draws old, whether or
+    // not the GPU has caught up.
     // A copy recorded in the still-open submission is left to the full path
     // below, as without this cvar, so the open submission is never ended here.
     CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index],
@@ -4753,7 +4765,7 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
       ++it;
       continue;
     }
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
       if (readback.mapped_data[i] && readback.memories[i] != VK_NULL_HANDLE) {
         dfn.vkUnmapMemory(device, readback.memories[i]);
       }
