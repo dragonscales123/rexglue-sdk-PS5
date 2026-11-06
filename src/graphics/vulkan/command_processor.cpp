@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <immintrin.h>
+#include <thread>
 #include <bit>
 #include <optional>
 #include <rex/memory/bytes_equal.h>
@@ -1993,9 +1995,9 @@ void VulkanCommandProcessor::ShutdownContext() {
     DrainEncodeQueue();
   }
   StopEncodeThread();
-  encode_queue_.clear();
-  encode_packets_free_.clear();
-  encode_packet_preparing_.reset();
+  encode_ring_head_.store(0);
+  encode_ring_tail_.store(0);
+  encode_packet_preparing_ = nullptr;
   AwaitAllQueueOperationsCompletion();
   StopSubmitThread();
   InvalidateAllVertexBufferResidency();
@@ -3420,22 +3422,24 @@ void VulkanCommandProcessor::EndRenderPass() {
   in_render_pass_ = false;
 }
 
-namespace {
-// Whether this thread is recording a draw preparation chunk. File-local and
-// constant-initialized, so no TLS init hook is needed (the PS5 SDK stubs
-// don't export the one a class static thread_local member references).
-thread_local bool tls_prep_recording_ = false;
-}  // namespace
-
-bool VulkanCommandProcessor::IsPrepRecording() const { return tls_prep_recording_; }
+bool VulkanCommandProcessor::IsPrepRecording() const {
+  // Only the preparation thread records preparation chunks, so while one is
+  // being recorded, any thread but the encoding thread is the preparation
+  // thread. (No thread_local: on the PS5 it goes through emulated TLS, slow
+  // for something checked on every barrier and command.)
+  if (!prep_recording_active_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  return !IsEncodeThread();
+}
 
 VulkanCommandProcessor::RecordingContext* VulkanCommandProcessor::CurrentRecording() {
-  return tls_prep_recording_ ? &prep_recording_ : &main_recording_;
+  return IsPrepRecording() ? &prep_recording_ : &main_recording_;
 }
 
 void VulkanCommandProcessor::SyncEncodeRegisters() {
   // Only when nothing prepared is waiting for encoding.
-  assert_true(encode_queue_.empty());
+  assert_true(IsEncodeRingEmpty());
   constexpr uint32_t kBlockSize = uint32_t(1) << kEncodeRegisterBlockShift;
   for (size_t word = 0; word < rex::countof(encode_register_dirty_); ++word) {
     uint64_t bits = encode_register_dirty_[word];
@@ -3507,7 +3511,7 @@ void VulkanCommandProcessor::BeginPrepRecording() {
   // encoding, which may be running on another thread - don't touch it here.
   // Barriers pending in it are flushed before the chunk when the chunk is
   // appended (AppendPrepCommandsToMain).
-  tls_prep_recording_ = true;
+  prep_recording_active_.store(true, std::memory_order_relaxed);
   prep_command_buffer_.Reset();
   // The chunk may be appended after other compute work in the main command
   // buffer, so it binds its compute pipelines itself.
@@ -3520,7 +3524,7 @@ void VulkanCommandProcessor::EndPrepRecording(std::vector<uintmax_t>* commands_o
   // Make the chunk's shared memory writes visible to whatever follows it.
   shared_memory_->EndPrepRecording();
   SubmitBarriers(false);
-  tls_prep_recording_ = false;
+  prep_recording_active_.store(false, std::memory_order_relaxed);
   commands_out->clear();
   prep_command_buffer_.SwapStream(*commands_out);
 }
@@ -3572,21 +3576,12 @@ void VulkanCommandProcessor::ApplyConstantsWritten(
 }
 
 VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeDrawPacket() {
-  assert_false(encode_packet_preparing_.has_value());
-  {
-    std::unique_lock<std::mutex> lock(encode_mutex_, std::defer_lock);
-    if (encode_thread_enabled_) {
-      lock.lock();
-    }
-    if (!encode_packets_free_.empty()) {
-      encode_packet_preparing_.emplace(std::move(encode_packets_free_.back()));
-      encode_packets_free_.pop_back();
-    }
-  }
-  if (!encode_packet_preparing_.has_value()) {
-    encode_packet_preparing_.emplace();
-  }
-  EncodeDrawPacket& packet = *encode_packet_preparing_;
+  assert_null(encode_packet_preparing_);
+  // A free slot (the encoding may be behind by up to the whole ring).
+  WaitForEncodeRing(kEncodeRingSize);
+  uint64_t head = encode_ring_head_.load(std::memory_order_relaxed);
+  EncodeDrawPacket& packet = encode_ring_[head & (kEncodeRingSize - 1)];
+  encode_packet_preparing_ = &packet;
   packet.has_draw = false;
   packet.memexport = false;
   packet.host_index_buffer = {VK_NULL_HANDLE, 0};
@@ -3596,19 +3591,44 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
 }
 
 void VulkanCommandProcessor::ReleaseEncodeDrawPacket() {
-  if (!encode_packet_preparing_.has_value()) {
+  // The slot isn't published, so it'll simply be reused.
+  encode_packet_preparing_ = nullptr;
+}
+
+void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
+  auto ready = [this, max_waiting]() {
+    return encode_ring_head_.load(std::memory_order_relaxed) -
+               encode_ring_tail_.load(std::memory_order_acquire) <
+           max_waiting;
+  };
+  if (ready()) {
     return;
   }
-  std::unique_lock<std::mutex> lock(encode_mutex_, std::defer_lock);
-  if (encode_thread_enabled_) {
-    lock.lock();
+  if (!encode_thread_enabled_) {
+    // Encode inline.
+    while (!ready()) {
+      uint64_t tail = encode_ring_tail_.load(std::memory_order_relaxed);
+      EncodeQueuedPacket(encode_ring_[tail & (kEncodeRingSize - 1)]);
+      encode_ring_tail_.store(tail + 1, std::memory_order_release);
+    }
+    return;
   }
-  encode_packets_free_.push_back(std::move(*encode_packet_preparing_));
-  encode_packet_preparing_.reset();
+  for (uint32_t i = 0; i < 4096; ++i) {
+    if (ready()) {
+      return;
+    }
+    _mm_pause();
+  }
+  std::unique_lock<std::mutex> lock(encode_mutex_);
+  encode_producer_sleeping_.store(true, std::memory_order_seq_cst);
+  while (!ready()) {
+    encode_done_cv_.wait(lock);
+  }
+  encode_producer_sleeping_.store(false, std::memory_order_relaxed);
 }
 
 void VulkanCommandProcessor::QueueEncodeDrawPacket() {
-  assert_true(encode_packet_preparing_.has_value());
+  assert_not_null(encode_packet_preparing_);
   EncodeDrawPacket& packet = *encode_packet_preparing_;
   // Register changes since the previous packet.
   packet.register_runs.clear();
@@ -3638,31 +3658,21 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   packet.constant_buffers_written = pending_constant_buffers_written_;
   pending_constant_buffers_written_ = 0;
 
+  // Publish.
+  encode_packet_preparing_ = nullptr;
+  uint64_t head = encode_ring_head_.load(std::memory_order_relaxed) + 1;
   if (encode_thread_enabled_) {
-    bool wake = false;
-    {
-      std::unique_lock<std::mutex> lock(encode_mutex_);
-      while (encode_queue_.size() >= kEncodeThreadMaxQueuedPackets) {
-        encode_producer_waiting_ = true;
-        encode_done_cv_.wait(lock);
-      }
-      encode_queue_.push_back(std::move(packet));
-      wake = encode_thread_waiting_;
-    }
-    encode_packet_preparing_.reset();
-    if (wake) {
+    // seq_cst store and load pair with the encoding thread's (sleeping flag
+    // store, head load), so either it sees the packet or this sees it sleeping.
+    encode_ring_head_.store(head, std::memory_order_seq_cst);
+    if (encode_thread_sleeping_.load(std::memory_order_seq_cst)) {
+      std::lock_guard<std::mutex> lock(encode_mutex_);
       encode_work_cv_.notify_one();
     }
   } else {
-    encode_queue_.push_back(std::move(packet));
-    encode_packet_preparing_.reset();
-    const size_t lag = std::min(REXCVAR_GET(vulkan_draw_encode_lag), uint32_t(1024));
-    while (encode_queue_.size() > lag) {
-      EncodeDrawPacket front = std::move(encode_queue_.front());
-      encode_queue_.pop_front();
-      EncodeQueuedPacket(front);
-      encode_packets_free_.push_back(std::move(front));
-    }
+    encode_ring_head_.store(head, std::memory_order_release);
+    WaitForEncodeRing(std::min(uint64_t(REXCVAR_GET(vulkan_draw_encode_lag)), kEncodeRingSize - 1) +
+                      1);
   }
   if (encode_end_submission_requested_.load(std::memory_order_relaxed)) {
     // The draws prepared for this submission must be in it.
@@ -3675,65 +3685,60 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
 }
 
 void VulkanCommandProcessor::DrainEncodeQueue() {
-  if (encode_thread_enabled_) {
-    if (IsEncodeThread()) {
-      // Can't wait for itself (the caller logs this case).
-      return;
-    }
-    std::unique_lock<std::mutex> lock(encode_mutex_);
-    while (!encode_queue_.empty() || encode_thread_busy_) {
-      encode_producer_waiting_ = true;
-      encode_done_cv_.wait(lock);
-    }
+  if (encode_thread_enabled_ && IsEncodeThread()) {
+    // Can't wait for itself (only EndSubmission while encoding a memexport
+    // draw, with the preparation thread waiting on an empty ring).
     return;
   }
-  assert_false(encoding_);
-  while (!encode_queue_.empty()) {
-    EncodeDrawPacket front = std::move(encode_queue_.front());
-    encode_queue_.pop_front();
-    EncodeQueuedPacket(front);
-    encode_packets_free_.push_back(std::move(front));
-  }
+  assert_true(encode_thread_enabled_ || !encoding_);
+  WaitForEncodeRing(1);
 }
 
 bool VulkanCommandProcessor::IsEncodeThread() const {
-  return encode_thread_ && rex::thread::Thread::GetCurrentThread() == encode_thread_.get();
+  return encode_thread_enabled_ && encode_thread_id_ready_.load(std::memory_order_acquire) &&
+         std::this_thread::get_id() == encode_thread_id_;
 }
 
 void VulkanCommandProcessor::EncodeThreadMain() {
+  encode_thread_id_ = std::this_thread::get_id();
+  encode_thread_id_ready_.store(true, std::memory_order_release);
 #if REX_PLATFORM_PS5
   rex::ps5prof::RegisterCurrentThread("GPU Encode");
 #endif
-  std::unique_lock<std::mutex> lock(encode_mutex_);
   while (true) {
-    while (encode_queue_.empty() && !encode_thread_exit_) {
-      encode_thread_waiting_ = true;
-      encode_work_cv_.wait(lock);
-      encode_thread_waiting_ = false;
+    uint64_t tail = encode_ring_tail_.load(std::memory_order_relaxed);
+    auto has_work = [this, tail]() {
+      return encode_ring_head_.load(std::memory_order_acquire) != tail;
+    };
+    if (!has_work()) {
+      // Draws come every few microseconds while a frame is being prepared -
+      // spin a little before sleeping.
+      bool woke = false;
+      for (uint32_t i = 0; i < 4096; ++i) {
+        _mm_pause();
+        if (has_work()) {
+          woke = true;
+          break;
+        }
+      }
+      if (!woke) {
+        std::unique_lock<std::mutex> lock(encode_mutex_);
+        encode_thread_sleeping_.store(true, std::memory_order_seq_cst);
+        while (encode_ring_head_.load(std::memory_order_seq_cst) == tail &&
+               !encode_thread_exit_.load(std::memory_order_relaxed)) {
+          encode_work_cv_.wait(lock);
+        }
+        encode_thread_sleeping_.store(false, std::memory_order_relaxed);
+        if (!has_work()) {
+          break;  // Exiting.
+        }
+      }
     }
-    if (encode_queue_.empty()) {
-      break;  // Exiting.
-    }
-    EncodeDrawPacket packet = std::move(encode_queue_.front());
-    encode_queue_.pop_front();
-    encode_thread_busy_ = true;
-    bool notify_producer = encode_producer_waiting_;
-    encode_producer_waiting_ = false;
-    lock.unlock();
-    if (notify_producer) {
-      // Room in the queue.
+    EncodeQueuedPacket(encode_ring_[tail & (kEncodeRingSize - 1)]);
+    encode_ring_tail_.store(tail + 1, std::memory_order_seq_cst);
+    if (encode_producer_sleeping_.load(std::memory_order_seq_cst)) {
+      std::lock_guard<std::mutex> lock(encode_mutex_);
       encode_done_cv_.notify_all();
-    }
-    EncodeQueuedPacket(packet);
-    lock.lock();
-    encode_packets_free_.push_back(std::move(packet));
-    encode_thread_busy_ = false;
-    if (encode_producer_waiting_ && encode_queue_.empty()) {
-      // Drained.
-      encode_producer_waiting_ = false;
-      lock.unlock();
-      encode_done_cv_.notify_all();
-      lock.lock();
     }
   }
 #if REX_PLATFORM_PS5
@@ -3742,19 +3747,29 @@ void VulkanCommandProcessor::EncodeThreadMain() {
 }
 
 void VulkanCommandProcessor::StartEncodeThread() {
+  if (!encode_ring_) {
+    encode_ring_ = std::make_unique<EncodeDrawPacket[]>(kEncodeRingSize);
+  }
+  encode_ring_head_.store(0);
+  encode_ring_tail_.store(0);
+  encode_packet_preparing_ = nullptr;
   encode_thread_enabled_ = REXCVAR_GET(vulkan_draw_encode_thread);
   if (!encode_thread_enabled_) {
     return;
   }
-  encode_thread_exit_ = false;
-  encode_thread_busy_ = false;
-  encode_thread_waiting_ = false;
-  encode_producer_waiting_ = false;
+  encode_thread_exit_.store(false);
+  encode_thread_sleeping_.store(false);
+  encode_producer_sleeping_.store(false);
+  encode_thread_id_ready_.store(false);
   encode_thread_ = rex::thread::Thread::Create({}, [this]() { EncodeThreadMain(); });
   if (!encode_thread_) {
     REXGPU_ERROR("Vulkan: failed to create the draw encoding thread, encoding inline");
     encode_thread_enabled_ = false;
     return;
+  }
+  // IsEncodeThread needs the thread's ID before anything is prepared.
+  while (!encode_thread_id_ready_.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
   }
   encode_thread_->set_name("GPU Encode");
   REXGPU_INFO("Vulkan: draws encoded on a separate thread");
@@ -3767,12 +3782,13 @@ void VulkanCommandProcessor::StopEncodeThread() {
   }
   {
     std::lock_guard<std::mutex> lock(encode_mutex_);
-    encode_thread_exit_ = true;
+    encode_thread_exit_.store(true);
   }
   encode_work_cv_.notify_all();
   rex::thread::Wait(encode_thread_.get(), false);
   encode_thread_.reset();
   encode_thread_enabled_ = false;
+  encode_thread_id_ready_.store(false);
 }
 
 void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
@@ -3783,7 +3799,8 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
     values += run.second;
   }
   ApplyConstantsWritten(packet.float_constants_written, packet.constant_buffers_written);
-  if (!encode_thread_enabled_ && encode_queue_.empty()) {
+  if (!encode_thread_enabled_ && encode_ring_head_.load(std::memory_order_relaxed) ==
+                                     encode_ring_tail_.load(std::memory_order_relaxed) + 1) {
     // Nothing prepared after this draw - unless registers have been written
     // since, the copy must equal the main register file. (Checked in
     // SyncEncodeRegisters with the encoding thread.)
@@ -6403,11 +6420,12 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (!IsEncodeThread()) {
       DrainEncodeQueue();
     }
-  } else if (!encode_queue_.empty()) {
+  } else if (!IsEncodeRingEmpty()) {
     ++encode_queue_unexpected_submission_ends_;
     if (encode_queue_unexpected_submission_ends_ <= 16) {
       REXGPU_WARN("EndSubmission with {} prepared draws not encoded yet{}",
-                  encode_queue_.size(), encoding_ ? " (while encoding)" : "");
+                  encode_ring_head_.load() - encode_ring_tail_.load(),
+                  encoding_ ? " (while encoding)" : "");
     }
     if (!encoding_) {
       DrainEncodeQueue();

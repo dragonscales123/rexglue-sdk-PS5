@@ -944,26 +944,43 @@ class VulkanCommandProcessor : public CommandProcessor {
     size_t image_info_texture_offsets[2] = {};
     size_t image_info_sampler_offsets[2] = {};
   };
-  // Prepared draws waiting for encoding (vulkan_draw_encode_lag), oldest
-  // first, and packets kept for reuse.
-  std::deque<EncodeDrawPacket> encode_queue_;
-  std::vector<EncodeDrawPacket> encode_packets_free_;
-  // The packet IssueDraw is preparing (from AcquireEncodeDrawPacket).
-  std::optional<EncodeDrawPacket> encode_packet_preparing_;
+  // Prepared draws waiting for encoding: a single-producer (preparation),
+  // single-consumer (encoding) ring of reused packets. Slots
+  // [encode_ring_tail_, encode_ring_head_) are prepared and waiting; the
+  // encoding advances the tail after finishing a packet, so tail == head means
+  // the encoding is idle.
+  static constexpr uint64_t kEncodeRingSize = 128;
+  std::unique_ptr<EncodeDrawPacket[]> encode_ring_;
+  std::atomic<uint64_t> encode_ring_head_{0};
+  std::atomic<uint64_t> encode_ring_tail_{0};
+  // The slot IssueDraw is preparing (from AcquireEncodeDrawPacket), or null.
+  EncodeDrawPacket* encode_packet_preparing_ = nullptr;
+  bool IsEncodeRingEmpty() const {
+    return encode_ring_tail_.load(std::memory_order_acquire) ==
+           encode_ring_head_.load(std::memory_order_acquire);
+  }
   bool encoding_ = false;
   std::atomic<bool> encode_end_submission_requested_{false};
-  // vulkan_draw_encode_thread: packets are encoded on encode_thread_. The
-  // queue and the free packets are then protected by encode_mutex_.
+  // vulkan_draw_encode_thread: packets are encoded on encode_thread_, which
+  // spins briefly, then sleeps on encode_work_cv_ when the ring is empty; the
+  // preparation sleeps on encode_done_cv_ when it's full or draining. The
+  // sleeping flags let the other side signal only when needed.
   bool encode_thread_enabled_ = false;
   std::unique_ptr<rex::thread::Thread> encode_thread_;
+  std::thread::id encode_thread_id_;
+  std::atomic<bool> encode_thread_id_ready_{false};
   std::mutex encode_mutex_;
   std::condition_variable encode_work_cv_;
   std::condition_variable encode_done_cv_;
-  bool encode_thread_busy_ = false;
-  bool encode_thread_waiting_ = false;
-  bool encode_producer_waiting_ = false;
-  bool encode_thread_exit_ = false;
-  static constexpr size_t kEncodeThreadMaxQueuedPackets = 128;
+  std::atomic<bool> encode_thread_sleeping_{false};
+  std::atomic<bool> encode_producer_sleeping_{false};
+  std::atomic<bool> encode_thread_exit_{false};
+  // Waits (spinning, then sleeping) until the ring has fewer than
+  // max_waiting packets prepared and not encoded yet.
+  void WaitForEncodeRing(uint64_t max_waiting);
+  // Whether the preparation thread is recording a preparation chunk (only it
+  // ever does - the encoding thread never records one).
+  std::atomic<bool> prep_recording_active_{false};
   // transient_descriptor_allocator_uniform_buffer_ / _storage_buffer_ and the
   // single transient descriptor lists are used by both draw preparation and
   // encoding.
