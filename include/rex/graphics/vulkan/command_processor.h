@@ -160,7 +160,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // (see BeginPrepRecording) rather than the main deferred command buffer.
   // Per thread: the draw preparation thread records preparation chunks while
   // the encoding (possibly on another thread) records the main command buffer.
-  bool IsPrepRecording() const { return tls_prep_recording_; }
+  bool IsPrepRecording() const;
   // Draw preparation (texture loads, index conversion, uploads in the main
   // stream) is recorded into a separate chunk with its own barrier queue, then
   // appended to the main deferred command buffer right before the draw it is
@@ -996,10 +996,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   DeferredCommandBuffer prep_command_buffer_{*this, 64 * 1024};
   RecordingContext main_recording_{&deferred_command_buffer_};
   RecordingContext prep_recording_{&prep_command_buffer_};
-  static thread_local bool tls_prep_recording_;
-  RecordingContext* CurrentRecording() {
-    return tls_prep_recording_ ? &prep_recording_ : &main_recording_;
-  }
+  RecordingContext* CurrentRecording();
 
   // GPU-local scratch buffer.
   static constexpr VkDeviceSize kScratchBufferSizeIncrement = 16 * 1024 * 1024;

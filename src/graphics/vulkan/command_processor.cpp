@@ -3420,7 +3420,18 @@ void VulkanCommandProcessor::EndRenderPass() {
   in_render_pass_ = false;
 }
 
-thread_local bool VulkanCommandProcessor::tls_prep_recording_ = false;
+namespace {
+// Whether this thread is recording a draw preparation chunk. File-local and
+// constant-initialized, so no TLS init hook is needed (the PS5 SDK stubs
+// don't export the one a class static thread_local member references).
+thread_local bool tls_prep_recording_ = false;
+}  // namespace
+
+bool VulkanCommandProcessor::IsPrepRecording() const { return tls_prep_recording_; }
+
+VulkanCommandProcessor::RecordingContext* VulkanCommandProcessor::CurrentRecording() {
+  return tls_prep_recording_ ? &prep_recording_ : &main_recording_;
+}
 
 void VulkanCommandProcessor::SyncEncodeRegisters() {
   // Only when nothing prepared is waiting for encoding.
