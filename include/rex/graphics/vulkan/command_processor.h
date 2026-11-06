@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/thread.h>
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -153,11 +154,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
     assert_true(submission_open_);
-    return *recording_->stream;
+    return *CurrentRecording()->stream;
   }
   // Whether commands are currently recorded into the draw preparation chunk
   // (see BeginPrepRecording) rather than the main deferred command buffer.
-  bool IsPrepRecording() const { return recording_ != &main_recording_; }
+  // Per thread: the draw preparation thread records preparation chunks while
+  // the encoding (possibly on another thread) records the main command buffer.
+  bool IsPrepRecording() const { return tls_prep_recording_; }
   // Draw preparation (texture loads, index conversion, uploads in the main
   // stream) is recorded into a separate chunk with its own barrier queue, then
   // appended to the main deferred command buffer right before the draw it is
@@ -859,6 +862,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   struct RecordingContext {
     DeferredCommandBuffer* stream = nullptr;
+    // Last pipeline bound with BindExternalComputePipeline in this stream.
+    VkPipeline compute_pipeline = VK_NULL_HANDLE;
     std::vector<VkBufferMemoryBarrier> buffer_memory_barriers;
     std::vector<VkImageMemoryBarrier> image_memory_barriers;
     std::vector<PendingBarrier> pending_barriers;
@@ -921,6 +926,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     VulkanShader::VulkanTranslation* vertex_shader_translation = nullptr;
     VulkanShader::VulkanTranslation* pixel_shader_translation = nullptr;
     PrimitiveProcessor::ProcessingResult primitive_processing_result;
+    // Host index buffer (converted / built-in), resolved when preparing.
+    std::pair<VkBuffer, VkDeviceSize> host_index_buffer = {VK_NULL_HANDLE, 0};
     reg::RB_DEPTHCONTROL normalized_depth_control;
     bool primitive_polygonal = false;
     bool is_rasterization_done = false;
@@ -944,7 +951,27 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The packet IssueDraw is preparing (from AcquireEncodeDrawPacket).
   std::optional<EncodeDrawPacket> encode_packet_preparing_;
   bool encoding_ = false;
-  bool encode_end_submission_requested_ = false;
+  std::atomic<bool> encode_end_submission_requested_{false};
+  // vulkan_draw_encode_thread: packets are encoded on encode_thread_. The
+  // queue and the free packets are then protected by encode_mutex_.
+  bool encode_thread_enabled_ = false;
+  std::unique_ptr<rex::thread::Thread> encode_thread_;
+  std::mutex encode_mutex_;
+  std::condition_variable encode_work_cv_;
+  std::condition_variable encode_done_cv_;
+  bool encode_thread_busy_ = false;
+  bool encode_thread_waiting_ = false;
+  bool encode_producer_waiting_ = false;
+  bool encode_thread_exit_ = false;
+  static constexpr size_t kEncodeThreadMaxQueuedPackets = 128;
+  // transient_descriptor_allocator_uniform_buffer_ / _storage_buffer_ and the
+  // single transient descriptor lists are used by both draw preparation and
+  // encoding.
+  std::mutex transient_descriptor_allocator_mutex_;
+  void StartEncodeThread();
+  void StopEncodeThread();
+  void EncodeThreadMain();
+  bool IsEncodeThread() const;
   uint64_t encode_queue_unexpected_submission_ends_ = 0;
   // Constants written since the last packet (see EncodeDrawPacket).
   uint64_t pending_float_constants_written_[2][4] = {};
@@ -964,14 +991,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ApplyConstantsWritten(const uint64_t (&float_constants_written)[2][4],
                              uint32_t constant_buffers_written);
   void AppendPrepCommandsToMain(const std::vector<uintmax_t>& commands);
-  // Main-context compute pipeline binding, saved while recording a chunk.
-  VkPipeline prep_saved_external_compute_pipeline_ = VK_NULL_HANDLE;
 
   // Commands for the draw preparation chunk (see BeginPrepRecording).
   DeferredCommandBuffer prep_command_buffer_{*this, 64 * 1024};
   RecordingContext main_recording_{&deferred_command_buffer_};
   RecordingContext prep_recording_{&prep_command_buffer_};
-  RecordingContext* recording_ = &main_recording_;
+  static thread_local bool tls_prep_recording_;
+  RecordingContext* CurrentRecording() {
+    return tls_prep_recording_ ? &prep_recording_ : &main_recording_;
+  }
 
   // GPU-local scratch buffer.
   static constexpr VkDeviceSize kScratchBufferSizeIncrement = 16 * 1024 * 1024;
@@ -1092,7 +1120,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   // TODO(Triang3l): Change to a deferred compilation handle.
   VkPipeline current_guest_graphics_pipeline_;
   VkPipeline current_external_graphics_pipeline_;
-  VkPipeline current_external_compute_pipeline_;
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;

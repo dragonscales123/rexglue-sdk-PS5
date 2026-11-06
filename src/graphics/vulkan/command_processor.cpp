@@ -112,6 +112,18 @@ REXCVAR_DEFINE_BOOL(vulkan_encode_register_check, true, "GPU/Vulkan",
                     "against the main register file (counted in the PS5 profile, logged).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+#ifndef REX_VULKAN_DRAW_ENCODE_THREAD_DEFAULT
+#if REX_PLATFORM_PS5
+#define REX_VULKAN_DRAW_ENCODE_THREAD_DEFAULT true
+#else
+#define REX_VULKAN_DRAW_ENCODE_THREAD_DEFAULT false
+#endif
+#endif
+REXCVAR_DEFINE_BOOL(vulkan_draw_encode_thread, REX_VULKAN_DRAW_ENCODE_THREAD_DEFAULT, "GPU/Vulkan",
+                    "Encode draws (render targets, pipelines, constants, bindings, recording) on "
+                    "a separate thread from their preparation (PM4, textures, guest memory). "
+                    "Read at startup.");
+
 REXCVAR_DEFINE_UINT32(vulkan_draw_encode_lag, 0, "GPU/Vulkan",
                       "Test mode for preparing draws ahead of encoding them: how many prepared "
                       "draws may wait before being encoded (on the same thread). 0 encodes each "
@@ -1971,6 +1983,7 @@ bool VulkanCommandProcessor::SetupContext() {
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
   StartSubmitThread();
+  StartEncodeThread();
 
   return true;
 }
@@ -1979,6 +1992,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   if (submission_open_) {
     DrainEncodeQueue();
   }
+  StopEncodeThread();
   encode_queue_.clear();
   encode_packets_free_.clear();
   encode_packet_preparing_.reset();
@@ -3076,7 +3090,7 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
   // Separate different barriers for overlapping buffer ranges into different
   // pipeline barrier commands.
   for (const VkBufferMemoryBarrier& other_buffer_memory_barrier :
-       recording_->buffer_memory_barriers) {
+       CurrentRecording()->buffer_memory_barriers) {
     if (other_buffer_memory_barrier.buffer != buffer ||
         (size != VK_WHOLE_SIZE && offset + size <= other_buffer_memory_barrier.offset) ||
         (other_buffer_memory_barrier.size != VK_WHOLE_SIZE &&
@@ -3089,18 +3103,18 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
         other_buffer_memory_barrier.srcQueueFamilyIndex == src_queue_family_index &&
         other_buffer_memory_barrier.dstQueueFamilyIndex == dst_queue_family_index) {
       // The barrier is already pending.
-      recording_->current_pending_barrier.src_stage_mask |= src_stage_mask;
-      recording_->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
+      CurrentRecording()->current_pending_barrier.src_stage_mask |= src_stage_mask;
+      CurrentRecording()->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
       return true;
     }
     SplitPendingBarrier();
     break;
   }
 
-  recording_->current_pending_barrier.src_stage_mask |= src_stage_mask;
-  recording_->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
+  CurrentRecording()->current_pending_barrier.src_stage_mask |= src_stage_mask;
+  CurrentRecording()->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
   VkBufferMemoryBarrier& buffer_memory_barrier =
-      recording_->buffer_memory_barriers.emplace_back();
+      CurrentRecording()->buffer_memory_barriers.emplace_back();
   buffer_memory_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
   buffer_memory_barrier.pNext = nullptr;
   buffer_memory_barrier.srcAccessMask = src_access_mask;
@@ -3127,7 +3141,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   // Separate different barriers for overlapping image subresource ranges into
   // different pipeline barrier commands.
   for (const VkImageMemoryBarrier& other_image_memory_barrier :
-       recording_->image_memory_barriers) {
+       CurrentRecording()->image_memory_barriers) {
     if (other_image_memory_barrier.image != image ||
         !(other_image_memory_barrier.subresourceRange.aspectMask & subresource_range.aspectMask) ||
         (subresource_range.levelCount != VK_REMAINING_MIP_LEVELS &&
@@ -3160,18 +3174,18 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
         other_image_memory_barrier.srcQueueFamilyIndex == src_queue_family_index &&
         other_image_memory_barrier.dstQueueFamilyIndex == dst_queue_family_index) {
       // The barrier is already pending.
-      recording_->current_pending_barrier.src_stage_mask |= src_stage_mask;
-      recording_->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
+      CurrentRecording()->current_pending_barrier.src_stage_mask |= src_stage_mask;
+      CurrentRecording()->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
       return true;
     }
     SplitPendingBarrier();
     break;
   }
 
-  recording_->current_pending_barrier.src_stage_mask |= src_stage_mask;
-  recording_->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
+  CurrentRecording()->current_pending_barrier.src_stage_mask |= src_stage_mask;
+  CurrentRecording()->current_pending_barrier.dst_stage_mask |= dst_stage_mask;
   VkImageMemoryBarrier& image_memory_barrier =
-      recording_->image_memory_barriers.emplace_back();
+      CurrentRecording()->image_memory_barriers.emplace_back();
   image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   image_memory_barrier.pNext = nullptr;
   image_memory_barrier.srcAccessMask = src_access_mask;
@@ -3188,7 +3202,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
 bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   assert_true(submission_open_);
   SplitPendingBarrier();
-  if (recording_->pending_barriers.empty()) {
+  if (CurrentRecording()->pending_barriers.empty()) {
     if (force_end_render_pass) {
       EndRenderPass();
     }
@@ -3197,30 +3211,30 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   // No-op while recording a preparation chunk (the render pass is ended when
   // the chunk is appended to the main command buffer).
   EndRenderPass();
-  for (auto it = recording_->pending_barriers.cbegin(); it != recording_->pending_barriers.cend(); ++it) {
+  for (auto it = CurrentRecording()->pending_barriers.cbegin(); it != CurrentRecording()->pending_barriers.cend(); ++it) {
     auto it_next = std::next(it);
-    bool is_last = it_next == recording_->pending_barriers.cend();
+    bool is_last = it_next == CurrentRecording()->pending_barriers.cend();
     // .data() + offset, not &[offset], for buffer and image barriers, because
     // if there are no buffer or image memory barriers in the last pipeline
     // barriers, the offsets may be equal to the sizes of the vectors.
-    recording_->stream->CmdVkPipelineBarrier(
+    CurrentRecording()->stream->CmdVkPipelineBarrier(
         it->src_stage_mask ? it->src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         it->dst_stage_mask ? it->dst_stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
         nullptr,
-        uint32_t((is_last ? recording_->buffer_memory_barriers.size()
+        uint32_t((is_last ? CurrentRecording()->buffer_memory_barriers.size()
                           : it_next->buffer_memory_barriers_offset) -
                  it->buffer_memory_barriers_offset),
-        recording_->buffer_memory_barriers.data() + it->buffer_memory_barriers_offset,
-        uint32_t((is_last ? recording_->image_memory_barriers.size()
+        CurrentRecording()->buffer_memory_barriers.data() + it->buffer_memory_barriers_offset,
+        uint32_t((is_last ? CurrentRecording()->image_memory_barriers.size()
                           : it_next->image_memory_barriers_offset) -
                  it->image_memory_barriers_offset),
-        recording_->image_memory_barriers.data() + it->image_memory_barriers_offset);
+        CurrentRecording()->image_memory_barriers.data() + it->image_memory_barriers_offset);
   }
-  recording_->pending_barriers.clear();
-  recording_->buffer_memory_barriers.clear();
-  recording_->image_memory_barriers.clear();
-  recording_->current_pending_barrier.buffer_memory_barriers_offset = 0;
-  recording_->current_pending_barrier.image_memory_barriers_offset = 0;
+  CurrentRecording()->pending_barriers.clear();
+  CurrentRecording()->buffer_memory_barriers.clear();
+  CurrentRecording()->image_memory_barriers.clear();
+  CurrentRecording()->current_pending_barrier.buffer_memory_barriers_offset = 0;
+  CurrentRecording()->current_pending_barrier.image_memory_barriers_offset = 0;
   return true;
 }
 
@@ -3406,6 +3420,8 @@ void VulkanCommandProcessor::EndRenderPass() {
   in_render_pass_ = false;
 }
 
+thread_local bool VulkanCommandProcessor::tls_prep_recording_ = false;
+
 void VulkanCommandProcessor::SyncEncodeRegisters() {
   // Only when nothing prepared is waiting for encoding.
   assert_true(encode_queue_.empty());
@@ -3478,12 +3494,11 @@ void VulkanCommandProcessor::BeginPrepRecording() {
   assert_false(IsPrepRecording());
   // Barriers already pending in the main context belong before the chunk.
   SubmitBarriers(false);
-  recording_ = &prep_recording_;
+  tls_prep_recording_ = true;
   prep_command_buffer_.Reset();
   // The chunk may be appended after other compute work in the main command
   // buffer, so it binds its compute pipelines itself.
-  prep_saved_external_compute_pipeline_ = current_external_compute_pipeline_;
-  current_external_compute_pipeline_ = VK_NULL_HANDLE;
+  prep_recording_.compute_pipeline = VK_NULL_HANDLE;
   shared_memory_->BeginPrepRecording();
 }
 
@@ -3492,8 +3507,7 @@ void VulkanCommandProcessor::EndPrepRecording(std::vector<uintmax_t>* commands_o
   // Make the chunk's shared memory writes visible to whatever follows it.
   shared_memory_->EndPrepRecording();
   SubmitBarriers(false);
-  recording_ = &main_recording_;
-  current_external_compute_pipeline_ = prep_saved_external_compute_pipeline_;
+  tls_prep_recording_ = false;
   commands_out->clear();
   prep_command_buffer_.SwapStream(*commands_out);
 }
@@ -3512,7 +3526,7 @@ void VulkanCommandProcessor::AppendPrepCommandsToMain(const std::vector<uintmax_
   SubmitBarriers(true);
   deferred_command_buffer_.AppendCommands(commands);
   // The chunk may have bound a different compute pipeline.
-  current_external_compute_pipeline_ = VK_NULL_HANDLE;
+  main_recording_.compute_pipeline = VK_NULL_HANDLE;
 }
 
 void VulkanCommandProcessor::MarkFloatConstantsWritten(uint32_t first_float_constant,
@@ -3546,25 +3560,38 @@ void VulkanCommandProcessor::ApplyConstantsWritten(
 
 VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeDrawPacket() {
   assert_false(encode_packet_preparing_.has_value());
-  if (!encode_packets_free_.empty()) {
-    encode_packet_preparing_.emplace(std::move(encode_packets_free_.back()));
-    encode_packets_free_.pop_back();
-  } else {
+  {
+    std::unique_lock<std::mutex> lock(encode_mutex_, std::defer_lock);
+    if (encode_thread_enabled_) {
+      lock.lock();
+    }
+    if (!encode_packets_free_.empty()) {
+      encode_packet_preparing_.emplace(std::move(encode_packets_free_.back()));
+      encode_packets_free_.pop_back();
+    }
+  }
+  if (!encode_packet_preparing_.has_value()) {
     encode_packet_preparing_.emplace();
   }
   EncodeDrawPacket& packet = *encode_packet_preparing_;
   packet.has_draw = false;
   packet.memexport = false;
+  packet.host_index_buffer = {VK_NULL_HANDLE, 0};
   packet.prep_commands.clear();
   packet.image_infos.clear();
   return packet;
 }
 
 void VulkanCommandProcessor::ReleaseEncodeDrawPacket() {
-  if (encode_packet_preparing_.has_value()) {
-    encode_packets_free_.push_back(std::move(*encode_packet_preparing_));
-    encode_packet_preparing_.reset();
+  if (!encode_packet_preparing_.has_value()) {
+    return;
   }
+  std::unique_lock<std::mutex> lock(encode_mutex_, std::defer_lock);
+  if (encode_thread_enabled_) {
+    lock.lock();
+  }
+  encode_packets_free_.push_back(std::move(*encode_packet_preparing_));
+  encode_packet_preparing_.reset();
 }
 
 void VulkanCommandProcessor::QueueEncodeDrawPacket() {
@@ -3598,19 +3625,36 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   packet.constant_buffers_written = pending_constant_buffers_written_;
   pending_constant_buffers_written_ = 0;
 
-  encode_queue_.push_back(std::move(packet));
-  encode_packet_preparing_.reset();
-
-  const size_t lag = std::min(REXCVAR_GET(vulkan_draw_encode_lag), uint32_t(1024));
-  while (encode_queue_.size() > lag) {
-    EncodeDrawPacket front = std::move(encode_queue_.front());
-    encode_queue_.pop_front();
-    EncodeQueuedPacket(front);
+  if (encode_thread_enabled_) {
+    bool wake = false;
+    {
+      std::unique_lock<std::mutex> lock(encode_mutex_);
+      while (encode_queue_.size() >= kEncodeThreadMaxQueuedPackets) {
+        encode_producer_waiting_ = true;
+        encode_done_cv_.wait(lock);
+      }
+      encode_queue_.push_back(std::move(packet));
+      wake = encode_thread_waiting_;
+    }
+    encode_packet_preparing_.reset();
+    if (wake) {
+      encode_work_cv_.notify_one();
+    }
+  } else {
+    encode_queue_.push_back(std::move(packet));
+    encode_packet_preparing_.reset();
+    const size_t lag = std::min(REXCVAR_GET(vulkan_draw_encode_lag), uint32_t(1024));
+    while (encode_queue_.size() > lag) {
+      EncodeDrawPacket front = std::move(encode_queue_.front());
+      encode_queue_.pop_front();
+      EncodeQueuedPacket(front);
+      encode_packets_free_.push_back(std::move(front));
+    }
   }
-  if (encode_end_submission_requested_) {
+  if (encode_end_submission_requested_.load(std::memory_order_relaxed)) {
     // The draws prepared for this submission must be in it.
     DrainEncodeQueue();
-    encode_end_submission_requested_ = false;
+    encode_end_submission_requested_.store(false, std::memory_order_relaxed);
     if (submission_open_ && CanEndSubmissionImmediately()) {
       EndSubmission(false);
     }
@@ -3618,12 +3662,104 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
 }
 
 void VulkanCommandProcessor::DrainEncodeQueue() {
+  if (encode_thread_enabled_) {
+    if (IsEncodeThread()) {
+      // Can't wait for itself (the caller logs this case).
+      return;
+    }
+    std::unique_lock<std::mutex> lock(encode_mutex_);
+    while (!encode_queue_.empty() || encode_thread_busy_) {
+      encode_producer_waiting_ = true;
+      encode_done_cv_.wait(lock);
+    }
+    return;
+  }
   assert_false(encoding_);
   while (!encode_queue_.empty()) {
     EncodeDrawPacket front = std::move(encode_queue_.front());
     encode_queue_.pop_front();
     EncodeQueuedPacket(front);
+    encode_packets_free_.push_back(std::move(front));
   }
+}
+
+bool VulkanCommandProcessor::IsEncodeThread() const {
+  return encode_thread_ && rex::thread::Thread::GetCurrentThread() == encode_thread_.get();
+}
+
+void VulkanCommandProcessor::EncodeThreadMain() {
+#if REX_PLATFORM_PS5
+  rex::ps5prof::RegisterCurrentThread("GPU Encode");
+#endif
+  std::unique_lock<std::mutex> lock(encode_mutex_);
+  while (true) {
+    while (encode_queue_.empty() && !encode_thread_exit_) {
+      encode_thread_waiting_ = true;
+      encode_work_cv_.wait(lock);
+      encode_thread_waiting_ = false;
+    }
+    if (encode_queue_.empty()) {
+      break;  // Exiting.
+    }
+    EncodeDrawPacket packet = std::move(encode_queue_.front());
+    encode_queue_.pop_front();
+    encode_thread_busy_ = true;
+    bool notify_producer = encode_producer_waiting_;
+    encode_producer_waiting_ = false;
+    lock.unlock();
+    if (notify_producer) {
+      // Room in the queue.
+      encode_done_cv_.notify_all();
+    }
+    EncodeQueuedPacket(packet);
+    lock.lock();
+    encode_packets_free_.push_back(std::move(packet));
+    encode_thread_busy_ = false;
+    if (encode_producer_waiting_ && encode_queue_.empty()) {
+      // Drained.
+      encode_producer_waiting_ = false;
+      lock.unlock();
+      encode_done_cv_.notify_all();
+      lock.lock();
+    }
+  }
+#if REX_PLATFORM_PS5
+  rex::ps5prof::UnregisterCurrentThread();
+#endif
+}
+
+void VulkanCommandProcessor::StartEncodeThread() {
+  encode_thread_enabled_ = REXCVAR_GET(vulkan_draw_encode_thread);
+  if (!encode_thread_enabled_) {
+    return;
+  }
+  encode_thread_exit_ = false;
+  encode_thread_busy_ = false;
+  encode_thread_waiting_ = false;
+  encode_producer_waiting_ = false;
+  encode_thread_ = rex::thread::Thread::Create({}, [this]() { EncodeThreadMain(); });
+  if (!encode_thread_) {
+    REXGPU_ERROR("Vulkan: failed to create the draw encoding thread, encoding inline");
+    encode_thread_enabled_ = false;
+    return;
+  }
+  encode_thread_->set_name("GPU Encode");
+  REXGPU_INFO("Vulkan: draws encoded on a separate thread");
+}
+
+void VulkanCommandProcessor::StopEncodeThread() {
+  if (!encode_thread_) {
+    encode_thread_enabled_ = false;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(encode_mutex_);
+    encode_thread_exit_ = true;
+  }
+  encode_work_cv_.notify_all();
+  rex::thread::Wait(encode_thread_.get(), false);
+  encode_thread_.reset();
+  encode_thread_enabled_ = false;
 }
 
 void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
@@ -3634,9 +3770,10 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
     values += run.second;
   }
   ApplyConstantsWritten(packet.float_constants_written, packet.constant_buffers_written);
-  if (encode_queue_.empty()) {
+  if (!encode_thread_enabled_ && encode_queue_.empty()) {
     // Nothing prepared after this draw - unless registers have been written
-    // since, the copy must equal the main register file.
+    // since, the copy must equal the main register file. (Checked in
+    // SyncEncodeRegisters with the encoding thread.)
     bool any_dirty = false;
     for (uint64_t dirty_word : encode_register_dirty_) {
       any_dirty |= dirty_word != 0;
@@ -3652,13 +3789,14 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
     encoding_ = false;
   }
   packet.prep_commands.clear();
-  encode_packets_free_.push_back(std::move(packet));
 }
 
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     SingleTransientDescriptorLayout transient_descriptor_layout) {
   assert_true(frame_open_);
+  // Used by draw preparation (texture loads) and encoding.
+  std::lock_guard<std::mutex> lock(transient_descriptor_allocator_mutex_);
   VkDescriptorSet descriptor_set;
   std::vector<VkDescriptorSet>& transient_descriptors_free =
       single_transient_descriptors_free_[size_t(transient_descriptor_layout)];
@@ -3926,11 +4064,12 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
 }
 
 void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
-  if (current_external_compute_pipeline_ == pipeline) {
+  RecordingContext& recording = *CurrentRecording();
+  if (recording.compute_pipeline == pipeline) {
     return;
   }
-  recording_->stream->CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-  current_external_compute_pipeline_ = pipeline;
+  recording.stream->CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+  recording.compute_pipeline = pipeline;
 }
 
 void VulkanCommandProcessor::SetViewport(const VkViewport& viewport) {
@@ -4295,6 +4434,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   packet.vertex_shader_translation = vertex_shader_translation;
   packet.pixel_shader_translation = pixel_shader_translation;
+  switch (primitive_processing_result.index_buffer_type) {
+    case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
+      packet.host_index_buffer = primitive_processor_->GetConvertedIndexBuffer(
+          primitive_processing_result.host_index_buffer_handle);
+      break;
+    case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
+    case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
+      packet.host_index_buffer = primitive_processor_->GetBuiltinIndexBuffer(
+          primitive_processing_result.host_index_buffer_handle);
+      break;
+    default:
+      break;
+  }
 
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
@@ -4697,13 +4849,11 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
         }
         break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
-        index_buffer = primitive_processor_->GetConvertedIndexBuffer(
-            primitive_processing_result.host_index_buffer_handle);
-        break;
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
       case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
-        index_buffer = primitive_processor_->GetBuiltinIndexBuffer(
-            primitive_processing_result.host_index_buffer_handle);
+        // Resolved when preparing (the primitive processor belongs to the
+        // preparation side).
+        index_buffer = packet.host_index_buffer;
         break;
       default:
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
@@ -5969,7 +6119,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     in_render_pass_ = false;
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
-    current_external_compute_pipeline_ = VK_NULL_HANDLE;
+    main_recording_.compute_pipeline = VK_NULL_HANDLE;
     current_guest_graphics_pipeline_layout_ = nullptr;
     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
 
@@ -6232,9 +6382,15 @@ void VulkanCommandProcessor::StopSubmitThread() {
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
-  if (!encode_queue_.empty()) {
-    // Prepared draws belong to this submission (objects they use are marked as
-    // used in it). All callers should have drained the queue already.
+  // Prepared draws belong to this submission (objects they use are marked as
+  // used in it), so they must be encoded first. Callers drain the queue
+  // already; when encoding a memexport draw (the only case on the encoding
+  // thread), the preparation thread waits with an empty queue.
+  if (encode_thread_enabled_) {
+    if (!IsEncodeThread()) {
+      DrainEncodeQueue();
+    }
+  } else if (!encode_queue_.empty()) {
     ++encode_queue_unexpected_submission_ends_;
     if (encode_queue_unexpected_submission_ends_ <= 16) {
       REXGPU_WARN("EndSubmission with {} prepared draws not encoded yet{}",
@@ -6532,19 +6688,19 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
 }
 
 void VulkanCommandProcessor::SplitPendingBarrier() {
-  size_t pending_buffer_memory_barrier_count = recording_->buffer_memory_barriers.size();
-  size_t pending_image_memory_barrier_count = recording_->image_memory_barriers.size();
-  if (!recording_->current_pending_barrier.src_stage_mask && !recording_->current_pending_barrier.dst_stage_mask &&
-      recording_->current_pending_barrier.buffer_memory_barriers_offset >=
+  size_t pending_buffer_memory_barrier_count = CurrentRecording()->buffer_memory_barriers.size();
+  size_t pending_image_memory_barrier_count = CurrentRecording()->image_memory_barriers.size();
+  if (!CurrentRecording()->current_pending_barrier.src_stage_mask && !CurrentRecording()->current_pending_barrier.dst_stage_mask &&
+      CurrentRecording()->current_pending_barrier.buffer_memory_barriers_offset >=
           pending_buffer_memory_barrier_count &&
-      recording_->current_pending_barrier.image_memory_barriers_offset >= pending_image_memory_barrier_count) {
+      CurrentRecording()->current_pending_barrier.image_memory_barriers_offset >= pending_image_memory_barrier_count) {
     return;
   }
-  recording_->pending_barriers.emplace_back(recording_->current_pending_barrier);
-  recording_->current_pending_barrier.src_stage_mask = 0;
-  recording_->current_pending_barrier.dst_stage_mask = 0;
-  recording_->current_pending_barrier.buffer_memory_barriers_offset = pending_buffer_memory_barrier_count;
-  recording_->current_pending_barrier.image_memory_barriers_offset = pending_image_memory_barrier_count;
+  CurrentRecording()->pending_barriers.emplace_back(CurrentRecording()->current_pending_barrier);
+  CurrentRecording()->current_pending_barrier.src_stage_mask = 0;
+  CurrentRecording()->current_pending_barrier.dst_stage_mask = 0;
+  CurrentRecording()->current_pending_barrier.buffer_memory_barriers_offset = pending_buffer_memory_barrier_count;
+  CurrentRecording()->current_pending_barrier.image_memory_barriers_offset = pending_image_memory_barrier_count;
 }
 
 void VulkanCommandProcessor::DestroyScratchBuffer() {
@@ -7690,8 +7846,11 @@ bool VulkanCommandProcessor::UpdateBindings(const EncodeDrawPacket& packet,
       VkDescriptorPoolSize constants_descriptor_count;
       constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
-      constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
-          descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+      {
+        std::lock_guard<std::mutex> lock(transient_descriptor_allocator_mutex_);
+        constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
+            descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+      }
       if (constants_descriptor_set == VK_NULL_HANDLE) {
         return false;
       }
