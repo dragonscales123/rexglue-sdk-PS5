@@ -38,6 +38,12 @@ class DeferredCommandBuffer {
   // executed elsewhere while recording continues into the other storage.
   void SwapStream(std::vector<uintmax_t>& stream) { command_stream_.swap(stream); }
   const std::vector<uintmax_t>& stream() const { return command_stream_; }
+  // Appends another buffer's recorded commands (self-contained, so copied as
+  // they are).
+  void AppendStream(const DeferredCommandBuffer& other) {
+    command_stream_.insert(command_stream_.end(), other.command_stream_.cbegin(),
+                           other.command_stream_.cend());
+  }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,

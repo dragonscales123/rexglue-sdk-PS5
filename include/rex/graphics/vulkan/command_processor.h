@@ -152,8 +152,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
     assert_true(submission_open_);
-    return deferred_command_buffer_;
+    return *recording_->stream;
   }
+  // Whether commands are currently recorded into the draw preparation chunk
+  // (see BeginPrepRecording) rather than the main deferred command buffer.
+  bool IsPrepRecording() const { return recording_ != &main_recording_; }
+  // Draw preparation (texture loads, index conversion, uploads in the main
+  // stream) is recorded into a separate chunk with its own barrier queue, then
+  // appended to the main deferred command buffer right before the draw it is
+  // for, so the GPU command order is unchanged. This separates the commands
+  // that depend only on guest memory and texture state from the render target
+  // / pipeline / binding work, so the two can later run on different threads.
+  void BeginPrepRecording();
+  // Flushes the preparation chunk's barriers, appends the chunk to the main
+  // deferred command buffer (ending the render pass first if it's not empty)
+  // and switches back to main recording.
+  void EndPrepRecording();
   // Executed before deferred_command_buffer() in the same submission.
   DeferredCommandBuffer& upload_command_buffer() {
     assert_true(submission_open_);
@@ -830,17 +844,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::array<SwapFramebuffer, ui::vulkan::VulkanPresenter::kMaxActiveGuestOutputImageVersions>
       swap_framebuffers_;
 
-  // Pending pipeline barriers.
-  std::vector<VkBufferMemoryBarrier> pending_barriers_buffer_memory_barriers_;
-  std::vector<VkImageMemoryBarrier> pending_barriers_image_memory_barriers_;
+  // Pending pipeline barriers, per recording context.
   struct PendingBarrier {
     VkPipelineStageFlags src_stage_mask = 0;
     VkPipelineStageFlags dst_stage_mask = 0;
     size_t buffer_memory_barriers_offset = 0;
     size_t image_memory_barriers_offset = 0;
   };
-  std::vector<PendingBarrier> pending_barriers_;
-  PendingBarrier current_pending_barrier_;
+  struct RecordingContext {
+    DeferredCommandBuffer* stream = nullptr;
+    std::vector<VkBufferMemoryBarrier> buffer_memory_barriers;
+    std::vector<VkImageMemoryBarrier> image_memory_barriers;
+    std::vector<PendingBarrier> pending_barriers;
+    PendingBarrier current_pending_barrier;
+  };
+  // Commands for the draw preparation chunk (see BeginPrepRecording).
+  DeferredCommandBuffer prep_command_buffer_{*this, 64 * 1024};
+  RecordingContext main_recording_{&deferred_command_buffer_};
+  RecordingContext prep_recording_{&prep_command_buffer_};
+  RecordingContext* recording_ = &main_recording_;
 
   // GPU-local scratch buffer.
   static constexpr VkDeviceSize kScratchBufferSizeIncrement = 16 * 1024 * 1024;
