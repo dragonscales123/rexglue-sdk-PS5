@@ -858,6 +858,37 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<PendingBarrier> pending_barriers;
     PendingBarrier current_pending_barrier;
   };
+  // Register file copy read by the draw encoding work (render targets,
+  // pipeline state, dynamic state, system constants, constant uploads), synced
+  // from the main register file by dirty 16-register blocks at each draw. This
+  // lets the encoding later run behind the PM4 thread, which keeps writing the
+  // main register file. Registers written by guest CPU MMIO
+  // (GraphicsSystem::WriteRegister) aren't tracked - the encoding doesn't read
+  // them.
+  static constexpr uint32_t kEncodeRegisterBlockShift = 4;
+  static constexpr size_t kEncodeRegisterBlockCount =
+      (RegisterFile::kRegisterCount + (size_t(1) << kEncodeRegisterBlockShift) - 1) >>
+      kEncodeRegisterBlockShift;
+  RegisterFile encode_register_file_;
+  uint64_t encode_register_dirty_[(kEncodeRegisterBlockCount + 63) / 64] = {};
+  uint32_t encode_register_check_countdown_ = 0;
+  uint32_t encode_register_mismatches_logged_ = 0;
+  void MarkEncodeRegistersDirty(uint32_t start_index, uint32_t count) {
+    if (!count) {
+      return;
+    }
+    uint32_t block_last = std::min(start_index + count - 1,
+                                   uint32_t(RegisterFile::kRegisterCount - 1)) >>
+                          kEncodeRegisterBlockShift;
+    for (uint32_t block = start_index >> kEncodeRegisterBlockShift; block <= block_last;
+         ++block) {
+      encode_register_dirty_[block >> 6] |= uint64_t(1) << (block & 63);
+    }
+  }
+  // Copies the dirty blocks to encode_register_file_ (and optionally checks the
+  // whole copy against the main register file).
+  void SyncEncodeRegisters();
+
   // Commands for the draw preparation chunk (see BeginPrepRecording).
   DeferredCommandBuffer prep_command_buffer_{*this, 64 * 1024};
   RecordingContext main_recording_{&deferred_command_buffer_};

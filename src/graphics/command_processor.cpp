@@ -1788,10 +1788,16 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
     REXGPU_INFO("End viz query ID {:02X}", id);
     // The scan converter writes the internal result back to the register here.
     // We just fake it and say it was visible in case it is read back.
+    // Through WriteRegister, so backends see the change (no side effects for
+    // these registers).
     if (id < 32) {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1) << id;
+      WriteRegister(XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0,
+                    register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |
+                        (uint32_t(1) << id));
     } else {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |= uint32_t(1) << (id - 32);
+      WriteRegister(XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1,
+                    register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |
+                        (uint32_t(1) << (id - 32)));
     }
   }
 

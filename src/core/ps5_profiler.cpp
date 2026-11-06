@@ -251,13 +251,16 @@ void Dump(int fd, double seconds) {
                                  counters_now.gpu_timed_submits.load(),
                                  counters_now.gpu_untimed_submits.load()};
     const uint64_t gpu_longest_ns = counters_now.gpu_longest_submit_ns.exchange(0);
+    const uint64_t encode_register_mismatches =
+        counters_now.encode_register_mismatches.exchange(0);
     const double gpu_busy_ms = double(gpu_now[0] - previous_gpu[0]) * inv / 1e6;
     n = snprintf(header, sizeof(header),
                  "gpu-time/s: busy %.1f ms (%.0f%%), longest submission %.2f ms | timed %.0f, "
-                 "untimed %.0f\n",
+                 "untimed %.0f | encode register mismatches %llu\n",
                  gpu_busy_ms, gpu_busy_ms / 10.0, double(gpu_longest_ns) / 1e6,
                  double(gpu_now[1] - previous_gpu[1]) * inv,
-                 double(gpu_now[2] - previous_gpu[2]) * inv);
+                 double(gpu_now[2] - previous_gpu[2]) * inv,
+                 (unsigned long long)encode_register_mismatches);
     for (int k = 0; k < 3; ++k) {
       previous_gpu[k] = gpu_now[k];
     }

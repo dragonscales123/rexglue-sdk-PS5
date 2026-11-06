@@ -61,6 +61,11 @@ class VulkanPipelineCache {
   VulkanPipelineCache(VulkanCommandProcessor& command_processor, const RegisterFile& register_file,
                       VulkanRenderTargetCache& render_target_cache,
                       VkShaderStageFlags guest_shader_vertex_stages);
+  // The register file read when describing the pipeline state in
+  // ConfigurePipeline (shader modifications still use the main one).
+  void SetStateRegisterFile(const RegisterFile* register_file) {
+    state_register_file_ = register_file;
+  }
   ~VulkanPipelineCache();
 
   bool Initialize();
@@ -373,6 +378,9 @@ class VulkanPipelineCache {
 
   VulkanCommandProcessor& command_processor_;
   const RegisterFile& register_file_;
+  // Register file read for the pipeline state description (the draw encoding
+  // copy); null to use register_file_.
+  const RegisterFile* state_register_file_ = nullptr;
   VulkanRenderTargetCache& render_target_cache_;
   VkShaderStageFlags guest_shader_vertex_stages_;
 

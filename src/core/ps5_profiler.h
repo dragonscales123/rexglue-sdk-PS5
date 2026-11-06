@@ -42,7 +42,9 @@ struct Counters {
   std::atomic<uint64_t> gpu_busy_ns{0};
   std::atomic<uint64_t> gpu_timed_submits{0};
   std::atomic<uint64_t> gpu_untimed_submits{0};
-  std::atomic<uint64_t> gpu_longest_submit_ns{0};  // since the last profile interval
+  std::atomic<uint64_t> gpu_longest_submit_ns{0};
+  // Registers found different in the draw encoding register file copy check.
+  std::atomic<uint64_t> encode_register_mismatches{0};  // since the last profile interval
 };
 Counters& counters();
 

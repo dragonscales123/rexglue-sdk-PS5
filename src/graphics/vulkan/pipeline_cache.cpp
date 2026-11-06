@@ -1384,7 +1384,7 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       command_processor_.GetVulkanDevice()->properties();
 
-  const RegisterFile& regs = register_file_;
+  const RegisterFile& regs = state_register_file_ ? *state_register_file_ : register_file_;
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
 
   description_out.vertex_shader_hash = vertex_shader->shader().ucode_data_hash();

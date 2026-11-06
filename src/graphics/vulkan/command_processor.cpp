@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <bit>
 #include <optional>
 #include <rex/memory/bytes_equal.h>
 #include <chrono>
@@ -105,6 +106,11 @@ REXCVAR_DEFINE_UINT32(vulkan_submit_every_draws, REX_VULKAN_SUBMIT_EVERY_DRAWS_D
 REXCVAR_DEFINE_BOOL(vulkan_submit_thread, REX_VULKAN_SUBMIT_THREAD_DEFAULT, "GPU/Vulkan",
                     "Record command buffers and submit them on a separate thread, so the GPU "
                     "command thread doesn't wait for the Vulkan driver. Read at startup.");
+
+REXCVAR_DEFINE_BOOL(vulkan_encode_register_check, true, "GPU/Vulkan",
+                    "Every 256th draw, check the register file copy used for draw encoding "
+                    "against the main register file (counted in the PS5 profile, logged).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_draw_prep_chunks, true, "GPU/Vulkan",
                     "Record each draw's preparation commands (texture loads, index conversion, "
@@ -958,6 +964,12 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
+  std::memcpy(encode_register_file_.values, register_file_->values,
+              sizeof(encode_register_file_.values));
+  std::memset(encode_register_dirty_, 0, sizeof(encode_register_dirty_));
+  encode_register_check_countdown_ = 0;
+  encode_register_mismatches_logged_ = 0;
+
   primitive_processor_ =
       std::make_unique<VulkanPrimitiveProcessor>(*register_file_, *memory_, *shared_memory_, *this);
   if (!primitive_processor_->Initialize()) {
@@ -1023,7 +1035,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
   // Requires the transient descriptor set layouts.
   render_target_cache_ = std::make_unique<VulkanRenderTargetCache>(
-      *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
+      encode_register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this);
   if (!render_target_cache_->Initialize(shared_memory_binding_count)) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -1071,6 +1083,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
   pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
       *this, *register_file_, *render_target_cache_, guest_shader_vertex_stages_);
+  pipeline_cache_->SetStateRegisterFile(&encode_register_file_);
   if (!pipeline_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
     return false;
@@ -2208,6 +2221,7 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   const bool fetch_constant_unchanged =
       is_fetch_constant && register_file_->values[index] == value;
   CommandProcessor::WriteRegister(index, value);
+  MarkEncodeRegistersDirty(index, 1);
 #if REX_PLATFORM_PS5
   if (is_fetch_constant) {
     rex::ps5prof::counters().fetch_dwords_written.fetch_add(1, std::memory_order_relaxed);
@@ -2286,6 +2300,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       }
     }
   }
+  MarkEncodeRegistersDirty(start_index, num_registers);
 
   auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
                                          uint32_t last_constant) -> bool {
@@ -3439,6 +3454,59 @@ void VulkanCommandProcessor::EndRenderPass() {
   in_render_pass_ = false;
 }
 
+void VulkanCommandProcessor::SyncEncodeRegisters() {
+  constexpr uint32_t kBlockSize = uint32_t(1) << kEncodeRegisterBlockShift;
+  for (size_t word = 0; word < rex::countof(encode_register_dirty_); ++word) {
+    uint64_t bits = encode_register_dirty_[word];
+    if (!bits) {
+      continue;
+    }
+    encode_register_dirty_[word] = 0;
+    while (bits) {
+      // Copy runs of adjacent dirty blocks at once.
+      uint32_t first = uint32_t(std::countr_zero(bits));
+      uint32_t run = uint32_t(std::countr_one(bits >> first));
+      bits = run >= 64 - first ? 0 : bits & ~(((uint64_t(1) << run) - 1) << first);
+      uint32_t start = uint32_t(word * 64 + first) * kBlockSize;
+      uint32_t end =
+          std::min(start + run * kBlockSize, uint32_t(RegisterFile::kRegisterCount));
+      std::memcpy(encode_register_file_.values + start, register_file_->values + start,
+                  sizeof(uint32_t) * (end - start));
+    }
+  }
+  if (REXCVAR_GET(vulkan_encode_register_check)) {
+    if (encode_register_check_countdown_) {
+      --encode_register_check_countdown_;
+    } else {
+      encode_register_check_countdown_ = 255;
+      if (!rex::memory::BytesEqual(encode_register_file_.values, register_file_->values,
+                                   sizeof(encode_register_file_.values))) {
+        uint32_t mismatches = 0, first_mismatch = UINT32_MAX;
+        for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+          if (encode_register_file_.values[i] != register_file_->values[i]) {
+            ++mismatches;
+            first_mismatch = std::min(first_mismatch, i);
+          }
+        }
+#if REX_PLATFORM_PS5
+        rex::ps5prof::counters().encode_register_mismatches.fetch_add(mismatches,
+                                                                      std::memory_order_relaxed);
+#endif
+        if (encode_register_mismatches_logged_ < 32) {
+          ++encode_register_mismatches_logged_;
+          REXGPU_WARN(
+              "Encode register file out of sync: {} registers differ, first 0x{:04X} "
+              "(main 0x{:08X}, copy 0x{:08X})",
+              mismatches, first_mismatch, register_file_->values[first_mismatch],
+              encode_register_file_.values[first_mismatch]);
+        }
+        std::memcpy(encode_register_file_.values, register_file_->values,
+                    sizeof(encode_register_file_.values));
+      }
+    }
+  }
+}
+
 void VulkanCommandProcessor::BeginPrepRecording() {
   assert_false(IsPrepRecording());
   // Barriers already pending in the main context belong before the chunk.
@@ -3815,7 +3883,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  SyncEncodeRegisters();
   const RegisterFile& regs = *register_file_;
+  // Registers as seen by the encoding work (render targets, pipeline state,
+  // viewport, constants). Same values as regs for now.
+  const RegisterFile& encode_regs = encode_register_file_;
   (void)index_buffer_info;
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
@@ -4073,7 +4145,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+      pixel_shader ? draw_util::GetNormalizedColorMask(encode_regs, pixel_shader->writes_color_targets())
                    : 0;
 
   // Update the textures before most other work in the submission because
@@ -4176,7 +4248,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
   draw_util::GetHostViewportInfo(
-      regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
+      encode_regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
       device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
       normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
@@ -4185,7 +4257,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
 
-  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  auto vgt_draw_initiator = encode_regs.Get<reg::VGT_DRAW_INITIATOR>();
 
   // Whether to load the guest 32-bit (usually big-endian) vertex index
   // indirectly in the vertex shader if full 32-bit indices are not supported by
@@ -6357,7 +6429,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = encode_register_file_;
   uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
   uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
 
@@ -6567,7 +6639,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = encode_register_file_;
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -7063,7 +7135,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  const RegisterFile& regs = *register_file_;
+  const RegisterFile& regs = encode_register_file_;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
