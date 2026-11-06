@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <optional>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -168,6 +169,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // deferred command buffer (ending the render pass first if it's not empty)
   // and switches back to main recording.
   void EndPrepRecording();
+  // Same, but moves the chunk's commands to commands_out instead of appending
+  // them (for draws prepared ahead of their encoding).
+  void EndPrepRecording(std::vector<uintmax_t>* commands_out);
   // Executed before deferred_command_buffer() in the same submission.
   DeferredCommandBuffer& upload_command_buffer() {
     assert_true(submission_open_);
@@ -524,13 +528,15 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
+  struct EncodeDrawPacket;
   void UpdateSystemConstantValues(
-      bool primitive_polygonal,
+      const EncodeDrawPacket& packet, bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
-  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  bool UpdateBindings(const EncodeDrawPacket& packet, const VulkanShader* vertex_shader,
+                      const VulkanShader* pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -888,6 +894,78 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Copies the dirty blocks to encode_register_file_ (and optionally checks the
   // whole copy against the main register file).
   void SyncEncodeRegisters();
+  // Periodically (vulkan_encode_register_check) compares encode_register_file_
+  // with the main register file, which it must equal when nothing is pending.
+  void CheckEncodeRegisters();
+
+  // A draw prepared by IssueDraw for EncodeDraw: everything the encoding needs
+  // that it can't take from encode_register_file_ or its own state.
+  struct EncodeDrawPacket {
+    // Register changes since the previous packet, as (first register, count)
+    // runs with their values, applied to encode_register_file_.
+    std::vector<std::pair<uint32_t, uint32_t>> register_runs;
+    std::vector<uint32_t> register_values;
+    // Float constants written since the previous packet (vertex, pixel), and
+    // the other constant buffers (bits) written - invalidate the uploaded
+    // constants if the encoded shaders use them.
+    uint64_t float_constants_written[2][4] = {};
+    uint32_t constant_buffers_written = 0;
+    // Preparation commands (texture loads, uploads, index conversion), appended
+    // to the main command buffer before the draw.
+    std::vector<uintmax_t> prep_commands;
+    // False if only the preparation commands are queued (dropped draw).
+    bool has_draw = false;
+    bool memexport = false;
+    VulkanShader* vertex_shader = nullptr;
+    VulkanShader* pixel_shader = nullptr;
+    VulkanShader::VulkanTranslation* vertex_shader_translation = nullptr;
+    VulkanShader::VulkanTranslation* pixel_shader_translation = nullptr;
+    PrimitiveProcessor::ProcessingResult primitive_processing_result;
+    reg::RB_DEPTHCONTROL normalized_depth_control;
+    bool primitive_polygonal = false;
+    bool is_rasterization_done = false;
+    uint32_t used_texture_mask = 0;
+    uint32_t memexport_extent_start = UINT32_MAX;
+    uint32_t memexport_extent_end = 0;
+    // Active texture state for the used textures.
+    uint8_t texture_swizzled_signs[32] = {};
+    uint32_t textures_resolution_scaled = 0;
+    uint32_t texture_host_swizzles[32] = {};
+    // Vertex texture image views, vertex samplers, pixel texture image views,
+    // pixel samplers.
+    std::vector<VkDescriptorImageInfo> image_infos;
+    size_t image_info_texture_offsets[2] = {};
+    size_t image_info_sampler_offsets[2] = {};
+  };
+  // Prepared draws waiting for encoding (vulkan_draw_encode_lag), oldest
+  // first, and packets kept for reuse.
+  std::deque<EncodeDrawPacket> encode_queue_;
+  std::vector<EncodeDrawPacket> encode_packets_free_;
+  // The packet IssueDraw is preparing (from AcquireEncodeDrawPacket).
+  std::optional<EncodeDrawPacket> encode_packet_preparing_;
+  bool encoding_ = false;
+  bool encode_end_submission_requested_ = false;
+  uint64_t encode_queue_unexpected_submission_ends_ = 0;
+  // Constants written since the last packet (see EncodeDrawPacket).
+  uint64_t pending_float_constants_written_[2][4] = {};
+  uint32_t pending_constant_buffers_written_ = 0;
+  void MarkFloatConstantsWritten(uint32_t first_float_constant, uint32_t last_float_constant);
+  EncodeDrawPacket& AcquireEncodeDrawPacket();
+  void ReleaseEncodeDrawPacket();
+  // Captures the register / constant changes into the packet being prepared,
+  // queues it, and encodes what is more than vulkan_draw_encode_lag draws
+  // behind.
+  void QueueEncodeDrawPacket();
+  // Encodes all prepared draws.
+  void DrainEncodeQueue();
+  void EncodeQueuedPacket(EncodeDrawPacket& packet);
+  bool EncodeDraw(const EncodeDrawPacket& packet);
+  // Applies the pending constant write records to the encoding state.
+  void ApplyConstantsWritten(const uint64_t (&float_constants_written)[2][4],
+                             uint32_t constant_buffers_written);
+  void AppendPrepCommandsToMain(const std::vector<uintmax_t>& commands);
+  // Main-context compute pipeline binding, saved while recording a chunk.
+  VkPipeline prep_saved_external_compute_pipeline_ = VK_NULL_HANDLE;
 
   // Commands for the draw preparation chunk (see BeginPrepRecording).
   DeferredCommandBuffer prep_command_buffer_{*this, 64 * 1024};
@@ -996,12 +1074,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t sampler_memo_submission_[2] = {};
   uint32_t sampler_memo_fetch_mask_[2] = {};
   bool sampler_memo_valid_[2] = {};
-  // Whether this draw reused the previous samplers for the stage.
-  bool sampler_memo_hit_[2] = {};
-  // UpdateBindings: shader and texture binding generation the stage's last
-  // texture descriptor set was gathered for.
-  const VulkanShader* texture_set_last_shader_[2] = {};
-  uint64_t texture_set_last_generation_[2] = {};
   // Texture fetch constant slots changed since each stage's samplers were built.
   uint32_t sampler_fetch_dirty_[2] = {UINT32_MAX, UINT32_MAX};
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;

@@ -241,6 +241,39 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  if (command_processor_.IsPrepRecording()) {
+    VkPipelineStageFlags dst_stage_mask;
+    VkAccessFlags dst_access_mask;
+    GetUsageMasks(usage, dst_stage_mask, dst_access_mask);
+    if (!prep_usage_known_) {
+      // Anything may have been done before the chunk.
+      VkPipelineStageFlags src_stage_mask;
+      VkAccessFlags src_access_mask;
+      GetAllUsagesMasks(src_stage_mask, src_access_mask);
+      command_processor_.PushBufferMemoryBarrier(buffer_, 0, VK_WHOLE_SIZE, src_stage_mask,
+                                                 dst_stage_mask, src_access_mask,
+                                                 dst_access_mask, VK_QUEUE_FAMILY_IGNORED,
+                                                 VK_QUEUE_FAMILY_IGNORED, false);
+      prep_usage_known_ = true;
+      prep_last_usage_ = usage;
+    } else if (prep_last_usage_ != usage || prep_last_written_range_.second) {
+      VkPipelineStageFlags src_stage_mask;
+      VkAccessFlags src_access_mask;
+      GetUsageMasks(prep_last_usage_, src_stage_mask, src_access_mask);
+      VkDeviceSize offset = 0, size = VK_WHOLE_SIZE;
+      if (prep_last_usage_ == usage) {
+        offset = VkDeviceSize(prep_last_written_range_.first);
+        size = VkDeviceSize(prep_last_written_range_.second);
+      }
+      prep_last_usage_ = usage;
+      command_processor_.PushBufferMemoryBarrier(buffer_, offset, size, src_stage_mask,
+                                                 dst_stage_mask, src_access_mask,
+                                                 dst_access_mask, VK_QUEUE_FAMILY_IGNORED,
+                                                 VK_QUEUE_FAMILY_IGNORED, false);
+    }
+    prep_last_written_range_ = written_range;
+    return;
+  }
   if (last_usage_ != usage || last_written_range_.second) {
     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
     VkAccessFlags src_access_mask, dst_access_mask;
@@ -265,6 +298,28 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   }
   last_written_range_ = written_range;
+}
+
+void VulkanSharedMemory::BeginPrepRecording() {
+  prep_usage_known_ = false;
+  prep_last_written_range_ = {};
+}
+
+void VulkanSharedMemory::EndPrepRecording() {
+  if (!prep_usage_known_) {
+    return;
+  }
+  // Make everything the chunk did visible to any later usage.
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  GetUsageMasks(prep_last_usage_, src_stage_mask, src_access_mask);
+  src_access_mask |= VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  GetAllUsagesMasks(dst_stage_mask, dst_access_mask);
+  command_processor_.PushBufferMemoryBarrier(buffer_, 0, VK_WHOLE_SIZE, src_stage_mask,
+                                             dst_stage_mask, src_access_mask, dst_access_mask,
+                                             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                             false);
+  prep_usage_known_ = false;
 }
 
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,

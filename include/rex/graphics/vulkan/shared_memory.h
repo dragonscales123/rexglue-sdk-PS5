@@ -46,6 +46,12 @@ class VulkanSharedMemory : public SharedMemory {
   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
   // read-write accesses are ordered with each other.
   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
+  // While the command processor records a draw preparation chunk, Use tracks
+  // the usage within the chunk separately: the chunk starts from "any usage"
+  // and ends making its accesses visible to all usages, so it is correct
+  // wherever it is placed in the main command buffer.
+  void BeginPrepRecording();
+  void EndPrepRecording();
 
   VkBuffer buffer() const { return buffer_; }
 
@@ -72,6 +78,11 @@ class VulkanSharedMemory : public SharedMemory {
 
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
+  // Usage tracking within a preparation chunk (prep_usage_known_ false until
+  // the chunk's first Use).
+  bool prep_usage_known_ = false;
+  Usage prep_last_usage_ = Usage::kRead;
+  std::pair<uint32_t, uint32_t> prep_last_written_range_;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;

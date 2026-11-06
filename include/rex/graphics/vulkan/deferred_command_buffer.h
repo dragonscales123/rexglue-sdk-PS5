@@ -40,6 +40,9 @@ class DeferredCommandBuffer {
   const std::vector<uintmax_t>& stream() const { return command_stream_; }
   // Appends another buffer's recorded commands (self-contained, so copied as
   // they are).
+  void AppendCommands(const std::vector<uintmax_t>& commands) {
+    command_stream_.insert(command_stream_.end(), commands.cbegin(), commands.cend());
+  }
   void AppendStream(const DeferredCommandBuffer& other) {
     command_stream_.insert(command_stream_.end(), other.command_stream_.cbegin(),
                            other.command_stream_.cend());
