@@ -3503,8 +3503,10 @@ void VulkanCommandProcessor::CheckEncodeRegisters() {
 
 void VulkanCommandProcessor::BeginPrepRecording() {
   assert_false(IsPrepRecording());
-  // Barriers already pending in the main context belong before the chunk.
-  SubmitBarriers(false);
+  // The main context (its stream and pending barriers) belongs to the
+  // encoding, which may be running on another thread - don't touch it here.
+  // Barriers pending in it are flushed before the chunk when the chunk is
+  // appended (AppendPrepCommandsToMain).
   tls_prep_recording_ = true;
   prep_command_buffer_.Reset();
   // The chunk may be appended after other compute work in the main command
