@@ -908,8 +908,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct EncodeDrawPacket {
     // Register changes since the previous packet, as (first register, count)
     // runs with their values, applied to encode_register_file_.
+    // Only the first register_run_count / register_value_count elements are
+    // used (the vectors only grow, so filling them doesn't reallocate or
+    // zero-initialize).
     std::vector<std::pair<uint32_t, uint32_t>> register_runs;
     std::vector<uint32_t> register_values;
+    size_t register_run_count = 0;
+    size_t register_value_count = 0;
     // Float constants written since the previous packet (vertex, pixel), and
     // the other constant buffers (bits) written - invalidate the uploaded
     // constants if the encoded shaders use them.
@@ -968,6 +973,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool encode_thread_enabled_ = false;
   std::unique_ptr<rex::thread::Thread> encode_thread_;
   std::thread::id encode_thread_id_;
+  // Cheap per-thread identity for IsEncodeThread (see CurrentThreadToken),
+  // or 0 to compare encode_thread_id_.
+  uintptr_t encode_thread_token_ = 0;
   std::atomic<bool> encode_thread_id_ready_{false};
   std::mutex encode_mutex_;
   std::condition_variable encode_work_cv_;

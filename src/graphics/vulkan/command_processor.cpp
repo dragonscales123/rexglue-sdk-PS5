@@ -3631,27 +3631,43 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   assert_not_null(encode_packet_preparing_);
   EncodeDrawPacket& packet = *encode_packet_preparing_;
   // Register changes since the previous packet.
-  packet.register_runs.clear();
-  packet.register_values.clear();
+  size_t dirty_blocks = 0;
+  for (uint64_t dirty_word : encode_register_dirty_) {
+    dirty_blocks += size_t(std::popcount(dirty_word));
+  }
   constexpr uint32_t kBlockSize = uint32_t(1) << kEncodeRegisterBlockShift;
-  for (size_t word = 0; word < rex::countof(encode_register_dirty_); ++word) {
-    uint64_t bits = encode_register_dirty_[word];
-    if (!bits) {
-      continue;
-    }
-    encode_register_dirty_[word] = 0;
-    while (bits) {
-      uint32_t first = uint32_t(std::countr_zero(bits));
-      uint32_t run = uint32_t(std::countr_one(bits >> first));
-      bits = run >= 64 - first ? 0 : bits & ~(((uint64_t(1) << run) - 1) << first);
-      uint32_t start = uint32_t(word * 64 + first) * kBlockSize;
-      uint32_t end =
-          std::min(start + run * kBlockSize, uint32_t(RegisterFile::kRegisterCount));
-      packet.register_runs.emplace_back(start, end - start);
-      packet.register_values.insert(packet.register_values.end(),
-                                    register_file_->values + start, register_file_->values + end);
+  if (packet.register_values.size() < dirty_blocks * kBlockSize) {
+    packet.register_values.resize(dirty_blocks * kBlockSize);
+  }
+  if (packet.register_runs.size() < dirty_blocks) {
+    packet.register_runs.resize(dirty_blocks);
+  }
+  size_t run_count = 0, value_count = 0;
+  if (dirty_blocks) {
+    uint32_t* values_out = packet.register_values.data();
+    std::pair<uint32_t, uint32_t>* runs_out = packet.register_runs.data();
+    for (size_t word = 0; word < rex::countof(encode_register_dirty_); ++word) {
+      uint64_t bits = encode_register_dirty_[word];
+      if (!bits) {
+        continue;
+      }
+      encode_register_dirty_[word] = 0;
+      while (bits) {
+        uint32_t first = uint32_t(std::countr_zero(bits));
+        uint32_t run = uint32_t(std::countr_one(bits >> first));
+        bits = run >= 64 - first ? 0 : bits & ~(((uint64_t(1) << run) - 1) << first);
+        uint32_t start = uint32_t(word * 64 + first) * kBlockSize;
+        uint32_t end =
+            std::min(start + run * kBlockSize, uint32_t(RegisterFile::kRegisterCount));
+        runs_out[run_count++] = {start, end - start};
+        std::memcpy(values_out + value_count, register_file_->values + start,
+                    sizeof(uint32_t) * (end - start));
+        value_count += end - start;
+      }
     }
   }
+  packet.register_run_count = run_count;
+  packet.register_value_count = value_count;
   std::memcpy(packet.float_constants_written, pending_float_constants_written_,
               sizeof(packet.float_constants_written));
   std::memset(pending_float_constants_written_, 0, sizeof(pending_float_constants_written_));
@@ -3694,13 +3710,36 @@ void VulkanCommandProcessor::DrainEncodeQueue() {
   WaitForEncodeRing(1);
 }
 
+namespace {
+// A value unique to the calling thread, read with one instruction: on the
+// PS5 (FreeBSD-based, x86-64) FS points to the thread's control block, whose
+// first field points to itself. std::this_thread::get_id is a pthread_self
+// library call there, too slow for IsPrepRecording, which runs on every
+// barrier and command. 0 if not available.
+uintptr_t CurrentThreadToken() {
+#if REX_PLATFORM_PS5 && defined(__x86_64__)
+  uintptr_t token;
+  __asm__ volatile("movq %%fs:0, %0" : "=r"(token));
+  return token;
+#else
+  return 0;
+#endif
+}
+}  // namespace
+
 bool VulkanCommandProcessor::IsEncodeThread() const {
-  return encode_thread_enabled_ && encode_thread_id_ready_.load(std::memory_order_acquire) &&
-         std::this_thread::get_id() == encode_thread_id_;
+  if (!encode_thread_enabled_ || !encode_thread_id_ready_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (encode_thread_token_) {
+    return CurrentThreadToken() == encode_thread_token_;
+  }
+  return std::this_thread::get_id() == encode_thread_id_;
 }
 
 void VulkanCommandProcessor::EncodeThreadMain() {
   encode_thread_id_ = std::this_thread::get_id();
+  encode_thread_token_ = CurrentThreadToken();
   encode_thread_id_ready_.store(true, std::memory_order_release);
 #if REX_PLATFORM_PS5
   rex::ps5prof::RegisterCurrentThread("GPU Encode");
@@ -3771,8 +3810,14 @@ void VulkanCommandProcessor::StartEncodeThread() {
   while (!encode_thread_id_ready_.load(std::memory_order_acquire)) {
     std::this_thread::yield();
   }
+  // Use the cheap thread token only if it really tells the threads apart.
+  uintptr_t this_thread_token = CurrentThreadToken();
+  if (!encode_thread_token_ || !this_thread_token || encode_thread_token_ == this_thread_token) {
+    encode_thread_token_ = 0;
+  }
+  REXGPU_INFO("Vulkan: draws encoded on a separate thread (thread check: {})",
+              encode_thread_token_ ? "FS token" : "thread ID");
   encode_thread_->set_name("GPU Encode");
-  REXGPU_INFO("Vulkan: draws encoded on a separate thread");
 }
 
 void VulkanCommandProcessor::StopEncodeThread() {
@@ -3794,7 +3839,8 @@ void VulkanCommandProcessor::StopEncodeThread() {
 void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
   // Registers and constants as of this draw.
   const uint32_t* values = packet.register_values.data();
-  for (const std::pair<uint32_t, uint32_t>& run : packet.register_runs) {
+  for (size_t i = 0; i < packet.register_run_count; ++i) {
+    const std::pair<uint32_t, uint32_t>& run = packet.register_runs[i];
     std::memcpy(encode_register_file_.values + run.first, values, sizeof(uint32_t) * run.second);
     values += run.second;
   }
