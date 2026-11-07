@@ -183,7 +183,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
-    return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
+    // Kept explicitly (advanced only by EndSubmission) rather than computed
+    // from the completed and in-flight counts, which the preparation thread
+    // may update while the encoding thread reads this.
+    return submission_current_;
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
@@ -570,6 +573,13 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool submission_open_ = false;
   uint64_t submission_completed_ = 0;
+  uint64_t submission_current_ = 1;
+  // Completion processing for the encoding side (render target cache, async
+  // memexport delivery) postponed because the encoding thread was busy.
+  bool encode_side_completion_pending_ = false;
+  // Fast memexport readback done by the preparation thread (see IssueDraw);
+  // false if it must be done synchronously.
+  bool TryPrepareMemexportReadbackFast(uint32_t total_size);
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;

@@ -2216,6 +2216,8 @@ void VulkanCommandProcessor::ShutdownContext() {
   }
   current_submission_wait_semaphores_.clear();
   submission_completed_ = 0;
+  submission_current_ = 1;
+  encode_side_completion_pending_ = false;
   submission_open_ = false;
 
   for (VkSemaphore semaphore : semaphores_free_) {
@@ -4788,24 +4790,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // the exported data (memexport_ranges_, and the readback buffers), or the
   // scratch buffer for a snapshot of guest DMA indices (shared with texture
   // loads here). Others go through the queue like any draw.
+  // The fast readback (the default) is done here instead, with the copy queued
+  // after the draw (TryPrepareMemexportReadbackFast).
   bool memexport_sync = false;
+  bool memexport_readback_here = false;
+  uint32_t memexport_total_size = 0;
   if (memexport_writes_possible) {
     memexport_sync = primitive_processing_result.index_buffer_type ==
                      PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
-    if (!memexport_sync && !memexport_ranges_.empty()) {
-      uint32_t memexport_total_size = 0;
+    if (!memexport_ranges_.empty()) {
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
       }
-      memexport_sync = memexport_total_size &&
-                       IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport));
-      if (memexport_sync) {
-        ++drain_source_counts_[size_t(DrainSource::kOther)][0];
+      if (memexport_total_size &&
+          IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
+        if (!memexport_sync && !REXCVAR_GET(readback_memexport_async) &&
+            REXCVAR_GET(readback_memexport_fast)) {
+          memexport_readback_here = true;
+        } else {
+          memexport_sync = true;
+        }
       }
-    } else if (memexport_sync) {
-      // Synchronous for the guest DMA index snapshot (counted as "other" calls
-      // with nothing waited for - see the profile's drains line).
-      ++drain_source_counts_[size_t(DrainSource::kEndSubmission)][1];
     }
     // The memory state side of memexport: the pages will hold GPU-written data
     // (invalidating textures and watches there) - in preparation order, so
@@ -4832,6 +4837,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (memexport_sync) {
     // Encoded right away, so memexport_ranges_ is still this draw's.
     DrainEncodeQueue(DrainSource::kMemexport);
+  } else if (memexport_readback_here &&
+             !TryPrepareMemexportReadbackFast(memexport_total_size)) {
+    // The previous readback isn't ready (or a buffer needs to be created):
+    // the synchronous path, with nothing being encoded on the other thread.
+    DrainEncodeQueue(DrainSource::kMemexport);
+    IssueDraw_MemexportReadbackFastPath(memexport_total_size);
   }
   memexport_ranges_.clear();
   return true;
@@ -5526,6 +5537,94 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   return true;
 }
 
+bool VulkanCommandProcessor::TryPrepareMemexportReadbackFast(uint32_t total_size) {
+  // Same as IssueDraw_MemexportReadbackFastPath, on the preparation thread
+  // while the draw may still be waiting for encoding: the copy for this draw is
+  // recorded into a preparation chunk queued right after it, and the previous
+  // copy (finished) is given to the guest - in PM4 order, like a synchronous
+  // readback. Anything that would need waiting for the encoding returns false.
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  const uint64_t readback_key =
+      MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+  ReadbackBuffer& readback = memexport_readback_buffers_[readback_key];
+  readback.last_used_frame = frame_current_;
+  const uint32_t slot_count =
+      std::clamp(REXCVAR_GET(readback_memexport_fast_latency), 1u, kReadbackSlots - 1) + 1;
+  const uint32_t write_index = readback.current_index % slot_count;
+  const uint32_t read_index = (write_index + 1) % slot_count;
+  const uint32_t readback_size = AlignReadbackBufferSize(total_size);
+  if (readback.buffers[write_index] == VK_NULL_HANDLE ||
+      readback.memories[write_index] == VK_NULL_HANDLE ||
+      readback.mapped_data[write_index] == nullptr || readback_size > readback.sizes[write_index]) {
+    // Creating or growing the buffer may wait for the GPU.
+    return false;
+  }
+
+  CheckSubmissionFenceAndDeviceLoss(0);
+  bool previous_slot_written =
+      readback.buffers[read_index] != VK_NULL_HANDLE &&
+      readback.memories[read_index] != VK_NULL_HANDLE &&
+      readback.mapped_data[read_index] != nullptr && total_size <= readback.sizes[read_index] &&
+      total_size <= readback.written_size[read_index] && readback.submission_written[read_index] != 0;
+  if (previous_slot_written && REXCVAR_GET(readback_memexport_fast_wait) &&
+      readback.submission_written[read_index] > submission_completed_ &&
+      readback.submission_written[read_index] < GetCurrentSubmission()) {
+    // Submitted already - only waits for the GPU, not the encoding.
+    CheckSubmissionFenceAndDeviceLoss(readback.submission_written[read_index],
+                                      FenceWaitReason::kMemexport);
+  }
+  if (!previous_slot_written || readback.submission_written[read_index] > submission_completed_) {
+    return false;
+  }
+
+  // This draw's copy, after the draw in the command buffer.
+  AcquireEncodeDrawPacket();
+  BeginPrepRecording();
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    VkBufferCopy readback_region = {};
+    readback_region.srcOffset = memexport_range.base_address_dwords << 2;
+    readback_region.dstOffset = readback_offset;
+    readback_region.size = memexport_range.size_bytes;
+    deferred_command_buffer().CmdVkCopyBuffer(shared_memory_->buffer(),
+                                              readback.buffers[write_index], 1, &readback_region);
+    readback_offset += memexport_range.size_bytes;
+  }
+  PushBufferMemoryBarrier(readback.buffers[write_index], 0, total_size,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  readback.submission_written[write_index] = GetCurrentSubmission();
+  readback.written_size[write_index] = total_size;
+  EndPrepRecording(&encode_packet_preparing_->prep_commands);
+  encode_packet_preparing_->has_draw = false;
+  QueueEncodeDrawPacket();
+
+  // The previous copy to the guest.
+  VkMappedMemoryRange readback_memory_range = {};
+  readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  readback_memory_range.memory = readback.memories[read_index];
+  readback_memory_range.offset = 0;
+  readback_memory_range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
+  const uint8_t* readback_bytes =
+      reinterpret_cast<const uint8_t*>(readback.mapped_data[read_index]);
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                readback_bytes, memexport_range.size_bytes);
+    readback_bytes += memexport_range.size_bytes;
+  }
+  readback.current_index = read_index;
+  return true;
+}
+
 bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -6190,8 +6289,16 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     }
     return;
   }
+  // The render target cache and memexport readback delivery belong to the
+  // encoding - if it may be running on its thread, update them later.
+  const bool encoding_busy = encode_thread_enabled_ && !IsEncodeThread() && !IsEncodeRingEmpty();
   if (!fences_awaited) {
     // Not updated - no need to reclaim or download things.
+    if (encode_side_completion_pending_ && !encoding_busy) {
+      encode_side_completion_pending_ = false;
+      render_target_cache_->CompletedSubmissionUpdated();
+      DeliverCompletedMemexportReadbacks();
+    }
     return;
   }
   // Reclaim fences.
@@ -6228,11 +6335,18 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 
   primitive_processor_->CompletedSubmissionUpdated();
 
-  render_target_cache_->CompletedSubmissionUpdated();
+  if (encoding_busy) {
+    encode_side_completion_pending_ = true;
+  } else {
+    encode_side_completion_pending_ = false;
+    render_target_cache_->CompletedSubmissionUpdated();
+  }
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
 
-  DeliverCompletedMemexportReadbacks();
+  if (!encoding_busy) {
+    DeliverCompletedMemexportReadbacks();
+  }
 
   // Destroy objects scheduled for destruction.
   while (!destroy_framebuffers_.empty()) {
@@ -6831,6 +6945,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     command_buffers_writable_.pop_back();
     // Increments the current submission number, going to the next submission.
     submissions_in_flight_fences_.push_back(fence);
+    ++submission_current_;
     fences_free_.pop_back();
 
     submission_open_ = false;
