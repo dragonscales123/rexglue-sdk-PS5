@@ -1006,6 +1006,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // written / changed), accumulated on the GPU command thread without atomics
   // and added to the PS5 profile counters at each swap.
   uint64_t register_write_counts_[6] = {};
+  // Encoding queue profile counts on the preparation thread (flushed at
+  // swaps): drains, packets waiting when draining, drain wait ns, drains that
+  // slept, full-ring waits, full-ring wait ns, encoding thread wake-ups.
+  uint64_t encode_wait_counts_[7] = {};
+  std::atomic<uint64_t> encode_thread_sleeps_{0};
   uint32_t pending_constant_buffers_written_ = 0;
   void MarkFloatConstantsWritten(uint32_t first_float_constant, uint32_t last_float_constant);
   EncodeDrawPacket& AcquireEncodeDrawPacket();

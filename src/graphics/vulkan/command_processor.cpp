@@ -2498,6 +2498,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     counters.state_dwords_written.fetch_add(register_write_counts_[4], std::memory_order_relaxed);
     counters.state_dwords_changed.fetch_add(register_write_counts_[5], std::memory_order_relaxed);
     std::memset(register_write_counts_, 0, sizeof(register_write_counts_));
+    for (size_t k = 0; k < rex::countof(encode_wait_counts_); ++k) {
+      counters.encode_wait[k].fetch_add(encode_wait_counts_[k], std::memory_order_relaxed);
+    }
+    std::memset(encode_wait_counts_, 0, sizeof(encode_wait_counts_));
+    counters.encode_thread_sleeps.fetch_add(encode_thread_sleeps_.exchange(0),
+                                            std::memory_order_relaxed);
   }
 #endif
   vertex_buffers_in_sync_[0] = 0;
@@ -3694,11 +3700,30 @@ void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
     }
     return;
   }
+  const bool is_drain = max_waiting <= 1;
+  const auto wait_start = std::chrono::steady_clock::now();
+  if (is_drain) {
+    ++encode_wait_counts_[0];
+    encode_wait_counts_[1] += encode_ring_head_.load(std::memory_order_relaxed) -
+                              encode_ring_tail_.load(std::memory_order_relaxed);
+  } else {
+    ++encode_wait_counts_[4];
+  }
+  auto account_wait = [&]() {
+    uint64_t wait_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - wait_start)
+                                    .count());
+    encode_wait_counts_[is_drain ? 2 : 5] += wait_ns;
+  };
   for (uint32_t i = 0; i < 4096; ++i) {
     if (ready()) {
+      account_wait();
       return;
     }
     _mm_pause();
+  }
+  if (is_drain) {
+    ++encode_wait_counts_[3];
   }
   std::unique_lock<std::mutex> lock(encode_mutex_);
   encode_producer_sleeping_.store(true, std::memory_order_seq_cst);
@@ -3706,6 +3731,8 @@ void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
     encode_done_cv_.wait(lock);
   }
   encode_producer_sleeping_.store(false, std::memory_order_relaxed);
+  lock.unlock();
+  account_wait();
 }
 
 void VulkanCommandProcessor::QueueEncodeDrawPacket() {
@@ -3763,6 +3790,7 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
     // store, head load), so either it sees the packet or this sees it sleeping.
     encode_ring_head_.store(head, std::memory_order_seq_cst);
     if (encode_thread_sleeping_.load(std::memory_order_seq_cst)) {
+      ++encode_wait_counts_[6];
       std::lock_guard<std::mutex> lock(encode_mutex_);
       encode_work_cv_.notify_one();
     }
@@ -3837,6 +3865,7 @@ void VulkanCommandProcessor::EncodeThreadMain() {
       }
       if (!woke) {
         std::unique_lock<std::mutex> lock(encode_mutex_);
+        encode_thread_sleeps_.fetch_add(1, std::memory_order_relaxed);
         encode_thread_sleeping_.store(true, std::memory_order_seq_cst);
         while (encode_ring_head_.load(std::memory_order_seq_cst) == tail &&
                !encode_thread_exit_.load(std::memory_order_relaxed)) {

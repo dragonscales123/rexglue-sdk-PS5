@@ -41,6 +41,11 @@ struct Counters {
   std::atomic<uint64_t> float_dwords_changed{0};
   std::atomic<uint64_t> state_dwords_written{0};
   std::atomic<uint64_t> state_dwords_changed{0};
+  // Draw encoding queue (see VulkanCommandProcessor::encode_wait_counts_):
+  // drains, packets waiting at drains, drain wait ns, sleeping drains, full
+  // waits, full wait ns, encoding thread wake-ups; encoding thread sleeps.
+  std::atomic<uint64_t> encode_wait[7] = {};
+  std::atomic<uint64_t> encode_thread_sleeps{0};
   std::atomic<uint64_t> memexport_delivered{0};  // async memexport ranges written to guest memory
   std::atomic<uint64_t> memexport_skipped{0};    // ...skipped (the CPU wrote that memory since)
   // GPU execution time of queue submissions (timestamps at the start and end

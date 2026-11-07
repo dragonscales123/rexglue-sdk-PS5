@@ -259,6 +259,23 @@ void Dump(int fd, double seconds) {
     previous_fetch[0] = fetch_now[0];
     previous_fetch[1] = fetch_now[1];
     write(fd, header, size_t(n));
+    static uint64_t previous_encode[8] = {};
+    uint64_t encode_now[8];
+    for (int k = 0; k < 7; ++k) {
+      encode_now[k] = counters_now.encode_wait[k].load();
+    }
+    encode_now[7] = counters_now.encode_thread_sleeps.load();
+    double e[8];
+    for (int k = 0; k < 8; ++k) {
+      e[k] = double(encode_now[k] - previous_encode[k]) * inv;
+      previous_encode[k] = encode_now[k];
+    }
+    n = snprintf(header, sizeof(header),
+                 "encode-queue/s: drains %.0f (avg %.1f waiting) %.1f ms, slept %.0f | full "
+                 "waits %.0f %.1f ms | encoder sleeps %.0f, wakes %.0f\n",
+                 e[0], e[0] > 0 ? e[1] / e[0] : 0.0, e[2] / 1e6, e[3], e[4], e[5] / 1e6, e[7],
+                 e[6]);
+    write(fd, header, size_t(n));
     static uint64_t previous_gpu[3] = {};
     const uint64_t gpu_now[3] = {counters_now.gpu_busy_ns.load(),
                                  counters_now.gpu_timed_submits.load(),
