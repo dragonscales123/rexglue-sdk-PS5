@@ -240,9 +240,22 @@ void Dump(int fd, double seconds) {
     static uint64_t previous_fetch[2] = {};
     const uint64_t fetch_now[2] = {counters_now.fetch_dwords_written.load(),
                                    counters_now.fetch_dwords_changed.load()};
-    n = snprintf(header, sizeof(header), "fetch-constants/s: dwords written %.0f, changed %.0f\n",
+    static uint64_t previous_bulk[4] = {};
+    const uint64_t bulk_now[4] = {
+        counters_now.float_dwords_written.load(), counters_now.float_dwords_changed.load(),
+        counters_now.state_dwords_written.load(), counters_now.state_dwords_changed.load()};
+    n = snprintf(header, sizeof(header),
+                 "fetch-constants/s: dwords written %.0f, changed %.0f | float constants written "
+                 "%.0f, changed %.0f | state written %.0f, changed %.0f\n",
                  double(fetch_now[0] - previous_fetch[0]) * inv,
-                 double(fetch_now[1] - previous_fetch[1]) * inv);
+                 double(fetch_now[1] - previous_fetch[1]) * inv,
+                 double(bulk_now[0] - previous_bulk[0]) * inv,
+                 double(bulk_now[1] - previous_bulk[1]) * inv,
+                 double(bulk_now[2] - previous_bulk[2]) * inv,
+                 double(bulk_now[3] - previous_bulk[3]) * inv);
+    for (int k = 0; k < 4; ++k) {
+      previous_bulk[k] = bulk_now[k];
+    }
     previous_fetch[0] = fetch_now[0];
     previous_fetch[1] = fetch_now[1];
     write(fd, header, size_t(n));

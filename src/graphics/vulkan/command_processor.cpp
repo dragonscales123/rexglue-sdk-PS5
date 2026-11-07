@@ -2288,6 +2288,46 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
 }
 
+namespace {
+// Byte-swaps count guest dwords from src into dst, storing only the groups of
+// 8 that differ, and calls changed(first_dword, lane_mask) for each changed
+// group (lane_mask bit i: dst[first_dword + i] changed). Returns the number of
+// changed dwords.
+template <typename ChangedFn>
+uint32_t CopySwapChanged(uint32_t* dst, const uint32_t* src, uint32_t count,
+                         ChangedFn&& changed) {
+  uint32_t changed_count = 0;
+  uint32_t i = 0;
+#if defined(__AVX2__)
+  const __m256i swap_shuffle =
+      _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6,
+                       5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+  for (; i + 8 <= count; i += 8) {
+    __m256i value = _mm256_shuffle_epi8(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)), swap_shuffle);
+    __m256i old_value = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
+    uint32_t equal_mask = uint32_t(
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(value, old_value))));
+    if (equal_mask != 0xFF) {
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), value);
+      uint32_t lane_mask = ~equal_mask & 0xFF;
+      changed_count += uint32_t(std::popcount(lane_mask));
+      changed(i, lane_mask);
+    }
+  }
+#endif
+  for (; i < count; ++i) {
+    uint32_t value = rex::byte_swap(src[i]);
+    if (dst[i] != value) {
+      dst[i] = value;
+      ++changed_count;
+      changed(i, 1u);
+    }
+  }
+  return changed_count;
+}
+}  // namespace
+
 void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                                    uint32_t num_registers) {
   if (!num_registers) {
@@ -2312,19 +2352,40 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       }
     }
   }
-  MarkEncodeRegistersDirty(start_index, num_registers);
-
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    MarkFloatConstantsWritten((start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2,
-                              (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2);
+    // Games often rewrite float constants with the values they already have -
+    // only what changed is passed to the encoding (register copy, constant
+    // buffer reupload).
+    const uint32_t first_float_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_000_X;
+    uint32_t changed_dword_count = CopySwapChanged(
+        register_file_->values + start_index, base, num_registers,
+        [&](uint32_t first_dword, uint32_t lane_mask) {
+          MarkEncodeRegistersDirty(start_index + first_dword, 8);
+          while (lane_mask) {
+            uint32_t lane = uint32_t(std::countr_zero(lane_mask));
+            lane_mask &= lane_mask - 1;
+            uint32_t float_constant = (first_float_dword + first_dword + lane) >> 2;
+            pending_float_constants_written_[float_constant >> 8]
+                                            [(float_constant >> 6) & 3] |=
+                uint64_t(1) << (float_constant & 63);
+          }
+        });
+#if REX_PLATFORM_PS5
+    rex::ps5prof::counters().float_dwords_written.fetch_add(num_registers,
+                                                           std::memory_order_relaxed);
+    rex::ps5prof::counters().float_dwords_changed.fetch_add(changed_dword_count,
+                                                           std::memory_order_relaxed);
+#else
+    (void)changed_dword_count;
+#endif
     return;
   }
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    MarkEncodeRegistersDirty(start_index, num_registers);
     pending_constant_buffers_written_ |= UINT32_C(1)
                                          << SpirvShaderTranslator::kConstantBufferBoolLoop;
     return;
@@ -2343,6 +2404,7 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       const uint32_t value = rex::byte_swap(base[i]);
       if (values[i] != value) {
         values[i] = value;
+        MarkEncodeRegistersDirty(start_index + i, 1);
         const uint32_t fetch_dword = first_fetch_dword + i;
         changed_textures |= UINT32_C(1) << (fetch_dword / 6);
         InvalidateVertexBufferResidency(fetch_dword / 2);
@@ -2384,7 +2446,20 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       !overlaps(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST) &&
       !overlaps(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_30_COLOR) &&
       !overlaps(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    uint32_t changed_dword_count = CopySwapChanged(
+        register_file_->values + start_index, base, num_registers,
+        [&](uint32_t first_dword, uint32_t lane_mask) {
+          (void)lane_mask;
+          MarkEncodeRegistersDirty(start_index + first_dword, 8);
+        });
+#if REX_PLATFORM_PS5
+    rex::ps5prof::counters().state_dwords_written.fetch_add(num_registers,
+                                                           std::memory_order_relaxed);
+    rex::ps5prof::counters().state_dwords_changed.fetch_add(changed_dword_count,
+                                                           std::memory_order_relaxed);
+#else
+    (void)changed_dword_count;
+#endif
     return;
   }
 

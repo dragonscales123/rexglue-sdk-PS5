@@ -35,6 +35,12 @@ struct Counters {
   std::atomic<uint64_t> draws{0};  // guest draws issued on the GPU thread
   std::atomic<uint64_t> fetch_dwords_written{0};  // texture/vertex fetch constant dwords written
   std::atomic<uint64_t> fetch_dwords_changed{0};  // ...whose value actually changed
+  // Float constant and plain state register dwords written in bulk
+  // (WriteRegistersFromMem) and how many of them changed.
+  std::atomic<uint64_t> float_dwords_written{0};
+  std::atomic<uint64_t> float_dwords_changed{0};
+  std::atomic<uint64_t> state_dwords_written{0};
+  std::atomic<uint64_t> state_dwords_changed{0};
   std::atomic<uint64_t> memexport_delivered{0};  // async memexport ranges written to guest memory
   std::atomic<uint64_t> memexport_skipped{0};    // ...skipped (the CPU wrote that memory since)
   // GPU execution time of queue submissions (timestamps at the start and end
