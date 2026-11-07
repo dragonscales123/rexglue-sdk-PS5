@@ -973,9 +973,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool encode_thread_enabled_ = false;
   std::unique_ptr<rex::thread::Thread> encode_thread_;
   std::thread::id encode_thread_id_;
-  // Cheap per-thread identity for IsEncodeThread (see CurrentThreadToken),
-  // or 0 to compare encode_thread_id_.
-  uintptr_t encode_thread_token_ = 0;
+  // The encoding thread's stack range [low, high) for IsEncodeThread, or
+  // empty to compare encode_thread_id_.
+  static constexpr size_t kEncodeThreadStackSize = size_t(4) << 20;
+  uintptr_t encode_thread_stack_low_ = 0;
+  uintptr_t encode_thread_stack_high_ = 0;
   std::atomic<bool> encode_thread_id_ready_{false};
   std::mutex encode_mutex_;
   std::condition_variable encode_work_cv_;

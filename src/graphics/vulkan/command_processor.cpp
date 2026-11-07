@@ -3710,36 +3710,30 @@ void VulkanCommandProcessor::DrainEncodeQueue() {
   WaitForEncodeRing(1);
 }
 
-namespace {
-// A value unique to the calling thread, read with one instruction: on the
-// PS5 (FreeBSD-based, x86-64) FS points to the thread's control block, whose
-// first field points to itself. std::this_thread::get_id is a pthread_self
-// library call there, too slow for IsPrepRecording, which runs on every
-// barrier and command. 0 if not available.
-uintptr_t CurrentThreadToken() {
-#if REX_PLATFORM_PS5 && defined(__x86_64__)
-  uintptr_t token;
-  __asm__ volatile("movq %%fs:0, %0" : "=r"(token));
-  return token;
-#else
-  return 0;
-#endif
-}
-}  // namespace
 
 bool VulkanCommandProcessor::IsEncodeThread() const {
   if (!encode_thread_enabled_ || !encode_thread_id_ready_.load(std::memory_order_acquire)) {
     return false;
   }
-  if (encode_thread_token_) {
-    return CurrentThreadToken() == encode_thread_token_;
+  if (encode_thread_stack_high_) {
+    // Whether the caller runs on the encoding thread's stack - a comparison
+    // instead of std::this_thread::get_id (a pthread_self system call on the
+    // PS5, ~7% of the GPU command thread from IsPrepRecording, which runs on
+    // every barrier and command).
+    uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+    return frame >= encode_thread_stack_low_ && frame < encode_thread_stack_high_;
   }
   return std::this_thread::get_id() == encode_thread_id_;
 }
 
 void VulkanCommandProcessor::EncodeThreadMain() {
   encode_thread_id_ = std::this_thread::get_id();
-  encode_thread_token_ = CurrentThreadToken();
+  // This frame is near the top of the thread's stack, which grows down; all
+  // the encoding runs in frames below it. A little room above for the frame
+  // itself, the stack size below.
+  uintptr_t frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+  encode_thread_stack_high_ = frame + 256;
+  encode_thread_stack_low_ = frame + 256 - kEncodeThreadStackSize;
   encode_thread_id_ready_.store(true, std::memory_order_release);
 #if REX_PLATFORM_PS5
   rex::ps5prof::RegisterCurrentThread("GPU Encode");
@@ -3800,7 +3794,10 @@ void VulkanCommandProcessor::StartEncodeThread() {
   encode_thread_sleeping_.store(false);
   encode_producer_sleeping_.store(false);
   encode_thread_id_ready_.store(false);
-  encode_thread_ = rex::thread::Thread::Create({}, [this]() { EncodeThreadMain(); });
+  rex::thread::Thread::CreationParameters encode_thread_params;
+  encode_thread_params.stack_size = kEncodeThreadStackSize;
+  encode_thread_ = rex::thread::Thread::Create(encode_thread_params,
+                                               [this]() { EncodeThreadMain(); });
   if (!encode_thread_) {
     REXGPU_ERROR("Vulkan: failed to create the draw encoding thread, encoding inline");
     encode_thread_enabled_ = false;
@@ -3810,13 +3807,16 @@ void VulkanCommandProcessor::StartEncodeThread() {
   while (!encode_thread_id_ready_.load(std::memory_order_acquire)) {
     std::this_thread::yield();
   }
-  // Use the cheap thread token only if it really tells the threads apart.
-  uintptr_t this_thread_token = CurrentThreadToken();
-  if (!encode_thread_token_ || !this_thread_token || encode_thread_token_ == this_thread_token) {
-    encode_thread_token_ = 0;
+  // Use the stack range only if this (the preparation) thread's stack is
+  // outside it.
+  uintptr_t this_frame = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+  if (this_frame >= encode_thread_stack_low_ - kEncodeThreadStackSize &&
+      this_frame < encode_thread_stack_high_ + kEncodeThreadStackSize) {
+    encode_thread_stack_low_ = 0;
+    encode_thread_stack_high_ = 0;
   }
   REXGPU_INFO("Vulkan: draws encoded on a separate thread (thread check: {})",
-              encode_thread_token_ ? "FS token" : "thread ID");
+              encode_thread_stack_high_ ? "stack range" : "thread ID");
   encode_thread_->set_name("GPU Encode");
 }
 
