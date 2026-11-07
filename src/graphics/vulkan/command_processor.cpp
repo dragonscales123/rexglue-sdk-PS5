@@ -4799,6 +4799,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
       memexport_sync = memexport_total_size &&
                        IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport));
+      if (memexport_sync) {
+        ++drain_source_counts_[size_t(DrainSource::kOther)][0];
+      }
+    } else if (memexport_sync) {
+      // Synchronous for the guest DMA index snapshot (counted as "other" calls
+      // with nothing waited for - see the profile's drains line).
+      ++drain_source_counts_[size_t(DrainSource::kEndSubmission)][1];
     }
     // The memory state side of memexport: the pages will hold GPU-written data
     // (invalidating textures and watches there) - in preparation order, so
