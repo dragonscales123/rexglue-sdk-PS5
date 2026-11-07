@@ -1020,7 +1020,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   // behind.
   void QueueEncodeDrawPacket();
   // Encodes all prepared draws.
-  void DrainEncodeQueue();
+  enum class DrainSource : uint32_t {
+    kOcclusionQuery,
+    kSwap,
+    kSubmitEvery,
+    kPrimaryBufferEnd,
+    kMemexport,
+    kCopy,
+    kEndSubmission,
+    kOther,
+    kCount,
+  };
+  // Calls and calls that had something to wait for, per source (profile).
+  uint64_t drain_source_counts_[size_t(DrainSource::kCount)][2] = {};
+  void DrainEncodeQueue(DrainSource source);
   void EncodeQueuedPacket(EncodeDrawPacket& packet);
   bool EncodeDraw(const EncodeDrawPacket& packet);
   // Applies the pending constant write records to the encoding state.

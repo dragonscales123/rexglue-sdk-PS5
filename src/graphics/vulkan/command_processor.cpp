@@ -730,7 +730,7 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
   // Occlusion queries are recorded into the main command buffer between draws.
-  DrainEncodeQueue();
+  DrainEncodeQueue(DrainSource::kOcclusionQuery);
 
   const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
@@ -1992,7 +1992,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   if (submission_open_) {
-    DrainEncodeQueue();
+    DrainEncodeQueue(DrainSource::kOther);
   }
   StopEncodeThread();
   encode_ring_head_.store(0);
@@ -2486,7 +2486,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  DrainEncodeQueue();
+  DrainEncodeQueue(DrainSource::kSwap);
   SyncEncodeRegisters();
 #if REX_PLATFORM_PS5
   {
@@ -2502,6 +2502,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       counters.encode_wait[k].fetch_add(encode_wait_counts_[k], std::memory_order_relaxed);
     }
     std::memset(encode_wait_counts_, 0, sizeof(encode_wait_counts_));
+    for (size_t k = 0; k < size_t(DrainSource::kCount); ++k) {
+      counters.drain_calls[k].fetch_add(drain_source_counts_[k][0], std::memory_order_relaxed);
+      counters.drain_waits[k].fetch_add(drain_source_counts_[k][1], std::memory_order_relaxed);
+    }
+    std::memset(drain_source_counts_, 0, sizeof(drain_source_counts_));
     counters.encode_thread_sleeps.fetch_add(encode_thread_sleeps_.exchange(0),
                                             std::memory_order_relaxed);
   }
@@ -3801,7 +3806,7 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   }
   if (encode_end_submission_requested_.load(std::memory_order_relaxed)) {
     // The draws prepared for this submission must be in it.
-    DrainEncodeQueue();
+    DrainEncodeQueue(DrainSource::kSubmitEvery);
     encode_end_submission_requested_.store(false, std::memory_order_relaxed);
     if (submission_open_ && CanEndSubmissionImmediately()) {
       EndSubmission(false);
@@ -3809,13 +3814,17 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   }
 }
 
-void VulkanCommandProcessor::DrainEncodeQueue() {
+void VulkanCommandProcessor::DrainEncodeQueue(DrainSource source) {
   if (encode_thread_enabled_ && IsEncodeThread()) {
     // Can't wait for itself (only EndSubmission while encoding a memexport
     // draw, with the preparation thread waiting on an empty ring).
     return;
   }
   assert_true(encode_thread_enabled_ || !encoding_);
+  ++drain_source_counts_[size_t(source)][0];
+  if (!IsEncodeRingEmpty()) {
+    ++drain_source_counts_[size_t(source)][1];
+  }
   WaitForEncodeRing(1);
 }
 
@@ -4290,7 +4299,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_) {
-    DrainEncodeQueue();
+    DrainEncodeQueue(DrainSource::kPrimaryBufferEnd);
     if (CanEndSubmissionImmediately()) {
       EndSubmission(false);
     }
@@ -4369,7 +4378,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     // Memexport draws are encoded immediately (their results may be read back
     // and are written to memory_ranges_ used by the encoding).
-    DrainEncodeQueue();
+    DrainEncodeQueue(DrainSource::kMemexport);
     memexport_ranges_.clear();
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
   }
@@ -4412,7 +4421,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
     if (!memexport_used_vertex) {
-      DrainEncodeQueue();
+      DrainEncodeQueue(DrainSource::kMemexport);
       memexport_ranges_.clear();
     }
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
@@ -4612,7 +4621,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     packet.has_draw = false;
     std::vector<uintmax_t> prep_commands_so_far;
     prep_commands_so_far.swap(packet.prep_commands);
-    DrainEncodeQueue();
+    DrainEncodeQueue(DrainSource::kOther);
     if (!prep_commands_so_far.empty()) {
       AppendPrepCommandsToMain(prep_commands_so_far);
     }
@@ -4779,7 +4788,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (memexport_writes_possible) {
     // Encoded right away (the queue was drained before memexport_ranges_ was
     // filled), so memexport_ranges_ stays this draw's until the readback.
-    DrainEncodeQueue();
+    DrainEncodeQueue(DrainSource::kMemexport);
     memexport_ranges_.clear();
   }
   return true;
@@ -5494,7 +5503,7 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   // Resolves use the render target cache (encoding side) with the current
   // registers, and change memory that later draws' preparation reads.
-  DrainEncodeQueue();
+  DrainEncodeQueue(DrainSource::kCopy);
   SyncEncodeRegisters();
 
   if (!BeginSubmission(true)) {
@@ -6574,7 +6583,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   // thread), the preparation thread waits with an empty queue.
   if (encode_thread_enabled_) {
     if (!IsEncodeThread()) {
-      DrainEncodeQueue();
+      DrainEncodeQueue(DrainSource::kEndSubmission);
     }
   } else if (!IsEncodeRingEmpty()) {
     ++encode_queue_unexpected_submission_ends_;
@@ -6584,7 +6593,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                   encoding_ ? " (while encoding)" : "");
     }
     if (!encoding_) {
-      DrainEncodeQueue();
+      DrainEncodeQueue(DrainSource::kEndSubmission);
     }
   }
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();

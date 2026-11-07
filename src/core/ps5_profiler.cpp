@@ -276,6 +276,23 @@ void Dump(int fd, double seconds) {
                  e[0], e[0] > 0 ? e[1] / e[0] : 0.0, e[2] / 1e6, e[3], e[4], e[5] / 1e6, e[7],
                  e[6]);
     write(fd, header, size_t(n));
+    static uint64_t previous_drain[16] = {};
+    double dr[16];
+    for (int k = 0; k < 8; ++k) {
+      uint64_t calls = counters_now.drain_calls[k].load();
+      uint64_t waits = counters_now.drain_waits[k].load();
+      dr[k] = double(calls - previous_drain[k]) * inv;
+      dr[8 + k] = double(waits - previous_drain[8 + k]) * inv;
+      previous_drain[k] = calls;
+      previous_drain[8 + k] = waits;
+    }
+    n = snprintf(header, sizeof(header),
+                 "drains/s (calls/waited): occlusion %.0f/%.0f, swap %.0f/%.0f, submit-every "
+                 "%.0f/%.0f, primary-end %.0f/%.0f, memexport %.0f/%.0f, copy %.0f/%.0f, "
+                 "end-submission %.0f/%.0f, other %.0f/%.0f\n",
+                 dr[0], dr[8], dr[1], dr[9], dr[2], dr[10], dr[3], dr[11], dr[4], dr[12], dr[5],
+                 dr[13], dr[6], dr[14], dr[7], dr[15]);
+    write(fd, header, size_t(n));
     static uint64_t previous_gpu[3] = {};
     const uint64_t gpu_now[3] = {counters_now.gpu_busy_ns.load(),
                                  counters_now.gpu_timed_submits.load(),

@@ -46,6 +46,11 @@ struct Counters {
   // waits, full wait ns, encoding thread wake-ups; encoding thread sleeps.
   std::atomic<uint64_t> encode_wait[7] = {};
   std::atomic<uint64_t> encode_thread_sleeps{0};
+  // Draw encoding queue drains by source (occlusion query, swap, submit every
+  // N draws, primary buffer end, memexport, copy, end submission, other):
+  // calls, and calls with packets still waiting.
+  std::atomic<uint64_t> drain_calls[8] = {};
+  std::atomic<uint64_t> drain_waits[8] = {};
   std::atomic<uint64_t> memexport_delivered{0};  // async memexport ranges written to guest memory
   std::atomic<uint64_t> memexport_skipped{0};    // ...skipped (the CPU wrote that memory since)
   // GPU execution time of queue submissions (timestamps at the start and end
