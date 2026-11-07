@@ -3676,6 +3676,7 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
   encode_packet_preparing_ = &packet;
   packet.has_draw = false;
   packet.memexport = false;
+  packet.memexport_sync = false;
   packet.host_index_buffer = {VK_NULL_HANDLE, 0};
   packet.prep_commands.clear();
   packet.image_infos.clear();
@@ -4376,9 +4377,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           "vertexPipelineStoresAndAtomics support");
       return false;
     }
-    // Memexport draws are encoded immediately (their results may be read back
-    // and are written to memory_ranges_ used by the encoding).
-    DrainEncodeQueue(DrainSource::kMemexport);
+    // memexport_ranges_ belongs to the preparation - the encoding only reads it
+    // for memexport draws encoded synchronously (see memexport_sync below).
     memexport_ranges_.clear();
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
   }
@@ -4421,7 +4421,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
     if (!memexport_used_vertex) {
-      DrainEncodeQueue(DrainSource::kMemexport);
       memexport_ranges_.clear();
     }
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
@@ -4784,13 +4783,50 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   packet.memexport_extent_start = memexport_extent_start;
   packet.memexport_extent_end = memexport_extent_end;
 
-  queue_packet(true);
+  // Memexport draws only need to be encoded right away (with this thread
+  // waiting) if the encoding uses something only valid now: the readback of
+  // the exported data (memexport_ranges_, and the readback buffers), or the
+  // scratch buffer for a snapshot of guest DMA indices (shared with texture
+  // loads here). Others go through the queue like any draw.
+  bool memexport_sync = false;
   if (memexport_writes_possible) {
-    // Encoded right away (the queue was drained before memexport_ranges_ was
-    // filled), so memexport_ranges_ stays this draw's until the readback.
-    DrainEncodeQueue(DrainSource::kMemexport);
-    memexport_ranges_.clear();
+    memexport_sync = primitive_processing_result.index_buffer_type ==
+                     PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA;
+    if (!memexport_sync && !memexport_ranges_.empty()) {
+      uint32_t memexport_total_size = 0;
+      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+        memexport_total_size += memexport_range.size_bytes;
+      }
+      memexport_sync = memexport_total_size &&
+                       IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport));
+    }
+    // The memory state side of memexport: the pages will hold GPU-written data
+    // (invalidating textures and watches there) - in preparation order, so
+    // later draws prepared before this one is encoded already see that.
+    if (!memexport_ranges_.empty()) {
+      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+        shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+                                          memexport_range.size_bytes);
+      }
+    } else {
+      // Stream constants can be invalid or dynamic, so exact destinations may
+      // be unknown. Keep invalidation conservative in this case.
+      shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+    }
   }
+  packet.memexport_sync = memexport_sync;
+
+  if (memexport_sync) {
+    // Nothing prepared before may still be waiting when this is encoded on
+    // the encoding thread (it may end the submission for the readback).
+    DrainEncodeQueue(DrainSource::kMemexport);
+  }
+  queue_packet(true);
+  if (memexport_sync) {
+    // Encoded right away, so memexport_ranges_ is still this draw's.
+    DrainEncodeQueue(DrainSource::kMemexport);
+  }
+  memexport_ranges_.clear();
   return true;
 }
 
@@ -4966,7 +5002,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   ScratchBufferAcquisition guest_dma_index_scratch_buffer;
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
-      !shader_32bit_index_dma && memexport_writes_possible) {
+      !shader_32bit_index_dma && memexport_writes_possible && packet.memexport_sync) {
     // Align with D3D12 behavior where memexporting draws using guest DMA indices
     // read a snapshot of indices to avoid read/write aliasing through shared
     // memory.
@@ -5063,23 +5099,10 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
                                               0, 0, 0);
   }
 
-  // Invalidate textures in memexported memory and watch for changes.
-  // (memexport_ranges_ is only this draw's for memexport draws, which are
-  // encoded right after being prepared.)
-  if (memexport_writes_possible && !memexport_ranges_.empty()) {
-    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
-                                        memexport_range.size_bytes);
-    }
-  } else if (memexport_writes_possible) {
-    // Stream constants can be invalid or dynamic, so exact destinations may be
-    // unknown. Keep invalidation conservative in this case.
-    shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
-  }
-
-  // Check for memexport first: IsReadbackMemexportEnabled looks a cvar up by
-  // name under the cvar registry lock, too costly for every draw.
-  if (memexport_writes_possible && !memexport_ranges_.empty() &&
+  // The memexported memory was marked as GPU-written when preparing. The
+  // readback is only done for draws encoded synchronously (memexport_sync),
+  // for which memexport_ranges_ is still this draw's.
+  if (packet.memexport_sync && !memexport_ranges_.empty() &&
       IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {

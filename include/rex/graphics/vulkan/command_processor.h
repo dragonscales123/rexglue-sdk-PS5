@@ -926,6 +926,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     // False if only the preparation commands are queued (dropped draw).
     bool has_draw = false;
     bool memexport = false;
+    // Memexport draw encoded right away with the preparation waiting (it reads
+    // back the exported data or snapshots guest DMA indices).
+    bool memexport_sync = false;
     VulkanShader* vertex_shader = nullptr;
     VulkanShader* pixel_shader = nullptr;
     VulkanShader::VulkanTranslation* vertex_shader_translation = nullptr;
