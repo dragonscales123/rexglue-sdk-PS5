@@ -1002,6 +1002,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t encode_queue_unexpected_submission_ends_ = 0;
   // Constants written since the last packet (see EncodeDrawPacket).
   uint64_t pending_float_constants_written_[2][4] = {};
+  // Register write profile counts (fetch, float constant, state dwords
+  // written / changed), accumulated on the GPU command thread without atomics
+  // and added to the PS5 profile counters at each swap.
+  uint64_t register_write_counts_[6] = {};
   uint32_t pending_constant_buffers_written_ = 0;
   void MarkFloatConstantsWritten(uint32_t first_float_constant, uint32_t last_float_constant);
   EncodeDrawPacket& AcquireEncodeDrawPacket();

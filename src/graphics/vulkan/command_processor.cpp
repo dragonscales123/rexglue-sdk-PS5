@@ -2249,9 +2249,9 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   MarkEncodeRegistersDirty(index, 1);
 #if REX_PLATFORM_PS5
   if (is_fetch_constant) {
-    rex::ps5prof::counters().fetch_dwords_written.fetch_add(1, std::memory_order_relaxed);
+    ++register_write_counts_[0];
     if (!fetch_constant_unchanged) {
-      rex::ps5prof::counters().fetch_dwords_changed.fetch_add(1, std::memory_order_relaxed);
+      ++register_write_counts_[1];
     }
   }
 #endif
@@ -2372,10 +2372,8 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
           }
         });
 #if REX_PLATFORM_PS5
-    rex::ps5prof::counters().float_dwords_written.fetch_add(num_registers,
-                                                           std::memory_order_relaxed);
-    rex::ps5prof::counters().float_dwords_changed.fetch_add(changed_dword_count,
-                                                           std::memory_order_relaxed);
+    register_write_counts_[2] += num_registers;
+    register_write_counts_[3] += changed_dword_count;
 #else
     (void)changed_dword_count;
 #endif
@@ -2412,10 +2410,8 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       }
     }
 #if REX_PLATFORM_PS5
-    rex::ps5prof::counters().fetch_dwords_written.fetch_add(num_registers,
-                                                           std::memory_order_relaxed);
-    rex::ps5prof::counters().fetch_dwords_changed.fetch_add(changed_dword_count,
-                                                           std::memory_order_relaxed);
+    register_write_counts_[0] += num_registers;
+    register_write_counts_[1] += changed_dword_count;
 #endif
     if (changed_textures) {
       sampler_fetch_dirty_[0] |= changed_textures;
@@ -2453,10 +2449,8 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
           MarkEncodeRegistersDirty(start_index + first_dword, 8);
         });
 #if REX_PLATFORM_PS5
-    rex::ps5prof::counters().state_dwords_written.fetch_add(num_registers,
-                                                           std::memory_order_relaxed);
-    rex::ps5prof::counters().state_dwords_changed.fetch_add(changed_dword_count,
-                                                           std::memory_order_relaxed);
+    register_write_counts_[4] += num_registers;
+    register_write_counts_[5] += changed_dword_count;
 #else
     (void)changed_dword_count;
 #endif
@@ -2494,6 +2488,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   SCOPE_profile_cpu_f("gpu");
   DrainEncodeQueue();
   SyncEncodeRegisters();
+#if REX_PLATFORM_PS5
+  {
+    auto& counters = rex::ps5prof::counters();
+    counters.fetch_dwords_written.fetch_add(register_write_counts_[0], std::memory_order_relaxed);
+    counters.fetch_dwords_changed.fetch_add(register_write_counts_[1], std::memory_order_relaxed);
+    counters.float_dwords_written.fetch_add(register_write_counts_[2], std::memory_order_relaxed);
+    counters.float_dwords_changed.fetch_add(register_write_counts_[3], std::memory_order_relaxed);
+    counters.state_dwords_written.fetch_add(register_write_counts_[4], std::memory_order_relaxed);
+    counters.state_dwords_changed.fetch_add(register_write_counts_[5], std::memory_order_relaxed);
+    std::memset(register_write_counts_, 0, sizeof(register_write_counts_));
+  }
+#endif
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
   if (shared_memory_) {
