@@ -325,6 +325,7 @@ class PhysicalHeap : public BaseHeap {
 
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+  void InvalidateGpuCopies(uint32_t address, uint32_t size);
 
   // Allocation on these heaps delegates to parent_heap_, whose own reconcile
   // pass takes the global critical region. Acquire whenever this heap or its

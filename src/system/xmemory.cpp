@@ -1961,7 +1961,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  std::unique_lock<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
   uint32_t parent_heap_start = GetPhysicalAddress(heap_base_);
@@ -1982,6 +1982,13 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
     return false;
   }
   *out_address = address;
+  heap_lock.unlock();
+  if (global_lock.owns_lock()) {
+    global_lock.unlock();
+  }
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateGpuCopies(address, size);
+  }
   return true;
 }
 
@@ -1994,7 +2001,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  std::unique_lock<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
   // NOTE: this can potentially overwrite heap contents if there are already
@@ -2015,6 +2022,13 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
     return false;
   }
 
+  heap_lock.unlock();
+  if (global_lock.owns_lock()) {
+    global_lock.unlock();
+  }
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateGpuCopies(address, size);
+  }
   return true;
 }
 
@@ -2030,7 +2044,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  std::unique_lock<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
   low_address = std::max(heap_base_, low_address);
@@ -2053,6 +2067,13 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
     return false;
   }
   *out_address = address;
+  heap_lock.unlock();
+  if (global_lock.owns_lock()) {
+    global_lock.unlock();
+  }
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateGpuCopies(address, size);
+  }
   return true;
 }
 
@@ -2108,6 +2129,7 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance.
   if (protect & memory::kMemoryProtectWrite) {
+    InvalidateGpuCopies(address, size);
     TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
   }
 
@@ -2117,6 +2139,16 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   }
 
   return BaseHeap::Protect(address, size, protect);
+}
+
+// The GPU can read a range while the guest has it free or read-only, and such
+// pages are not write-watched, so its copy is dropped once the guest can write.
+void PhysicalHeap::InvalidateGpuCopies(uint32_t address, uint32_t size) {
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t physical_address = GetPhysicalAddress(address);
+  for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
+    invalidation_callback->first(invalidation_callback->second, physical_address, size, true);
+  }
 }
 
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
