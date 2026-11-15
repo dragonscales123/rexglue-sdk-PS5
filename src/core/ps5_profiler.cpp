@@ -312,6 +312,17 @@ void Dump(int fd, double seconds) {
       previous_gpu[k] = gpu_now[k];
     }
     write(fd, header, size_t(n));
+    if (const uint64_t marks = counters_now.gpu_phase_marks.exchange(0)) {
+      double ms[Counters::kGpuPhases];
+      for (int k = 0; k < Counters::kGpuPhases; ++k) {
+        ms[k] = double(counters_now.gpu_phase_ns[k].exchange(0)) * inv / 1e6;
+      }
+      n = snprintf(header, sizeof(header),
+                   "gpu-phases/s (ms): draw %.1f, dispatch %.1f, copy/clear %.1f, barrier %.1f, "
+                   "render-pass %.1f, upload %.1f | marks %.0f\n",
+                   ms[1], ms[2], ms[3], ms[4], ms[5], ms[0], double(marks) * inv);
+      write(fd, header, size_t(n));
+    }
   }
 
   size_t shown = 0;

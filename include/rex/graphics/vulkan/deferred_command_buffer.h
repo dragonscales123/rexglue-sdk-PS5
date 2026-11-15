@@ -32,8 +32,16 @@ class DeferredCommandBuffer {
   void Execute(VkCommandBuffer command_buffer) { ExecuteStream(command_stream_, command_buffer); }
   // Records a command stream taken out with SwapStream (possibly on another
   // thread - only the device functions are used).
+  // Optional GPU phase timing while replaying: Mark is called before a
+  // command whose kind (see ps5prof::Counters::gpu_phase_ns) differs from the
+  // previous command's.
+  class PhaseMarker {
+   public:
+    virtual ~PhaseMarker() = default;
+    virtual void Mark(VkCommandBuffer command_buffer, int phase) = 0;
+  };
   void ExecuteStream(const std::vector<uintmax_t>& command_stream,
-                     VkCommandBuffer command_buffer) const;
+                     VkCommandBuffer command_buffer, PhaseMarker* marker = nullptr) const;
   // Exchanges the recorded commands with `stream`, so a finished stream can be
   // executed elsewhere while recording continues into the other storage.
   void SwapStream(std::vector<uintmax_t>& stream) { command_stream_.swap(stream); }

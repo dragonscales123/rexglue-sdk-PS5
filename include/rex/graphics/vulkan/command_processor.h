@@ -657,6 +657,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t gpu_timestamp_slot_ = 0;
   bool gpu_timestamp_slot_used_[kGpuTimestampSlots] = {};
   void ReadGpuTimestampSlot(uint32_t slot);
+  // GPU phase timing (REX_GPU_PHASES=1): up to kGpuPhaseMarks timestamps per
+  // submission where the replayed stream changes kind of work, same ring.
+  static constexpr uint32_t kGpuPhaseMarks = 128;
+  VkQueryPool gpu_phase_pool_ = VK_NULL_HANDLE;
+  bool gpu_phase_pool_failed_ = false;
+  uint8_t gpu_phase_kinds_[kGpuTimestampSlots][kGpuPhaseMarks] = {};
+  uint16_t gpu_phase_counts_[kGpuTimestampSlots] = {};
+  void ReadGpuPhaseSlot(uint32_t slot);
   DeferredCommandBuffer deferred_command_buffer_;
   DeferredCommandBuffer upload_command_buffer_;
 

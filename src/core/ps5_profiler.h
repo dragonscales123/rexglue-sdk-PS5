@@ -59,6 +59,13 @@ struct Counters {
   std::atomic<uint64_t> gpu_timed_submits{0};
   std::atomic<uint64_t> gpu_untimed_submits{0};
   std::atomic<uint64_t> gpu_longest_submit_ns{0};
+  // GPU time by kind of work (REX_GPU_PHASES=1): timestamps where the replayed
+  // command stream switches between kinds; each span goes to the kind that
+  // started it. 0 upload stream, 1 draws, 2 compute dispatches, 3 copies and
+  // clears, 4 pipeline barriers, 5 render pass begin/end.
+  static constexpr int kGpuPhases = 6;
+  std::atomic<uint64_t> gpu_phase_ns[kGpuPhases] = {};
+  std::atomic<uint64_t> gpu_phase_marks{0};
   // Registers found different in the draw encoding register file copy check.
   std::atomic<uint64_t> encode_register_mismatches{0};  // since the last profile interval
 };

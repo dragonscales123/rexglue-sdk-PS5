@@ -6692,8 +6692,65 @@ VkResult VulkanCommandProcessor::RecordAndSubmit(
                             gpu_timestamp_pool_, timestamp_slot * 2);
   }
 #endif
-  upload_command_buffer_.ExecuteStream(upload_stream, command_buffer.buffer);
-  deferred_command_buffer_.ExecuteStream(deferred_stream, command_buffer.buffer);
+  // GPU phase markers (REX_GPU_PHASES=1, PS5 profiler).
+  struct PhaseMarker final : DeferredCommandBuffer::PhaseMarker {
+    const ui::vulkan::VulkanDevice::Functions* dfn = nullptr;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    uint32_t first_query = 0;
+    uint8_t* kinds = nullptr;
+    uint16_t count = 0;
+    void Mark(VkCommandBuffer cb, int phase) override {
+      if (count + 1 >= kGpuPhaseMarks) {
+        return;  // keep the last query for the end timestamp
+      }
+      dfn->vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, first_query + count);
+      kinds[count++] = uint8_t(phase);
+    }
+  };
+  PhaseMarker phase_marker;
+  PhaseMarker* phase_marker_ptr = nullptr;
+#if REX_PLATFORM_PS5
+  static const bool gpu_phases_enabled = [] {
+    const char* env = std::getenv("REX_GPU_PHASES");
+    return env && *env && *env != '0';
+  }();
+  if (gpu_phases_enabled && timestamp_slot != UINT32_MAX) {
+    if (gpu_phase_pool_ == VK_NULL_HANDLE && !gpu_phase_pool_failed_) {
+      VkQueryPoolCreateInfo pool_info = {};
+      pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+      pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      pool_info.queryCount = kGpuTimestampSlots * kGpuPhaseMarks;
+      if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_phase_pool_) != VK_SUCCESS) {
+        gpu_phase_pool_ = VK_NULL_HANDLE;
+        gpu_phase_pool_failed_ = true;
+        REXGPU_WARN("VulkanCommandProcessor: failed to create the GPU phase query pool");
+      }
+    }
+    if (gpu_phase_pool_ != VK_NULL_HANDLE) {
+      if (gpu_phase_counts_[timestamp_slot]) {
+        ReadGpuPhaseSlot(timestamp_slot);
+      }
+      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_phase_pool_,
+                              timestamp_slot * kGpuPhaseMarks, kGpuPhaseMarks);
+      phase_marker.dfn = &dfn;
+      phase_marker.pool = gpu_phase_pool_;
+      phase_marker.first_query = timestamp_slot * kGpuPhaseMarks;
+      phase_marker.kinds = gpu_phase_kinds_[timestamp_slot];
+      phase_marker.Mark(command_buffer.buffer, 0);
+      phase_marker_ptr = &phase_marker;
+    }
+  }
+#endif
+  upload_command_buffer_.ExecuteStream(upload_stream, command_buffer.buffer, phase_marker_ptr);
+  if (phase_marker_ptr) {
+    phase_marker.Mark(command_buffer.buffer, 0);
+  }
+  deferred_command_buffer_.ExecuteStream(deferred_stream, command_buffer.buffer, phase_marker_ptr);
+  if (phase_marker_ptr) {
+    dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            phase_marker.pool, phase_marker.first_query + phase_marker.count);
+    gpu_phase_counts_[timestamp_slot] = uint16_t(phase_marker.count + 1);
+  }
   if (timestamp_slot != UINT32_MAX) {
     dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             gpu_timestamp_pool_, timestamp_slot * 2 + 1);
@@ -6722,6 +6779,42 @@ VkResult VulkanCommandProcessor::RecordAndSubmit(
   rex::ps5prof::counters().queue_submits.fetch_add(1, std::memory_order_relaxed);
 #endif
   return result;
+}
+
+void VulkanCommandProcessor::ReadGpuPhaseSlot(uint32_t slot) {
+#if REX_PLATFORM_PS5
+  const uint32_t count = gpu_phase_counts_[slot];
+  gpu_phase_counts_[slot] = 0;
+  if (count < 2) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  uint64_t results[kGpuPhaseMarks * 2] = {};
+  const VkResult result = dfn.vkGetQueryPoolResults(
+      vulkan_device->device(), gpu_phase_pool_, slot * kGpuPhaseMarks, count, sizeof(results),
+      results, sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+  if (result != VK_SUCCESS && result != VK_NOT_READY) {
+    return;
+  }
+  auto& counters = rex::ps5prof::counters();
+  const double period = double(vulkan_device->properties().timestampPeriod);
+  for (uint32_t i = 0; i + 1 < count; ++i) {
+    const uint64_t* a = results + i * 2;
+    const uint64_t* b = results + (i + 1) * 2;
+    if (!a[1] || !b[1] || b[0] < a[0]) {
+      continue;
+    }
+    const uint32_t kind = gpu_phase_kinds_[slot][i];
+    if (kind < rex::ps5prof::Counters::kGpuPhases) {
+      counters.gpu_phase_ns[kind].fetch_add(uint64_t(double(b[0] - a[0]) * period),
+                                            std::memory_order_relaxed);
+    }
+  }
+  counters.gpu_phase_marks.fetch_add(count, std::memory_order_relaxed);
+#else
+  (void)slot;
+#endif
 }
 
 void VulkanCommandProcessor::ReadGpuTimestampSlot(uint32_t slot) {

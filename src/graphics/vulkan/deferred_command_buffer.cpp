@@ -33,7 +33,9 @@ void DeferredCommandBuffer::Reset() {
 }
 
 void DeferredCommandBuffer::ExecuteStream(const std::vector<uintmax_t>& command_stream,
-                                          VkCommandBuffer command_buffer) const {
+                                          VkCommandBuffer command_buffer,
+                                          PhaseMarker* marker) const {
+  int current_phase = -1;
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -46,6 +48,40 @@ void DeferredCommandBuffer::ExecuteStream(const std::vector<uintmax_t>& command_
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
+
+    if (marker) {
+      int phase = -1;
+      switch (header.command) {
+        case Command::kVkDraw:
+        case Command::kVkDrawIndexed:
+        case Command::kVkClearAttachments:
+          phase = 1;
+          break;
+        case Command::kVkDispatch:
+          phase = 2;
+          break;
+        case Command::kVkCopyBuffer:
+        case Command::kVkCopyBufferToImage:
+        case Command::kVkClearColorImage:
+          phase = 3;
+          break;
+        case Command::kVkPipelineBarrier:
+          phase = 4;
+          break;
+        case Command::kVkBeginRenderPass:
+        case Command::kVkEndRenderPass:
+        case Command::kVkBeginRendering:
+        case Command::kVkEndRendering:
+          phase = 5;
+          break;
+        default:
+          break;
+      }
+      if (phase >= 0 && phase != current_phase) {
+        marker->Mark(command_buffer, phase);
+        current_phase = phase;
+      }
+    }
 
     switch (header.command) {
       case Command::kVkBeginRenderPass: {
