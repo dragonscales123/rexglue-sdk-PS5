@@ -17,6 +17,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -1142,8 +1145,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // Diagnostic: which waits come how often and how many are already
+  // satisfied at the first poll (logged every 10 s).
+  uint32_t diag_polls = 0;
   bool matched = false;
   do {
+    ++diag_polls;
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1231,6 +1238,35 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  {
+    struct DiagEntry {
+      uint64_t count = 0;
+      uint64_t immediate = 0;
+      uint32_t last_ref = 0, last_mask = 0;
+    };
+    static std::unordered_map<uint64_t, DiagEntry> diag_entries;
+    static auto diag_last = std::chrono::steady_clock::now();
+    DiagEntry& entry = diag_entries[(uint64_t(wait_info & 0x17) << 32) | poll_reg_addr];
+    ++entry.count;
+    entry.immediate += diag_polls == 1;
+    entry.last_ref = ref;
+    entry.last_mask = mask;
+    const auto diag_now = std::chrono::steady_clock::now();
+    if (diag_now - diag_last >= std::chrono::seconds(10)) {
+      diag_last = diag_now;
+      std::vector<std::pair<uint64_t, DiagEntry>> sorted(diag_entries.begin(), diag_entries.end());
+      std::sort(sorted.begin(), sorted.end(),
+                [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+      for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+        REXGPU_INFO("[wrm-diag] info={:02X} addr={:08X} count={} immediate={} ref={:08X} mask={:08X}",
+                    uint32_t(sorted[i].first >> 32), uint32_t(sorted[i].first),
+                    sorted[i].second.count, sorted[i].second.immediate, sorted[i].second.last_ref,
+                    sorted[i].second.last_mask);
+      }
+      diag_entries.clear();
+    }
+  }
 
   return true;
 }
