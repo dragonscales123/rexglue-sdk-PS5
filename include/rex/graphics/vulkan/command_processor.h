@@ -290,6 +290,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  void PrepareForWait() override;
   void OnGuestSyncPoint(GuestSyncPoint kind) override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -980,9 +981,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   // for a free slot against it doesn't pull the tail's cache line from the
   // encoding thread for every draw.
   uint64_t encode_ring_tail_cached_ = 0;
+  // Packets prepared (the preparation's view of the head). encode_ring_head_
+  // is published in batches of kEncodePublishBatch - each publish is a full
+  // barrier taking the head's cache line from the spinning encoding thread -
+  // and before the preparation waits for anything (PublishEncodeRing).
+  uint64_t encode_ring_head_prepared_ = 0;
+  static constexpr uint64_t kEncodePublishBatch = 4;
+  void PublishEncodeRing();
   bool IsEncodeRingEmpty() const {
-    return encode_ring_tail_.load(std::memory_order_acquire) ==
-           encode_ring_head_.load(std::memory_order_acquire);
+    return encode_ring_tail_.load(std::memory_order_acquire) == encode_ring_head_prepared_;
   }
   bool encoding_ = false;
   std::atomic<bool> encode_end_submission_requested_{false};
