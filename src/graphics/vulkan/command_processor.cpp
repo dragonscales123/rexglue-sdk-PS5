@@ -2004,6 +2004,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   encode_ring_tail_cached_ = 0;
   encode_ring_head_prepared_ = 0;
   encode_packet_preparing_ = nullptr;
+  texture_memo_.valid = false;
   AwaitAllQueueOperationsCompletion();
   StopSubmitThread();
   InvalidateAllVertexBufferResidency();
@@ -4691,30 +4692,45 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // resolution scaling, host swizzle) and the descriptor image infos (image
   // views of both stages, then samplers).
   {
-    packet.textures_resolution_scaled = 0;
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      packet.texture_swizzled_signs[texture_index] =
-          texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
-      packet.textures_resolution_scaled |=
-          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index))
-          << texture_index;
-      if (!device_properties.imageViewFormatSwizzle) {
-        packet.texture_host_swizzles[texture_index] =
-            texture_cache_->GetActiveTextureHostSwizzle(texture_index);
+    const VulkanShader* memo_shaders[2] = {vertex_shader, pixel_shader};
+    TextureMemo& memo = texture_memo_;
+    const uint64_t bindings_generation = texture_cache_->texture_bindings_generation();
+    if (!memo.valid || memo.shaders[0] != memo_shaders[0] || memo.shaders[1] != memo_shaders[1] ||
+        memo.bindings_generation != bindings_generation ||
+        memo.used_texture_mask != used_texture_mask ||
+        memo.image_infos[0].size() !=
+            (memo_shaders[0] ? memo_shaders[0]->GetTextureBindingsAfterTranslation().size() : 0) ||
+        memo.image_infos[1].size() !=
+            (memo_shaders[1] ? memo_shaders[1]->GetTextureBindingsAfterTranslation().size() : 0)) {
+      memo.valid = true;
+      memo.shaders[0] = memo_shaders[0];
+      memo.shaders[1] = memo_shaders[1];
+      memo.bindings_generation = bindings_generation;
+      memo.used_texture_mask = used_texture_mask;
+      memo.textures_resolution_scaled = 0;
+      uint32_t textures_remaining = used_texture_mask;
+      uint32_t texture_index;
+      while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+        textures_remaining &= ~(UINT32_C(1) << texture_index);
+        memo.texture_swizzled_signs[texture_index] =
+            texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
+        memo.textures_resolution_scaled |=
+            uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index))
+            << texture_index;
+        if (!device_properties.imageViewFormatSwizzle) {
+          memo.texture_host_swizzles[texture_index] =
+              texture_cache_->GetActiveTextureHostSwizzle(texture_index);
+        }
       }
-    }
-    std::vector<VkDescriptorImageInfo>& image_infos = packet.image_infos;
-    image_infos.clear();
-    for (uint32_t j = 0; j < 2; ++j) {
-      const VulkanShader* shader = j ? pixel_shader : vertex_shader;
-      packet.image_info_texture_offsets[j] = image_infos.size();
-      if (shader) {
+      for (uint32_t j = 0; j < 2; ++j) {
+        std::vector<VkDescriptorImageInfo>& stage_infos = memo.image_infos[j];
+        stage_infos.clear();
+        if (!memo_shaders[j]) {
+          continue;
+        }
         for (const VulkanShader::TextureBinding& texture_binding :
-             shader->GetTextureBindingsAfterTranslation()) {
-          VkDescriptorImageInfo& descriptor_image_info = image_infos.emplace_back();
+             memo_shaders[j]->GetTextureBindingsAfterTranslation()) {
+          VkDescriptorImageInfo& descriptor_image_info = stage_infos.emplace_back();
           descriptor_image_info.sampler = VK_NULL_HANDLE;
           descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
               texture_binding.fetch_constant, texture_binding.dimension,
@@ -4724,6 +4740,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                   : VK_IMAGE_LAYOUT_UNDEFINED;
         }
       }
+    }
+    packet.textures_resolution_scaled = memo.textures_resolution_scaled;
+    std::memcpy(packet.texture_swizzled_signs, memo.texture_swizzled_signs,
+                sizeof(packet.texture_swizzled_signs));
+    if (!device_properties.imageViewFormatSwizzle) {
+      std::memcpy(packet.texture_host_swizzles, memo.texture_host_swizzles,
+                  sizeof(packet.texture_host_swizzles));
+    }
+    std::vector<VkDescriptorImageInfo>& image_infos = packet.image_infos;
+    image_infos.clear();
+    for (uint32_t j = 0; j < 2; ++j) {
+      const VulkanShader* shader = j ? pixel_shader : vertex_shader;
+      packet.image_info_texture_offsets[j] = image_infos.size();
+      image_infos.insert(image_infos.end(), memo.image_infos[j].begin(), memo.image_infos[j].end());
       packet.image_info_sampler_offsets[j] = image_infos.size();
       if (shader && !shader->GetSamplerBindingsAfterTranslation().empty()) {
         for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :

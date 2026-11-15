@@ -1183,6 +1183,21 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Texture fetch constant slots changed since each stage's samplers were built.
   uint32_t sampler_fetch_dirty_[2] = {UINT32_MAX, UINT32_MAX};
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
+  // The texture state given to the previous draw's packet (signs, resolution
+  // scaling, host swizzles, image views per stage), reused while the shaders
+  // and the texture cache's bindings (texture_bindings_generation) are the
+  // same - instead of asking the texture cache texture by texture.
+  struct TextureMemo {
+    bool valid = false;
+    const VulkanShader* shaders[2] = {};
+    uint64_t bindings_generation = 0;
+    uint32_t used_texture_mask = 0;
+    uint32_t textures_resolution_scaled = 0;
+    uint8_t texture_swizzled_signs[32] = {};
+    uint32_t texture_host_swizzles[32] = {};
+    std::vector<VkDescriptorImageInfo> image_infos[2];
+  };
+  TextureMemo texture_memo_;
 
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
