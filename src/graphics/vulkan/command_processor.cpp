@@ -53,6 +53,10 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(vulkan_readback_memexport_fast_submit, true, "GPU/Vulkan",
+                    "End the submission right after a fast memexport readback copy, so the GPU "
+                    "starts it at once and the next memexport draw (which reads it back) "
+                    "waits less.");
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -5635,6 +5639,10 @@ bool VulkanCommandProcessor::TryPrepareMemexportReadbackFast(uint32_t total_size
   readback.written_size[write_index] = total_size;
   EndPrepRecording(&encode_packet_preparing_->prep_commands);
   encode_packet_preparing_->has_draw = false;
+  if (REXCVAR_GET(vulkan_readback_memexport_fast_submit)) {
+    // QueueEncodeDrawPacket then drains and ends the submission.
+    encode_end_submission_requested_.store(true, std::memory_order_relaxed);
+  }
   QueueEncodeDrawPacket();
 
   // The previous copy to the guest.
