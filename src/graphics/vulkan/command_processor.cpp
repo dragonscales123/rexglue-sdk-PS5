@@ -53,7 +53,7 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
-REXCVAR_DEFINE_BOOL(vulkan_readback_memexport_fast_submit, true, "GPU/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_readback_memexport_fast_submit, false, "GPU/Vulkan",
                     "End the submission right after a fast memexport readback copy (for readback "
                     "buffers that have made the next memexport draw wait), so the GPU starts it "
                     "at once and the next memexport draw (which reads it back) waits less.");
