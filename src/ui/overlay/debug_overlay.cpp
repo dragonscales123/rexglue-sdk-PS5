@@ -34,6 +34,17 @@ REXCVAR_DEFINE_BOOL(debug_overlay_compact, false, "UI",
 
 namespace rex::ui {
 
+namespace {
+std::string& BuildLabel() {
+  static std::string label;
+  return label;
+}
+}  // namespace
+
+void SetDebugOverlayBuildLabel(std::string label) {
+  BuildLabel() = std::move(label);
+}
+
 DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProvider stats_provider)
     : ImGuiDialog(imgui_drawer), stats_provider_(std::move(stats_provider)) {}
 
@@ -66,6 +77,9 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
       if (stats.frame_count > 0) {
         ImGui::Text("Guest: %.1f FPS (%.2f ms)", stats.fps, stats.frame_time_ms);
       }
+    }
+    if (!BuildLabel().empty()) {
+      ImGui::TextUnformatted(BuildLabel().c_str());
     }
     DrawPs5Stats();
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -151,6 +165,9 @@ void DebugOverlayDialog::DrawCompact(ImGuiIO& io) {
       ImGui::Text("%.1f FPS  %.1f ms", stats.fps, stats.frame_time_ms);
     } else {
       ImGui::TextUnformatted("-- FPS");
+    }
+    if (!BuildLabel().empty()) {
+      ImGui::TextUnformatted(BuildLabel().c_str());
     }
 #if REX_PLATFORM_PS5
     SamplePs5Stats();

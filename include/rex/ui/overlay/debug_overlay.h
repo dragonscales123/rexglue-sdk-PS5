@@ -10,6 +10,8 @@
  *              See LICENSE file in the project root for full license text.
  */
 #pragma once
+
+#include <string>
 #include <rex/ui/imgui_dialog.h>
 #include <array>
 #include <cstdint>
@@ -22,6 +24,9 @@ struct FrameStats {
   double fps = 0;
   uint64_t frame_count = 0;
 };
+
+// Text the debug overlay shows under the frame rate (e.g. the app's build id).
+void SetDebugOverlayBuildLabel(std::string label);
 
 class DebugOverlayDialog : public ImGuiDialog {
  public:
