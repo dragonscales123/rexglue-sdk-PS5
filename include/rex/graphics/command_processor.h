@@ -277,6 +277,9 @@ class CommandProcessor {
   Shader* active_pixel_shader_ = nullptr;
 
   bool paused_ = false;
+  // The last WAIT_REG_MEM polled COHER_STATUS_HOST (a GPU cache coherency
+  // request from the command stream, not a wait for the CPU).
+  bool last_wait_was_coherency_ = false;
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.

@@ -42,6 +42,10 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(hot_page_epoch_on_coherency_waits, true, "GPU",
+                    "Start a new hot page check epoch at WAIT_REG_MEMs on COHER_STATUS_HOST "
+                    "(GPU cache coherency requests). Off: only other waits, batches, "
+                    "interrupts and swaps start one (experimental).");
 
 REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
                      "Host guest-frame swap limit in FPS (0 = unlimited). "
@@ -733,6 +737,33 @@ void CommandProcessor::MakeCoherent() {
     action = "VC";
   }
 
+  {
+    // Diagnostic: what the coherency requests cover (units of base/size).
+    static uint32_t diag_logged = 0;
+    static uint64_t diag_count = 0, diag_size_sum = 0;
+    static uint32_t diag_min_base = UINT32_MAX, diag_max_base = 0, diag_max_size = 0;
+    static auto diag_last = std::chrono::steady_clock::now();
+    if (diag_logged < 24) {
+      ++diag_logged;
+      REXGPU_INFO("[coher-diag] status={:08X} base={:08X} size={:08X}",
+                  uint32_t(regs_volatile[XE_GPU_REG_COHER_STATUS_HOST]), base_host, size_host);
+    }
+    ++diag_count;
+    diag_size_sum += size_host;
+    diag_min_base = std::min(diag_min_base, base_host);
+    diag_max_base = std::max(diag_max_base, base_host);
+    diag_max_size = std::max(diag_max_size, size_host);
+    const auto diag_now = std::chrono::steady_clock::now();
+    if (diag_now - diag_last >= std::chrono::seconds(10)) {
+      diag_last = diag_now;
+      REXGPU_INFO("[coher-diag] 10 s: {} requests, size avg {} max {:08X}, base {:08X}..{:08X}",
+                  diag_count, diag_count ? diag_size_sum / diag_count : 0, diag_max_size,
+                  diag_min_base, diag_max_base);
+      diag_count = diag_size_sum = 0;
+      diag_min_base = UINT32_MAX;
+      diag_max_base = diag_max_size = 0;
+    }
+  }
   // TODO(benvanik): notify resource cache of base->size and type.
   REXGPU_TRACE("Make {:08X} -> {:08X} ({}b) coherent, action = {}", base_host,
                base_host + size_host, size_host, action);
@@ -1025,7 +1056,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   }
   switch (opcode) {
     case PM4_WAIT_REG_MEM:
-      OnGuestSyncPoint(GuestSyncPoint::kWait);
+      if (!last_wait_was_coherency_ || REXCVAR_GET(hot_page_epoch_on_coherency_waits)) {
+        OnGuestSyncPoint(GuestSyncPoint::kWait);
+      }
       break;
     case PM4_INTERRUPT:
       OnGuestSyncPoint(GuestSyncPoint::kInterrupt);
@@ -1144,6 +1177,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  last_wait_was_coherency_ = !is_memory && poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST;
 
   // Diagnostic: which waits come how often and how many are already
   // satisfied at the first poll (logged every 10 s).
