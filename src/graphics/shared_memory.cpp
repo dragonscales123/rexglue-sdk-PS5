@@ -430,8 +430,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
                         page_bytes);
             // The whole page equals guest memory as of now.
             shadow.verified_epoch = hot_check_epoch_;
-            shadow.verified_begin = 0;
-            shadow.verified_end = uint32_t(page_bytes);
+            shadow.verified_lines = UINT64_MAX;
           }
 #if REX_PLATFORM_PS5
           rex::ps5prof::counters().hot_page_bytes.fetch_add(
@@ -563,6 +562,8 @@ void SharedMemory::FilterUnchangedHotPages(
     return;
   }
   const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+  // A page is checked in 64 lines.
+  const uint32_t line_shift = page_size_log2_ - 6;
   const bool use_epochs = REXCVAR_GET(shared_memory_hot_page_check_epochs);
   const uint32_t epoch = hot_check_epoch_;
   uint64_t compared_bytes = 0;
@@ -594,8 +595,7 @@ void SharedMemory::FilterUnchangedHotPages(
           const uint8_t* guest = memory().TranslatePhysical(page_start);
           if (!use_epochs || shadow.verified_epoch != epoch) {
             shadow.verified_epoch = epoch;
-            shadow.verified_begin = 0;
-            shadow.verified_end = 0;
+            shadow.verified_lines = 0;
           }
           for (size_t r = range_index; r < byte_ranges.size() && unchanged; ++r) {
             if (byte_ranges[r].first >= page_end) {
@@ -608,24 +608,64 @@ void SharedMemory::FilterUnchangedHotPages(
             if (start >= end) {
               continue;
             }
-            if (start >= shadow.verified_begin && end <= shadow.verified_end) {
-              // Already found equal since the last synchronization point.
-              skipped_bytes += end - start;
+            // Lines entirely within the request are compared whole and marked
+            // as verified; the partial lines at the ends, only the requested
+            // bytes (unless the whole line is verified already), so bytes the
+            // request doesn't use never cause an upload.
+            const uint32_t line_bytes = uint32_t(1) << line_shift;
+            auto compare = [&](uint32_t offset, uint32_t length) {
+              compared_bytes += length;
+              return rex::memory::BytesEqual(shadow.data.get() + offset, guest + offset, length);
+            };
+            const uint32_t full_first = (start + line_bytes - 1) >> line_shift;
+            const uint32_t full_end = end >> line_shift;  // exclusive
+            if (full_first >= full_end) {
+              // Within one or two lines, no line whole.
+              const uint32_t line_a = start >> line_shift, line_b = (end - 1) >> line_shift;
+              const uint64_t lines = (uint64_t(1) << line_a) | (uint64_t(1) << line_b);
+              if ((shadow.verified_lines & lines) == lines) {
+                skipped_bytes += end - start;
+              } else {
+                unchanged = compare(start, end - start);
+              }
               continue;
             }
-            compared_bytes += end - start;
-            unchanged = rex::memory::BytesEqual(shadow.data.get() + start, guest + start,
-                                                end - start);
-            if (unchanged) {
-              if (start <= shadow.verified_end && end >= shadow.verified_begin &&
-                  shadow.verified_end > shadow.verified_begin) {
-                // Overlapping or adjacent: grow the verified span.
-                shadow.verified_begin = std::min(shadow.verified_begin, start);
-                shadow.verified_end = std::max(shadow.verified_end, end);
-              } else if (end - start > shadow.verified_end - shadow.verified_begin) {
-                shadow.verified_begin = start;
-                shadow.verified_end = end;
+            const uint32_t head_end = full_first << line_shift;
+            const uint32_t tail_start = full_end << line_shift;
+            if (start < head_end) {
+              if ((shadow.verified_lines >> (start >> line_shift)) & 1) {
+                skipped_bytes += head_end - start;
+              } else if (!compare(start, head_end - start)) {
+                unchanged = false;
+                continue;
               }
+            }
+            if (tail_start < end) {
+              if ((shadow.verified_lines >> full_end) & 1) {
+                skipped_bytes += end - tail_start;
+              } else if (!compare(tail_start, end - tail_start)) {
+                unchanged = false;
+                continue;
+              }
+            }
+            const uint64_t request_lines =
+                (full_end >= 64 ? UINT64_MAX : (uint64_t(1) << full_end) - 1) &
+                ~((uint64_t(1) << full_first) - 1);
+            uint64_t needed = request_lines & ~shadow.verified_lines;
+            skipped_bytes += uint64_t(std::popcount(request_lines & shadow.verified_lines))
+                             << line_shift;
+            while (needed) {
+              const uint32_t run_first = uint32_t(std::countr_zero(needed));
+              const uint32_t run_count = uint32_t(std::countr_one(needed >> run_first));
+              const uint64_t run_bits = (run_count >= 64 ? UINT64_MAX
+                                                         : (uint64_t(1) << run_count) - 1)
+                                        << run_first;
+              needed &= ~run_bits;
+              if (!compare(run_first << line_shift, run_count << line_shift)) {
+                unchanged = false;
+                break;
+              }
+              shadow.verified_lines |= run_bits;
             }
           }
           if (unchanged) {

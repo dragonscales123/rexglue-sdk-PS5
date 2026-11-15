@@ -209,12 +209,12 @@ class SharedMemory {
   // render pass).
   struct HotPageShadow {
     std::unique_ptr<uint8_t[]> data;
-    // Bytes [verified_begin, verified_end) of the page were found equal to
-    // guest memory (or snapshotted) during check epoch verified_epoch, so
-    // requests in the same epoch skip comparing them again.
+    // The 1/64 parts of the page (bit i = bytes [i, i + 1) * page size / 64)
+    // found equal to guest memory (or snapshotted) during check epoch
+    // verified_epoch, so requests in the same epoch skip comparing them again
+    // - however scattered the requested bytes of the page are.
     uint32_t verified_epoch = 0;
-    uint32_t verified_begin = 0;
-    uint32_t verified_end = 0;
+    uint64_t verified_lines = 0;
   };
   std::unordered_map<uint32_t, HotPageShadow> hot_page_shadows_;
   // Advanced at every point where the guest CPU may legitimately have changed
