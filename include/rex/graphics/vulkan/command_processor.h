@@ -969,10 +969,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   // the encoding is idle.
   static constexpr uint64_t kEncodeRingSize = 128;
   std::unique_ptr<EncodeDrawPacket[]> encode_ring_;
-  std::atomic<uint64_t> encode_ring_head_{0};
-  std::atomic<uint64_t> encode_ring_tail_{0};
+  // Head (written by the preparation) and tail (written by the encoding) on
+  // cache lines of their own, away from the fields either thread writes for
+  // every draw, so each publish moves one line instead of several.
+  alignas(64) std::atomic<uint64_t> encode_ring_head_{0};
+  alignas(64) std::atomic<uint64_t> encode_ring_tail_{0};
   // The slot IssueDraw is preparing (from AcquireEncodeDrawPacket), or null.
-  EncodeDrawPacket* encode_packet_preparing_ = nullptr;
+  alignas(64) EncodeDrawPacket* encode_packet_preparing_ = nullptr;
+  // The preparation's last seen tail (never ahead of the real one): checking
+  // for a free slot against it doesn't pull the tail's cache line from the
+  // encoding thread for every draw.
+  uint64_t encode_ring_tail_cached_ = 0;
   bool IsEncodeRingEmpty() const {
     return encode_ring_tail_.load(std::memory_order_acquire) ==
            encode_ring_head_.load(std::memory_order_acquire);
@@ -1088,7 +1095,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
   };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
+  // (Cache line alignment here and below: preparation-thread and
+  // encoding-thread fields don't share lines.)
+  alignas(64) std::array<VertexBufferState, 96> vertex_buffer_states_{};
   uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
@@ -1122,7 +1131,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // binding any pipeline to the bind point with static state (even if it's
   // unused, like depth bias being disabled, but the values themselves still not
   // declared as dynamic in the pipeline) invalidates such dynamic state.
-  VkViewport dynamic_viewport_;
+  alignas(64) VkViewport dynamic_viewport_;
   VkRect2D dynamic_scissor_;
   // Dynamic fixed-function depth bias, blend constants, stencil state are
   // applicable only to the render target implementations where they are
@@ -1168,7 +1177,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
   // but in_render_pass_ is true.
-  VkRenderPass current_render_pass_;
+  alignas(64) VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
 
@@ -1214,7 +1223,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   SpirvShaderTranslator::SystemConstants system_constants_;
 
   // Temporary storage for memexport stream constants used in the draw.
-  std::vector<draw_util::MemExportRange> memexport_ranges_;
+  alignas(64) std::vector<draw_util::MemExportRange> memexport_ranges_;
 };
 
 }  // namespace rex::graphics::vulkan

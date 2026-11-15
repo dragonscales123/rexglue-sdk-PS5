@@ -1997,6 +1997,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   StopEncodeThread();
   encode_ring_head_.store(0);
   encode_ring_tail_.store(0);
+  encode_ring_tail_cached_ = 0;
   encode_packet_preparing_ = nullptr;
   AwaitAllQueueOperationsCompletion();
   StopSubmitThread();
@@ -3692,10 +3693,15 @@ void VulkanCommandProcessor::ReleaseEncodeDrawPacket() {
 
 void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
   auto ready = [this, max_waiting]() {
-    return encode_ring_head_.load(std::memory_order_relaxed) -
-               encode_ring_tail_.load(std::memory_order_acquire) <
+    encode_ring_tail_cached_ = encode_ring_tail_.load(std::memory_order_acquire);
+    return encode_ring_head_.load(std::memory_order_relaxed) - encode_ring_tail_cached_ <
            max_waiting;
   };
+  // The cached tail is never ahead of the real one, so enough room by it is
+  // enough room.
+  if (encode_ring_head_.load(std::memory_order_relaxed) - encode_ring_tail_cached_ < max_waiting) {
+    return;
+  }
   if (ready()) {
     return;
   }
@@ -3859,12 +3865,16 @@ void VulkanCommandProcessor::EncodeThreadMain() {
 #if REX_PLATFORM_PS5
   rex::ps5prof::RegisterCurrentThread("GPU Encode");
 #endif
+  // The last seen head: packets up to it are encoded without touching the
+  // head's cache line, which the preparation writes for every draw.
+  uint64_t head_cached = encode_ring_head_.load(std::memory_order_acquire);
   while (true) {
     uint64_t tail = encode_ring_tail_.load(std::memory_order_relaxed);
-    auto has_work = [this, tail]() {
-      return encode_ring_head_.load(std::memory_order_acquire) != tail;
+    auto has_work = [this, tail, &head_cached]() {
+      head_cached = encode_ring_head_.load(std::memory_order_acquire);
+      return head_cached != tail;
     };
-    if (!has_work()) {
+    if (head_cached == tail && !has_work()) {
       // Draws come every few microseconds while a frame is being prepared -
       // spin a little before sleeping.
       bool woke = false;
@@ -3907,6 +3917,7 @@ void VulkanCommandProcessor::StartEncodeThread() {
   }
   encode_ring_head_.store(0);
   encode_ring_tail_.store(0);
+  encode_ring_tail_cached_ = 0;
   encode_packet_preparing_ = nullptr;
   encode_thread_enabled_ = REXCVAR_GET(vulkan_draw_encode_thread);
   if (!encode_thread_enabled_) {
