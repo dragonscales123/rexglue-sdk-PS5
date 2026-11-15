@@ -148,6 +148,13 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_DOUBLE(swap_sharpness, 0.0, "GPU",
+                      "Contrast-adaptive sharpening of the final image, 0 (off) to 1 (strongest). "
+                      "With swap_post_effect=fxaa, edge pixels get FXAA and the rest are "
+                      "sharpened.")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 #if REX_PLATFORM_PS5
 #include "../../core/ps5_profiler.h"
 #endif
@@ -512,6 +519,88 @@ void main() {
                   ApplyPwl(source.b, 2u), 1.0));
 }
 )";
+}
+
+// Contrast-adaptive sharpening of the final image (same bindings and push
+// constants as the FXAA pass). Each pixel is pulled away from its 4
+// neighbours by a weight that shrinks where the 3x3 neighbourhood is already
+// high-contrast or near black/white, so edges don't ring and flat areas don't
+// gain noise. With fxaa_edges, pixels that FXAA would treat as an edge get the
+// FXAA result instead and only the rest are sharpened.
+std::string GetSwapSharpenComputeSource(bool fxaa_edges, float sharpness) {
+  std::string source = R"(#version 450
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform XeApplyGammaRampConstants {
+  uvec2 xe_fxaa_size;
+  vec2 xe_fxaa_size_inv;
+};
+
+layout(set = 0, binding = 0) uniform sampler2D xe_fxaa_source;
+layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D xe_fxaa_dest;
+
+const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
+const float kEdgeThreshold = 0.166;
+const float kEdgeThresholdMin = 0.0833;
+const float kSpanMax = 8.0;
+const float kDirReduceMul = 0.125;
+const float kDirReduceMin = 1.0 / 128.0;
+)";
+  source += "const float kSharpness = " + std::to_string(std::clamp(sharpness, 0.0f, 1.0f)) + ";\n";
+  source += fxaa_edges ? "const bool kFxaaEdges = true;\n" : "const bool kFxaaEdges = false;\n";
+  source += R"(
+vec4 Fetch(ivec2 p) {
+  return texelFetch(xe_fxaa_source, clamp(p, ivec2(0), ivec2(xe_fxaa_size) - 1), 0);
+}
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, xe_fxaa_size))) {
+    return;
+  }
+  ivec2 p = ivec2(pixel);
+  vec4 a = Fetch(p + ivec2(-1, -1)), b = Fetch(p + ivec2(0, -1)), c = Fetch(p + ivec2(1, -1));
+  vec4 d = Fetch(p + ivec2(-1, 0)), e = Fetch(p), f = Fetch(p + ivec2(1, 0));
+  vec4 g = Fetch(p + ivec2(-1, 1)), h = Fetch(p + ivec2(0, 1)), i = Fetch(p + ivec2(1, 1));
+
+  if (kFxaaEdges) {
+    // FXAA edge test on the diagonal neighbours' luma (alpha), as in the FXAA pass.
+    float lumaMin = min(e.a, min(min(a.a, c.a), min(g.a, i.a)));
+    float lumaMax = max(e.a, max(max(a.a, c.a), max(g.a, i.a)));
+    if (lumaMax - lumaMin >= max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
+      vec2 uv = (vec2(pixel) + vec2(0.5)) * xe_fxaa_size_inv;
+      vec2 dir;
+      dir.x = -((a.a + c.a) - (g.a + i.a));
+      dir.y = ((a.a + g.a) - (c.a + i.a));
+      float dirReduce = max((a.a + c.a + g.a + i.a) * (0.25 * kDirReduceMul), kDirReduceMin);
+      float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+      dir = clamp(dir * rcpDirMin, vec2(-kSpanMax), vec2(kSpanMax)) * xe_fxaa_size_inv;
+      vec3 rgbA = 0.5 * (textureLod(xe_fxaa_source, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
+                         textureLod(xe_fxaa_source, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+      vec3 rgbB = rgbA * 0.5 + 0.25 * (textureLod(xe_fxaa_source, uv + dir * -0.5, 0.0).rgb +
+                                       textureLod(xe_fxaa_source, uv + dir * 0.5, 0.0).rgb);
+      float lumaB = dot(rgbB, kLumaWeights);
+      vec3 result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+      imageStore(xe_fxaa_dest, p, vec4(result, 1.0));
+      return;
+    }
+  }
+
+  // Cross and full 3x3 minimum / maximum, added (soft min / max).
+  vec3 mn = min(min(min(d.rgb, e.rgb), min(f.rgb, b.rgb)), h.rgb);
+  vec3 mx = max(max(max(d.rgb, e.rgb), max(f.rgb, b.rgb)), h.rgb);
+  mn += min(mn, min(min(a.rgb, c.rgb), min(g.rgb, i.rgb)));
+  mx += max(mx, max(max(a.rgb, c.rgb), max(g.rgb, i.rgb)));
+  // Room to sharpen before clipping, relative to the brightest value.
+  vec3 amp = clamp(min(mn, 2.0 - mx) / max(mx, vec3(1.0 / 65536.0)), 0.0, 1.0);
+  amp = sqrt(amp);
+  float peak = -1.0 / mix(8.0, 5.0, kSharpness);
+  vec3 w = amp * peak;
+  vec3 result = (b.rgb * w + d.rgb * w + f.rgb * w + h.rgb * w + e.rgb) / (1.0 + 4.0 * w);
+  imageStore(xe_fxaa_dest, p, vec4(clamp(result, 0.0, 1.0), 1.0));
+}
+)";
+  return source;
 }
 
 const char* GetSwapApplyGammaTableFxaaLumaComputeRbSwapSource() {
@@ -1943,6 +2032,32 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
+  // Sharpening variants (swap_sharpness > 0): alone, and with FXAA on edges.
+  if (REXCVAR_GET(swap_sharpness) > 0.0) {
+    for (int fxaa_edges = 0; fxaa_edges < 2; ++fxaa_edges) {
+      std::vector<uint32_t> swap_sharpen_spirv;
+      std::string swap_sharpen_compile_error;
+      if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                              GetSwapSharpenComputeSource(
+                                  fxaa_edges != 0, float(REXCVAR_GET(swap_sharpness)))
+                                  .c_str(),
+                              swap_sharpen_spirv, swap_sharpen_compile_error)) {
+        REXGPU_WARN("Failed to compile the sharpening compute shader to SPIR-V: {}",
+                    swap_sharpen_compile_error);
+        continue;
+      }
+      VkPipeline& pipeline = fxaa_edges ? swap_sharpen_fxaa_pipeline_ : swap_sharpen_pipeline_;
+      pipeline = ui::vulkan::util::CreateComputePipeline(
+          vulkan_device, swap_fxaa_pipeline_layout_, swap_sharpen_spirv.data(),
+          sizeof(uint32_t) * swap_sharpen_spirv.size());
+      if (pipeline == VK_NULL_HANDLE) {
+        REXGPU_WARN("Failed to create the sharpening compute pipeline");
+      }
+    }
+    REXGPU_INFO("Final-image sharpening {:.2f} ({})", REXCVAR_GET(swap_sharpness),
+                swap_sharpen_pipeline_ != VK_NULL_HANDLE ? "ready" : "unavailable");
+  }
+
   std::vector<uint32_t> swap_fxaa_extreme_spirv;
   std::string swap_fxaa_extreme_compile_error;
   if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, GetSwapFxaaComputeSource(true),
@@ -2065,6 +2180,9 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_sharpen_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         swap_sharpen_fxaa_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -2685,8 +2803,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         const VkDevice device = vulkan_device->device();
 
         uint32_t swap_frame_index = uint32_t(frame_current_ % kMaxFramesInFlight);
-        bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
-                        swap_post_effect == SwapPostEffect::kFxaaExtreme;
+        const bool fxaa_requested = swap_post_effect == SwapPostEffect::kFxaa ||
+                                    swap_post_effect == SwapPostEffect::kFxaaExtreme;
+        // Sharpening runs as the FXAA pass (same intermediate image and
+        // layout), with FXAA on edge pixels when FXAA is also requested.
+        const VkPipeline sharpen_pipeline =
+            fxaa_requested ? swap_sharpen_fxaa_pipeline_ : swap_sharpen_pipeline_;
+        bool use_fxaa = fxaa_requested || sharpen_pipeline != VK_NULL_HANDLE;
 
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for
@@ -3051,7 +3174,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             deferred_command_buffer_.CmdVkPushConstants(
                 swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(swap_fxaa_constants), &swap_fxaa_constants);
-            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
+            BindExternalComputePipeline(sharpen_pipeline != VK_NULL_HANDLE ? sharpen_pipeline
+                                        : swap_post_effect == SwapPostEffect::kFxaaExtreme
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
