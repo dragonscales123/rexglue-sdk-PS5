@@ -501,6 +501,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t written_size[kReadbackSlots] = {};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // The fast memexport readback had to wait for the GPU with this buffer -
+    // end the submission right after its copies from then on.
+    bool submit_after_copy = false;
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
