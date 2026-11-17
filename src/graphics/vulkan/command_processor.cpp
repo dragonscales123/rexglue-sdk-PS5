@@ -2242,6 +2242,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   }
   gpu_timestamp_pool_failed_ = false;
   gpu_timestamp_slot_ = 0;
+  gpu_timestamp_previous_end_ = 0;
   std::fill(std::begin(gpu_timestamp_slot_used_), std::end(gpu_timestamp_slot_used_), false);
 
   device_lost_ = false;
@@ -6285,8 +6286,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 
   if (submit_thread_enabled_) {
     if (await_submission > submission_completed_) {
-      // Blocking wait: its fences must be on the queue.
-      DrainSubmitThread();
+      // Blocking wait: its fences (not the later ones) must be on the queue.
+      WaitForSubmitThreadQueued(await_submission);
     }
     if (submit_thread_device_lost_.load()) {
       device_lost_ = true;
@@ -6696,6 +6697,14 @@ void VulkanCommandProcessor::ReadGpuTimestampSlot(uint32_t slot) {
                                  double(vulkan_device->properties().timestampPeriod));
     counters.gpu_busy_ns.fetch_add(ns, std::memory_order_relaxed);
     counters.gpu_timed_submits.fetch_add(1, std::memory_order_relaxed);
+    // Slots are read in submission order (each when it is reused).
+    if (gpu_timestamp_previous_end_ && results[0] > gpu_timestamp_previous_end_) {
+      counters.gpu_gap_ns.fetch_add(
+          uint64_t(double(results[0] - gpu_timestamp_previous_end_) *
+                   double(vulkan_device->properties().timestampPeriod)),
+          std::memory_order_relaxed);
+    }
+    gpu_timestamp_previous_end_ = results[2];
     uint64_t longest = counters.gpu_longest_submit_ns.load(std::memory_order_relaxed);
     while (ns > longest &&
            !counters.gpu_longest_submit_ns.compare_exchange_weak(longest, ns,
@@ -6726,10 +6735,29 @@ void VulkanCommandProcessor::SubmitThreadMain() {
       submit_thread_busy_ = true;
     }
     VkResult result = VK_ERROR_DEVICE_LOST;
+#if REX_PLATFORM_PS5
+    const auto record_start = std::chrono::steady_clock::now();
+#endif
     if (!submit_thread_device_lost_.load()) {
       result = RecordAndSubmit(job.command_buffer, job.upload_stream, job.deferred_stream,
                                job.fence, job.wait_semaphores, job.wait_stage_masks);
     }
+#if REX_PLATFORM_PS5
+    {
+      auto& counters = rex::ps5prof::counters();
+      counters.submit_jobs.fetch_add(1, std::memory_order_relaxed);
+      counters.submit_queue_ns.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(record_start -
+                                                                        job.queued_time)
+                       .count()),
+          std::memory_order_relaxed);
+      counters.submit_record_ns.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - record_start)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+#endif
     if (result != VK_SUCCESS) {
       REXGPU_ERROR("Vulkan submit thread: failed to record or submit a command buffer ({})",
                    int(result));
@@ -6751,6 +6779,37 @@ void VulkanCommandProcessor::SubmitThreadMain() {
   }
 #if REX_PLATFORM_PS5
   rex::ps5prof::UnregisterCurrentThread();
+#endif
+}
+
+void VulkanCommandProcessor::WaitForSubmitThreadQueued(uint64_t submission) {
+  if (!submit_thread_enabled_ ||
+      submissions_queued_.load(std::memory_order_acquire) >= submission) {
+    return;
+  }
+#if REX_PLATFORM_PS5
+  const auto wait_start = std::chrono::steady_clock::now();
+  uint64_t jobs_at_start;
+#endif
+  {
+    std::unique_lock<std::mutex> lock(submit_mutex_);
+#if REX_PLATFORM_PS5
+    jobs_at_start = submit_jobs_.size() + (submit_thread_busy_ ? 1 : 0);
+#endif
+    submit_done_cv_.wait(lock, [this, submission] {
+      return submissions_queued_.load(std::memory_order_acquire) >= submission ||
+             submit_thread_device_lost_.load() || (submit_jobs_.empty() && !submit_thread_busy_);
+    });
+  }
+#if REX_PLATFORM_PS5
+  auto& counters = rex::ps5prof::counters();
+  counters.submit_waits.fetch_add(1, std::memory_order_relaxed);
+  counters.submit_wait_jobs.fetch_add(jobs_at_start, std::memory_order_relaxed);
+  counters.submit_wait_ns.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - wait_start)
+                   .count()),
+      std::memory_order_relaxed);
 #endif
 }
 
@@ -6980,6 +7039,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       job.wait_semaphores = current_submission_wait_semaphores_;
       job.wait_stage_masks = current_submission_wait_stage_masks_;
       job.submission = submission_to_submit;
+      job.queued_time = std::chrono::steady_clock::now();
       {
         std::lock_guard<std::mutex> lock(submit_mutex_);
         submit_jobs_.push_back(std::move(job));

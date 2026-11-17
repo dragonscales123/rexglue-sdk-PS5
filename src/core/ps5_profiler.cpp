@@ -312,6 +312,25 @@ void Dump(int fd, double seconds) {
       previous_gpu[k] = gpu_now[k];
     }
     write(fd, header, size_t(n));
+    static uint64_t previous_submit[7] = {};
+    const uint64_t submit_now[7] = {
+        counters_now.gpu_gap_ns.load(),      counters_now.submit_jobs.load(),
+        counters_now.submit_queue_ns.load(), counters_now.submit_record_ns.load(),
+        counters_now.submit_waits.load(),    counters_now.submit_wait_ns.load(),
+        counters_now.submit_wait_jobs.load()};
+    double sd[7];
+    for (int k = 0; k < 7; ++k) {
+      sd[k] = double(submit_now[k] - previous_submit[k]) * inv;
+      previous_submit[k] = submit_now[k];
+    }
+    n = snprintf(header, sizeof(header),
+                 "submit-thread/s: gpu idle between submissions %.1f ms | jobs %.0f, queued "
+                 "avg %.3f ms, record+submit avg %.3f ms (busy %.1f ms) | waits for it %.0f, "
+                 "%.1f ms, jobs ahead avg %.1f\n",
+                 sd[0] / 1e6, sd[1], sd[1] ? sd[2] / sd[1] / 1e6 : 0.0,
+                 sd[1] ? sd[3] / sd[1] / 1e6 : 0.0, sd[3] / 1e6, sd[4], sd[5] / 1e6,
+                 sd[4] ? sd[6] / sd[4] : 0.0);
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;

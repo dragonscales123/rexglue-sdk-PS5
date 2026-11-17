@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <optional>
 #include <array>
 #include <atomic>
@@ -627,8 +628,14 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkSemaphore> wait_semaphores;
     std::vector<VkPipelineStageFlags> wait_stage_masks;
     uint64_t submission = 0;
+    std::chrono::steady_clock::time_point queued_time;
   };
   bool submit_thread_enabled_ = false;
+  // Waits until the submit thread has put submission (and everything before)
+  // on the queue - not the jobs after it, unlike DrainSubmitThread.
+  void WaitForSubmitThreadQueued(uint64_t submission);
+  // GPU end timestamp of the previous timed submission (gpu_gap_ns).
+  uint64_t gpu_timestamp_previous_end_ = 0;
   std::thread submit_thread_;
   std::mutex submit_mutex_;
   std::condition_variable submit_cv_;

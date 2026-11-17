@@ -59,6 +59,19 @@ struct Counters {
   std::atomic<uint64_t> gpu_timed_submits{0};
   std::atomic<uint64_t> gpu_untimed_submits{0};
   std::atomic<uint64_t> gpu_longest_submit_ns{0};
+  // GPU idle time between consecutive timed submissions (end of one to the
+  // start of the next on the GPU timestamp clock).
+  std::atomic<uint64_t> gpu_gap_ns{0};
+  // Submit thread: jobs, time each waited in the queue before being picked up,
+  // time recording + vkQueueSubmit took.
+  std::atomic<uint64_t> submit_jobs{0};
+  std::atomic<uint64_t> submit_queue_ns{0};
+  std::atomic<uint64_t> submit_record_ns{0};
+  // Waits of the GPU command thread for the submit thread to put a submission
+  // on the queue before awaiting its fence: count, time, jobs queued at start.
+  std::atomic<uint64_t> submit_waits{0};
+  std::atomic<uint64_t> submit_wait_ns{0};
+  std::atomic<uint64_t> submit_wait_jobs{0};
   // Registers found different in the draw encoding register file copy check.
   std::atomic<uint64_t> encode_register_mismatches{0};  // since the last profile interval
 };
