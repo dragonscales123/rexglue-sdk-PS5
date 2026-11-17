@@ -16,6 +16,11 @@
 #include <rex/memory/bytes_equal.h>
 #include <chrono>
 #include <algorithm>
+// Per-draw timing of the encoding thread (encode-thread/s, encode-draw/s
+// profile lines) - costs about 0.2 us per draw, off normally.
+#ifndef REX_ENCODE_PROFILING
+#define REX_ENCODE_PROFILING 0
+#endif
 #include <ctime>
 #if REX_PLATFORM_PS5
 #include <x86intrin.h>
@@ -4079,11 +4084,11 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
       CheckEncodeRegisters();
     }
   }
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   const uint64_t append_start = __rdtsc();
 #endif
   AppendPrepCommandsToMain(packet.prep_commands);
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   const uint64_t requests_start = __rdtsc();
   rex::ps5prof::counters().encode_append_tsc.fetch_add(requests_start - append_start,
                                                        std::memory_order_relaxed);
@@ -4100,7 +4105,7 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
       }
     }
   }
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   const uint64_t draw_start = __rdtsc();
 #endif
   if (packet.has_draw) {
@@ -4108,7 +4113,7 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
     EncodeDraw(packet);
     encoding_ = false;
   }
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   {
     const uint64_t draw_end = __rdtsc();
     auto& counters = rex::ps5prof::counters();
@@ -5075,7 +5080,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
                    : 0;
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   uint64_t encode_section_time = __rdtsc();
   // Every 16th draw, also the thread's CPU time per section, so the time spent
   // blocked (wall minus CPU) can be told apart.
@@ -5110,7 +5115,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(0);
 #endif
 
@@ -5139,7 +5144,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
     return draw_fail("pipeline_lookup");
   }
 
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(1);
 #endif
   if (current_guest_graphics_pipeline_ != pipeline) {
@@ -5240,7 +5245,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
     }
   }
 
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(2);
 #endif
   // Update system constants before uploading them.
@@ -5248,7 +5253,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
 
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(3);
 #endif
   // Update uniform buffers and descriptor sets after binding the pipeline with
@@ -5256,7 +5261,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   if (!UpdateBindings(packet, vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(4);
 #endif
 
@@ -5320,13 +5325,13 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(5);
 #endif
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(6);
 #endif
 
@@ -5387,8 +5392,10 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
     }
   }
 
-#if REX_PLATFORM_PS5
+#if REX_ENCODE_PROFILING
   encode_section_mark(7);
+#endif
+#if REX_PLATFORM_PS5
   rex::ps5prof::counters().draws.fetch_add(1, std::memory_order_relaxed);
 #endif
   if (const uint32_t submit_every = REXCVAR_GET(vulkan_submit_every_draws)) {
@@ -6959,7 +6966,7 @@ void VulkanCommandProcessor::SubmitThreadMain() {
       }
       job.upload_stream.clear();
       job.deferred_stream.clear();
-      submit_streams_free_.push_back(std::move(job.upload_stream));
+      submit_upload_streams_free_.push_back(std::move(job.upload_stream));
       submit_streams_free_.push_back(std::move(job.deferred_stream));
       submit_thread_busy_ = false;
     }
@@ -7034,6 +7041,7 @@ void VulkanCommandProcessor::StopSubmitThread() {
   }
   submit_thread_enabled_ = false;
   submit_streams_free_.clear();
+  submit_upload_streams_free_.clear();
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
@@ -7213,11 +7221,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       SubmitJob job;
       {
         std::lock_guard<std::mutex> lock(submit_mutex_);
-        for (std::vector<uintmax_t>* stream : {&job.upload_stream, &job.deferred_stream}) {
-          if (!submit_streams_free_.empty()) {
-            *stream = std::move(submit_streams_free_.back());
-            submit_streams_free_.pop_back();
-          }
+        if (!submit_upload_streams_free_.empty()) {
+          job.upload_stream = std::move(submit_upload_streams_free_.back());
+          submit_upload_streams_free_.pop_back();
+        }
+        if (!submit_streams_free_.empty()) {
+          job.deferred_stream = std::move(submit_streams_free_.back());
+          submit_streams_free_.pop_back();
         }
       }
       upload_command_buffer_.SwapStream(job.upload_stream);

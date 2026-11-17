@@ -646,7 +646,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Highest submission index handed to vkQueueSubmit (by either thread).
   std::atomic<uint64_t> submissions_queued_{0};
   std::atomic<bool> submit_thread_device_lost_{false};
+  // Recycled stream storage, kept apart so the (large) deferred stream gets
+  // back a large one instead of growing again from a small upload stream's.
   std::vector<std::vector<uintmax_t>> submit_streams_free_;
+  std::vector<std::vector<uintmax_t>> submit_upload_streams_free_;
   void SubmitThreadMain();
   void DrainSubmitThread();
   void StartSubmitThread();
