@@ -109,6 +109,20 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
+  // Deferred requests: while a list is set (by the draw preparation thread,
+  // only around its vertex and index buffer requests), RequestRange only
+  // appends the range to it; the encoding thread makes the requests later,
+  // in draw order, with RequestRangeImmediate.
+  struct DeferredRequest {
+    uint32_t start;
+    uint32_t length;
+    RequestSource source;
+  };
+  void set_deferred_requests(std::vector<DeferredRequest>* deferred_requests) {
+    deferred_requests_ = deferred_requests;
+  }
+  bool RequestRangeImmediate(uint32_t start, uint32_t length);
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written
@@ -177,6 +191,10 @@ class SharedMemory {
   // Called after a range has been requested for GPU access (and uploaded if
   // needed) or written by the GPU.
   virtual void RangeAccessedByGpu(uint32_t start, uint32_t length) {}
+  // Before a request or a GPU write marking that is not a deferred one: the
+  // backend makes sure no deferred request still waiting covers the range
+  // (otherwise that earlier draw would see the pages already valid).
+  virtual void BeforeNonDeferredAccess(uint32_t start, uint32_t length) {}
 
  private:
   memory::Memory& memory_;
@@ -237,7 +255,14 @@ class SharedMemory {
   std::unordered_map<uint32_t, HotPageShadow> hot_page_shadows_;
   // Advanced at every point where the guest CPU may legitimately have changed
   // memory the GPU already read (see AdvanceHotCheckEpoch). 0 = never.
-  uint32_t hot_check_epoch_ = 1;
+  std::atomic<uint32_t> hot_check_epoch_{1};
+  // Requests from the draw preparation and the encoding threads: the upload
+  // state (upload_ranges_, the backend's upload buffers and upload command
+  // buffer, submission access tracking) and the request cache.
+  std::mutex request_mutex_;
+  std::vector<DeferredRequest>* deferred_requests_ = nullptr;
+  bool RequestRangesLocked(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+  bool RequestRangeCachedLocked(uint32_t start, uint32_t length);
 
   // RequestRange results: a range requested successfully needs nothing more
   // while no page has become invalid, no hot page has changed state and - if

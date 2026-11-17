@@ -340,6 +340,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
   }
+  BeforeNonDeferredAccess(start, length);
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
@@ -439,7 +440,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
             std::memcpy(shadow.data.get(), memory().TranslatePhysical(page << page_size_log2_),
                         page_bytes);
             // The whole page equals guest memory as of now.
-            shadow.verified_epoch = hot_check_epoch_;
+            shadow.verified_epoch = hot_check_epoch_.load(std::memory_order_relaxed);
             shadow.verified_lines = UINT64_MAX;
           }
 #if REX_PLATFORM_PS5
@@ -555,9 +556,8 @@ void SharedMemory::AdvanceHotCheckEpoch(GuestSyncPoint kind) {
       !REXCVAR_GET(shared_memory_hot_page_epoch_on_gpu_signals)) {
     return;
   }
-  if (++hot_check_epoch_ == 0) {
-    hot_check_epoch_ = 1;
-  }
+  uint32_t epoch = hot_check_epoch_.load(std::memory_order_relaxed) + 1;
+  hot_check_epoch_.store(epoch ? epoch : 1, std::memory_order_relaxed);
 #if REX_PLATFORM_PS5
   rex::ps5prof::counters().hot_check_epochs.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -577,7 +577,7 @@ void SharedMemory::FilterUnchangedHotPages(
   // A page is checked in 64 lines.
   const uint32_t line_shift = page_size_log2_ - 6;
   const bool use_epochs = REXCVAR_GET(shared_memory_hot_page_check_epochs);
-  const uint32_t epoch = hot_check_epoch_;
+  const uint32_t epoch = hot_check_epoch_.load(std::memory_order_relaxed);
   uint64_t compared_bytes = 0;
   uint64_t skipped_bytes = 0;
   size_t range_index = 0;
@@ -729,6 +729,18 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 }
 
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+  if (ranges == nullptr || !count) {
+    return true;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    BeforeNonDeferredAccess(ranges[i].first, ranges[i].second);
+  }
+  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  return RequestRangesLocked(ranges, count);
+}
+
+bool SharedMemory::RequestRangesLocked(const std::pair<uint32_t, uint32_t>* ranges,
+                                       size_t count) {
   if (ranges == nullptr || !count) {
     return true;
   }
@@ -907,9 +919,29 @@ bool SharedMemory::RangeCoversHotPages(uint32_t start, uint32_t length) const {
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  if (deferred_requests_) {
+    if (length) {
+      if (start > kBufferSize || (kBufferSize - start) < length) {
+        return false;
+      }
+      deferred_requests_->push_back(DeferredRequest{start, length, request_source_});
+    }
+    return true;
+  }
+  BeforeNonDeferredAccess(start, length);
+  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  return RequestRangeCachedLocked(start, length);
+}
+
+bool SharedMemory::RequestRangeImmediate(uint32_t start, uint32_t length) {
+  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  return RequestRangeCachedLocked(start, length);
+}
+
+bool SharedMemory::RequestRangeCachedLocked(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   if (!length || !REXCVAR_GET(shared_memory_request_cache)) {
-    return RequestRanges(&range, 1);
+    return RequestRangesLocked(&range, 1);
   }
   if (!request_cache_) {
     request_cache_ = std::make_unique<RequestCacheEntry[]>(size_t(1) << kRequestCacheSizeLog2);
@@ -921,7 +953,7 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   // the entry stale.
   const uint64_t generation = validity_generation_.load(std::memory_order_acquire);
   if (entry.start == start && entry.length == length && entry.generation == generation &&
-      (!entry.covers_hot || entry.epoch == hot_check_epoch_)) {
+      (!entry.covers_hot || entry.epoch == hot_check_epoch_.load(std::memory_order_relaxed))) {
     RangeAccessedByGpu(start, length);
 #if REX_PLATFORM_PS5
     rex::ps5prof::counters().request_cache_hits[uint32_t(request_source_)].fetch_add(
@@ -929,14 +961,14 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 #endif
     return true;
   }
-  if (!RequestRanges(&range, 1)) {
+  if (!RequestRangesLocked(&range, 1)) {
     entry.length = 0;
     return false;
   }
   entry.start = start;
   entry.length = length;
   entry.generation = generation;
-  entry.epoch = hot_check_epoch_;
+  entry.epoch = hot_check_epoch_.load(std::memory_order_relaxed);
   entry.covers_hot = RangeCoversHotPages(start, length);
   return true;
 }

@@ -53,6 +53,10 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(vulkan_encode_buffer_requests, true, "GPU/Vulkan",
+                    "With the draw encoding thread, make the vertex and index buffer shared "
+                    "memory requests (residency checks, hot page checks, uploads) on that thread "
+                    "right before each draw instead of during the draw preparation.");
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport_fast_submit, false, "GPU/Vulkan",
                     "End the submission right after a fast memexport readback copy (for readback "
                     "buffers that have made the next memexport draw wait), so the GPU starts it "
@@ -2003,6 +2007,8 @@ void VulkanCommandProcessor::ShutdownContext() {
   encode_ring_tail_.store(0);
   encode_ring_tail_cached_ = 0;
   encode_ring_head_prepared_ = 0;
+  deferred_requests_pending_.clear();
+  deferred_requests_pending_first_ = 0;
   encode_packet_preparing_ = nullptr;
   texture_memo_.valid = false;
   AwaitAllQueueOperationsCompletion();
@@ -3689,7 +3695,39 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
   packet.host_index_buffer = {VK_NULL_HANDLE, 0};
   packet.prep_commands.clear();
   packet.image_infos.clear();
+  packet.deferred_requests.clear();
   return packet;
+}
+
+void VulkanCommandProcessor::SyncDeferredSharedMemoryRequests(uint32_t start, uint32_t length) {
+  if (deferred_requests_pending_first_ >= deferred_requests_pending_.size() || !length ||
+      IsEncodeThread()) {
+    return;
+  }
+  // Forget the requests the encoding has made already (packets up to the tail).
+  const uint64_t tail = encode_ring_tail_.load(std::memory_order_acquire);
+  while (deferred_requests_pending_first_ < deferred_requests_pending_.size() &&
+         deferred_requests_pending_[deferred_requests_pending_first_].packet <= tail) {
+    ++deferred_requests_pending_first_;
+  }
+  bool overlap = false;
+  const uint32_t end = start + length;
+  for (size_t i = deferred_requests_pending_first_; i < deferred_requests_pending_.size(); ++i) {
+    const DeferredRequestPending& pending = deferred_requests_pending_[i];
+    if (pending.start < end && start < pending.end) {
+      overlap = true;
+      break;
+    }
+  }
+  if (overlap) {
+    // The earlier draw must get the pages as they are before this.
+    DrainEncodeQueue(DrainSource::kOther);
+    deferred_requests_pending_first_ = deferred_requests_pending_.size();
+  }
+  if (deferred_requests_pending_first_ >= deferred_requests_pending_.size()) {
+    deferred_requests_pending_.clear();
+    deferred_requests_pending_first_ = 0;
+  }
 }
 
 void VulkanCommandProcessor::ReleaseEncodeDrawPacket() {
@@ -3806,6 +3844,26 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   // Publish.
   encode_packet_preparing_ = nullptr;
   uint64_t head = ++encode_ring_head_prepared_;
+  if (encode_thread_enabled_ && packet.has_draw && !packet.deferred_requests.empty()) {
+    // Forget the requests made already (cached tail - never ahead), keeping
+    // the list short.
+    while (deferred_requests_pending_first_ < deferred_requests_pending_.size() &&
+           deferred_requests_pending_[deferred_requests_pending_first_].packet <=
+               encode_ring_tail_cached_) {
+      ++deferred_requests_pending_first_;
+    }
+    if (deferred_requests_pending_first_ >= 256 &&
+        deferred_requests_pending_first_ * 2 >= deferred_requests_pending_.size()) {
+      deferred_requests_pending_.erase(
+          deferred_requests_pending_.begin(),
+          deferred_requests_pending_.begin() + ptrdiff_t(deferred_requests_pending_first_));
+      deferred_requests_pending_first_ = 0;
+    }
+    for (const SharedMemory::DeferredRequest& request : packet.deferred_requests) {
+      deferred_requests_pending_.push_back(
+          DeferredRequestPending{head, request.start, request.start + request.length});
+    }
+  }
   if (encode_thread_enabled_) {
     if (head - encode_ring_head_.load(std::memory_order_relaxed) >= kEncodePublishBatch) {
       PublishEncodeRing();
@@ -3942,6 +4000,8 @@ void VulkanCommandProcessor::StartEncodeThread() {
   encode_ring_tail_.store(0);
   encode_ring_tail_cached_ = 0;
   encode_ring_head_prepared_ = 0;
+  deferred_requests_pending_.clear();
+  deferred_requests_pending_first_ = 0;
   encode_packet_preparing_ = nullptr;
   encode_thread_enabled_ = REXCVAR_GET(vulkan_draw_encode_thread);
   if (!encode_thread_enabled_) {
@@ -4016,6 +4076,18 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
     }
   }
   AppendPrepCommandsToMain(packet.prep_commands);
+  if (packet.has_draw) {
+    for (const SharedMemory::DeferredRequest& request : packet.deferred_requests) {
+      SharedMemory::ScopedRequestSource request_source(*shared_memory_, request.source);
+      if (!shared_memory_->RequestRangeImmediate(request.start, request.length)) {
+        REXGPU_ERROR("Failed to request a {} buffer at 0x{:08X} (size {}) in the shared memory",
+                     request.source == SharedMemory::RequestSource::kIndex ? "index" : "vertex",
+                     request.start, request.length);
+        packet.has_draw = false;
+        break;
+      }
+    }
+  }
   if (packet.has_draw) {
     encoding_ = true;
     EncodeDraw(packet);
@@ -4501,6 +4573,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     QueueEncodeDrawPacket();
   };
 
+  // Sets the shared memory's deferred request list for the scope.
+  struct DeferredRequestsScope {
+    SharedMemory* shared_memory;
+    DeferredRequestsScope(SharedMemory* shared_memory_in,
+                          std::vector<SharedMemory::DeferredRequest>* list)
+        : shared_memory(list ? shared_memory_in : nullptr) {
+      if (shared_memory) {
+        shared_memory->set_deferred_requests(list);
+      }
+    }
+    ~DeferredRequestsScope() {
+      if (shared_memory) {
+        shared_memory->set_deferred_requests(nullptr);
+      }
+    }
+  };
+
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
   // in case of a sampler count overflow, and if that happens, all subsystem
@@ -4513,9 +4602,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return draw_fail("begin_submission");
     }
     BeginPrepRecording();
+    // Vertex and index buffer requests left to the encoding thread (redone
+    // with the rest in the second iteration).
+    packet.deferred_requests.clear();
+    const bool defer_buffer_requests =
+        encode_thread_enabled_ && REXCVAR_GET(vulkan_encode_buffer_requests);
 
     // Process primitives.
-    if (!primitive_processor_->Process(primitive_processing_result)) {
+    bool primitives_processed;
+    {
+      DeferredRequestsScope deferred_scope(
+          shared_memory_.get(), defer_buffer_requests ? &packet.deferred_requests : nullptr);
+      primitives_processed = primitive_processor_->Process(primitive_processing_result);
+    }
+    if (!primitives_processed) {
       queue_packet(false);
       return draw_fail("primitive_processing");
     }
@@ -4770,6 +4870,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+  {
+  DeferredRequestsScope vertex_deferred_scope(
+      shared_memory_.get(), encode_thread_enabled_ && REXCVAR_GET(vulkan_encode_buffer_requests)
+                                ? &packet.deferred_requests
+                                : nullptr);
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
     uint32_t j;
@@ -4821,6 +4926,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       state.size = vfetch_constant.size;
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
+  }
   }
 
   // Synchronize the memory pages backing memory scatter export streams, and

@@ -227,6 +227,10 @@ void VulkanSharedMemory::EndSubmission() {
   std::fill(submission_accessed_pages_.begin(), submission_accessed_pages_.end(), 0);
 }
 
+void VulkanSharedMemory::BeforeNonDeferredAccess(uint32_t start, uint32_t length) {
+  command_processor_.SyncDeferredSharedMemoryRequests(start, length);
+}
+
 void VulkanSharedMemory::RangeAccessedByGpu(uint32_t start, uint32_t length) {
   if (!length || submission_accessed_pages_.empty()) {
     return;

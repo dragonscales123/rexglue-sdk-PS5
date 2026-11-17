@@ -927,6 +927,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // A draw prepared by IssueDraw for EncodeDraw: everything the encoding needs
   // that it can't take from encode_register_file_ or its own state.
   struct EncodeDrawPacket {
+    // Vertex and index buffer shared memory requests, made by the encoding
+    // (vulkan_encode_buffer_requests) right before the draw.
+    std::vector<SharedMemory::DeferredRequest> deferred_requests;
     // Register changes since the previous packet, as (first register, count)
     // runs with their values, applied to encode_register_file_.
     // Only the first register_run_count / register_value_count elements are
@@ -998,6 +1001,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t encode_ring_head_prepared_ = 0;
   static constexpr uint64_t kEncodePublishBatch = 4;
   void PublishEncodeRing();
+  // Deferred shared memory requests queued and possibly not made yet: packet
+  // number (encode_ring_head_prepared_ after queueing) and byte range.
+  struct DeferredRequestPending {
+    uint64_t packet;
+    uint32_t start;
+    uint32_t end;
+  };
+  std::vector<DeferredRequestPending> deferred_requests_pending_;
+  size_t deferred_requests_pending_first_ = 0;
+
+ public:
+  // From VulkanSharedMemory::BeforeNonDeferredAccess: if a deferred request
+  // still waiting overlaps the range, waits for the encoding to make it.
+  void SyncDeferredSharedMemoryRequests(uint32_t start, uint32_t length);
+
+ private:
   bool IsEncodeRingEmpty() const {
     return encode_ring_tail_.load(std::memory_order_acquire) == encode_ring_head_prepared_;
   }
