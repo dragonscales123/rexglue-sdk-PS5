@@ -175,7 +175,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void EndPrepRecording();
   // Same, but moves the chunk's commands to commands_out instead of appending
   // them (for draws prepared ahead of their encoding).
-  void EndPrepRecording(std::vector<uintmax_t>* commands_out);
+  void EndPrepRecording(CommandStream* commands_out);
   // Executed before deferred_command_buffer() in the same submission.
   DeferredCommandBuffer& upload_command_buffer() {
     assert_true(submission_open_);
@@ -621,8 +621,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // fence waits, swaps - the presenter submits right after - and sparse binds)
   // drains the thread first. Fences are only polled once actually submitted.
   struct SubmitJob {
-    std::vector<uintmax_t> upload_stream;
-    std::vector<uintmax_t> deferred_stream;
+    CommandStream upload_stream;
+    CommandStream deferred_stream;
     CommandBuffer command_buffer = {};
     VkFence fence = VK_NULL_HANDLE;
     std::vector<VkSemaphore> wait_semaphores;
@@ -648,8 +648,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::atomic<bool> submit_thread_device_lost_{false};
   // Recycled stream storage, kept apart so the (large) deferred stream gets
   // back a large one instead of growing again from a small upload stream's.
-  std::vector<std::vector<uintmax_t>> submit_streams_free_;
-  std::vector<std::vector<uintmax_t>> submit_upload_streams_free_;
+  std::vector<CommandStream> submit_streams_free_;
+  std::vector<CommandStream> submit_upload_streams_free_;
   void SubmitThreadMain();
   void DrainSubmitThread();
   void StartSubmitThread();
@@ -657,8 +657,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Resets the pool, records both streams and submits. Returns the result of
   // the failing call (VK_SUCCESS if all succeeded).
   VkResult RecordAndSubmit(const CommandBuffer& command_buffer,
-                           const std::vector<uintmax_t>& upload_stream,
-                           const std::vector<uintmax_t>& deferred_stream, VkFence fence,
+                           const CommandStream& upload_stream,
+                           const CommandStream& deferred_stream, VkFence fence,
                            const std::vector<VkSemaphore>& wait_semaphores,
                            const std::vector<VkPipelineStageFlags>& wait_stage_masks);
   // GPU execution time measurement (PS5 profiler): a pair of timestamps
@@ -949,7 +949,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t constant_buffers_written = 0;
     // Preparation commands (texture loads, uploads, index conversion), appended
     // to the main command buffer before the draw.
-    std::vector<uintmax_t> prep_commands;
+    CommandStream prep_commands;
     // False if only the preparation commands are queued (dropped draw).
     bool has_draw = false;
     bool memexport = false;
@@ -1098,7 +1098,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Applies the pending constant write records to the encoding state.
   void ApplyConstantsWritten(const uint64_t (&float_constants_written)[2][4],
                              uint32_t constant_buffers_written);
-  void AppendPrepCommandsToMain(const std::vector<uintmax_t>& commands);
+  void AppendPrepCommandsToMain(const CommandStream& commands);
 
   // Commands for the draw preparation chunk (see BeginPrepRecording).
   DeferredCommandBuffer prep_command_buffer_{*this, 64 * 1024};

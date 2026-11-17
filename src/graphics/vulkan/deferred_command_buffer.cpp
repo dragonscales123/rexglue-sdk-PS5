@@ -32,7 +32,7 @@ void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
 }
 
-void DeferredCommandBuffer::ExecuteStream(const std::vector<uintmax_t>& command_stream,
+void DeferredCommandBuffer::ExecuteStream(const CommandStream& command_stream,
                                           VkCommandBuffer command_buffer) const {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");

@@ -3636,7 +3636,7 @@ void VulkanCommandProcessor::BeginPrepRecording() {
   shared_memory_->BeginPrepRecording();
 }
 
-void VulkanCommandProcessor::EndPrepRecording(std::vector<uintmax_t>* commands_out) {
+void VulkanCommandProcessor::EndPrepRecording(CommandStream* commands_out) {
   assert_true(IsPrepRecording());
   // Make the chunk's shared memory writes visible to whatever follows it.
   shared_memory_->EndPrepRecording();
@@ -3647,12 +3647,12 @@ void VulkanCommandProcessor::EndPrepRecording(std::vector<uintmax_t>* commands_o
 }
 
 void VulkanCommandProcessor::EndPrepRecording() {
-  std::vector<uintmax_t> commands;
+  CommandStream commands;
   EndPrepRecording(&commands);
   AppendPrepCommandsToMain(commands);
 }
 
-void VulkanCommandProcessor::AppendPrepCommandsToMain(const std::vector<uintmax_t>& commands) {
+void VulkanCommandProcessor::AppendPrepCommandsToMain(const CommandStream& commands) {
   assert_false(IsPrepRecording());
   if (commands.empty()) {
     return;
@@ -4785,7 +4785,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // (including this draw's preparation commands) into it first.
     EndPrepRecording(&packet.prep_commands);
     packet.has_draw = false;
-    std::vector<uintmax_t> prep_commands_so_far;
+    CommandStream prep_commands_so_far;
     prep_commands_so_far.swap(packet.prep_commands);
     DrainEncodeQueue(DrainSource::kOther);
     if (!prep_commands_so_far.empty()) {
@@ -6800,8 +6800,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 VkResult VulkanCommandProcessor::RecordAndSubmit(
-    const CommandBuffer& command_buffer, const std::vector<uintmax_t>& upload_stream,
-    const std::vector<uintmax_t>& deferred_stream, VkFence fence,
+    const CommandBuffer& command_buffer, const CommandStream& upload_stream,
+    const CommandStream& deferred_stream, VkFence fence,
     const std::vector<VkSemaphore>& wait_semaphores,
     const std::vector<VkPipelineStageFlags>& wait_stage_masks) {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();

@@ -10,6 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <utility>
+#include <type_traits>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +26,29 @@ namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
 
+// Command stream storage: growing it doesn't zero the new elements first (the
+// commands are written right after), which CommandStream::resize
+// would - a memset per recorded command.
+template <typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+  template <typename U>
+  struct rebind {
+    using other = DefaultInitAllocator<U>;
+  };
+  DefaultInitAllocator() noexcept = default;
+  template <typename U>
+  DefaultInitAllocator(const DefaultInitAllocator<U>&) noexcept {}
+  template <typename U>
+  void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+    ::new (static_cast<void*>(p)) U;
+  }
+  template <typename U, typename... Args>
+  void construct(U* p, Args&&... args) {
+    ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+  }
+};
+using CommandStream = std::vector<uintmax_t, DefaultInitAllocator<uintmax_t>>;
+
 class DeferredCommandBuffer {
  public:
   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
@@ -32,15 +58,15 @@ class DeferredCommandBuffer {
   void Execute(VkCommandBuffer command_buffer) { ExecuteStream(command_stream_, command_buffer); }
   // Records a command stream taken out with SwapStream (possibly on another
   // thread - only the device functions are used).
-  void ExecuteStream(const std::vector<uintmax_t>& command_stream,
+  void ExecuteStream(const CommandStream& command_stream,
                      VkCommandBuffer command_buffer) const;
   // Exchanges the recorded commands with `stream`, so a finished stream can be
   // executed elsewhere while recording continues into the other storage.
-  void SwapStream(std::vector<uintmax_t>& stream) { command_stream_.swap(stream); }
-  const std::vector<uintmax_t>& stream() const { return command_stream_; }
+  void SwapStream(CommandStream& stream) { command_stream_.swap(stream); }
+  const CommandStream& stream() const { return command_stream_; }
   // Appends another buffer's recorded commands (self-contained, so copied as
   // they are).
-  void AppendCommands(const std::vector<uintmax_t>& commands) {
+  void AppendCommands(const CommandStream& commands) {
     command_stream_.insert(command_stream_.end(), commands.cbegin(), commands.cend());
   }
   void AppendStream(const DeferredCommandBuffer& other) {
@@ -620,7 +646,7 @@ class DeferredCommandBuffer {
   const VulkanCommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
-  std::vector<uintmax_t> command_stream_;
+  CommandStream command_stream_;
 };
 
 }  // namespace rex::graphics::vulkan
