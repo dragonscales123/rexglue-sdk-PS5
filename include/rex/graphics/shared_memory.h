@@ -28,6 +28,22 @@ namespace rex::graphics {
 // system page size granularity.
 class SharedMemory {
  public:
+  // What the current requests are for (profiling only, set by the requester).
+  enum class RequestSource : uint8_t { kOther, kVertex, kIndex, kTexture, kMemexport, kResolve };
+  RequestSource request_source() const { return request_source_; }
+  void set_request_source(RequestSource source) { request_source_ = source; }
+  class ScopedRequestSource {
+   public:
+    ScopedRequestSource(SharedMemory& shared_memory, RequestSource source)
+        : shared_memory_(shared_memory), previous_(shared_memory.request_source_) {
+      shared_memory.request_source_ = source;
+    }
+    ~ScopedRequestSource() { shared_memory_.request_source_ = previous_; }
+
+   private:
+    SharedMemory& shared_memory_;
+    RequestSource previous_;
+  };
   static constexpr uint32_t kBufferSizeLog2 = 29;
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
 
@@ -112,6 +128,7 @@ class SharedMemory {
   bool IsRangeGpuWritten(uint32_t start, uint32_t length);
 
  protected:
+  RequestSource request_source_ = RequestSource::kOther;
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
   void InitializeCommon();

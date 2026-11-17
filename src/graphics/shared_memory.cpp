@@ -11,6 +11,9 @@
 
 #include <rex/memory/bytes_equal.h>
 #include <algorithm>
+#if REX_PLATFORM_PS5
+#include <x86intrin.h>
+#endif
 #include <cstring>
 #include <utility>
 
@@ -679,6 +682,8 @@ void SharedMemory::FilterUnchangedHotPages(
   upload_ranges_.swap(kept);
 #if REX_PLATFORM_PS5
   if (compared_bytes) {
+    rex::ps5prof::counters().request_hot_compared[uint32_t(request_source_)].fetch_add(
+        compared_bytes, std::memory_order_relaxed);
     rex::ps5prof::counters().hot_compared_bytes.fetch_add(compared_bytes,
                                                           std::memory_order_relaxed);
   }
@@ -718,6 +723,16 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   if (ranges == nullptr || !count) {
     return true;
   }
+#if REX_PLATFORM_PS5
+  struct TscScope {
+    uint32_t source;
+    uint64_t start = __rdtsc();
+    ~TscScope() {
+      rex::ps5prof::counters().request_tsc[source].fetch_add(__rdtsc() - start,
+                                                             std::memory_order_relaxed);
+    }
+  } tsc_scope{uint32_t(request_source_)};
+#endif
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
@@ -738,6 +753,18 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   SCOPE_profile_cpu_f("gpu");
+#if REX_PLATFORM_PS5
+  {
+    auto& counters = rex::ps5prof::counters();
+    const uint32_t source = uint32_t(request_source_);
+    counters.request_calls[source].fetch_add(1, std::memory_order_relaxed);
+    uint64_t requested = 0;
+    for (const auto& range : merged_ranges) {
+      requested += range.second;
+    }
+    counters.request_bytes[source].fetch_add(requested, std::memory_order_relaxed);
+  }
+#endif
 
   std::sort(merged_ranges.begin(), merged_ranges.end(),
             [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {

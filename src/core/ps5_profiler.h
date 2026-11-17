@@ -72,6 +72,13 @@ struct Counters {
   std::atomic<uint64_t> submit_waits{0};
   std::atomic<uint64_t> submit_wait_ns{0};
   std::atomic<uint64_t> submit_wait_jobs{0};
+  // Shared memory requests by source (SharedMemory::RequestSource): calls,
+  // requested bytes, hot-page bytes compared, bytes uploaded.
+  std::atomic<uint64_t> request_calls[6] = {};
+  std::atomic<uint64_t> request_bytes[6] = {};
+  std::atomic<uint64_t> request_hot_compared[6] = {};
+  std::atomic<uint64_t> request_uploaded[6] = {};
+  std::atomic<uint64_t> request_tsc[6] = {};  // time in RequestRanges, TSC ticks
   // Registers found different in the draw encoding register file copy check.
   std::atomic<uint64_t> encode_register_mismatches{0};  // since the last profile interval
 };

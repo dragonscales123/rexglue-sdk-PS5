@@ -420,6 +420,8 @@ bool VulkanSharedMemory::UploadRanges(
     uint64_t pages = 0;
     for (const auto& range : upload_page_ranges) pages += range.second;
     rex::ps5prof::counters().upload_calls.fetch_add(1, std::memory_order_relaxed);
+    rex::ps5prof::counters().request_uploaded[uint32_t(request_source())].fetch_add(
+        pages << page_size_log2(), std::memory_order_relaxed);
     rex::ps5prof::counters().upload_bytes.fetch_add(pages << page_size_log2(),
                                                    std::memory_order_relaxed);
   }

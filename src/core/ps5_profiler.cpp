@@ -12,6 +12,7 @@
  * "outside", which for most threads means blocked.
  */
 
+#include <x86intrin.h>
 #include "ps5_profiler.h"
 
 #if defined(__PROSPERO__)
@@ -331,6 +332,38 @@ void Dump(int fd, double seconds) {
                  sd[1] ? sd[3] / sd[1] / 1e6 : 0.0, sd[3] / 1e6, sd[4], sd[5] / 1e6,
                  sd[4] ? sd[6] / sd[4] : 0.0);
     write(fd, header, size_t(n));
+    static uint64_t previous_request[30] = {};
+    double rq[30];
+    for (int k = 0; k < 6; ++k) {
+      const uint64_t now5[5] = {counters_now.request_calls[k].load(),
+                                counters_now.request_bytes[k].load(),
+                                counters_now.request_hot_compared[k].load(),
+                                counters_now.request_uploaded[k].load(),
+                                counters_now.request_tsc[k].load()};
+      for (int m = 0; m < 5; ++m) {
+        rq[k * 5 + m] = double(now5[m] - previous_request[k * 5 + m]) * inv;
+        previous_request[k * 5 + m] = now5[m];
+      }
+    }
+    static const char* const kSourceNames[6] = {"other",   "vertex",    "index",
+                                                "texture", "memexport", "resolve"};
+    char request_line[640];
+    static uint64_t previous_tsc = 0;
+    const uint64_t tsc_now = __rdtsc();
+    const double tsc_mhz = previous_tsc ? double(tsc_now - previous_tsc) * inv / 1e6 : 0.0;
+    previous_tsc = tsc_now;
+    int w = snprintf(request_line, sizeof(request_line),
+                     "requests/s (tsc %.0f MHz; calls, MB requested/compared/uploaded, Mtsc):",
+                     tsc_mhz);
+    for (int k = 0; k < 6 && w > 0 && size_t(w) < sizeof(request_line); ++k) {
+      w += snprintf(request_line + w, sizeof(request_line) - size_t(w), " %s %.0f %.1f/%.1f/%.1f %.1f%s",
+                    kSourceNames[k], rq[k * 5], rq[k * 5 + 1] / 1048576.0,
+                    rq[k * 5 + 2] / 1048576.0, rq[k * 5 + 3] / 1048576.0, rq[k * 5 + 4] / 1e6,
+                    k < 5 ? "," : "\n");
+    }
+    if (w > 0) {
+      write(fd, request_line, std::min(size_t(w), sizeof(request_line) - 1));
+    }
   }
 
   size_t shown = 0;
