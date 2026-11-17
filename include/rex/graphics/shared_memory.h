@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <mutex>
 #include <utility>
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -237,6 +238,30 @@ class SharedMemory {
   // Advanced at every point where the guest CPU may legitimately have changed
   // memory the GPU already read (see AdvanceHotCheckEpoch). 0 = never.
   uint32_t hot_check_epoch_ = 1;
+
+  // RequestRange results: a range requested successfully needs nothing more
+  // while no page has become invalid, no hot page has changed state and - if
+  // it covers hot pages - the hot check epoch is the same. Most draws request
+  // vertex and index ranges that are already resident, and the full request
+  // (allocation check, lock, page scan, hot page filter) cost more than the
+  // rest of the draw preparation of their buffers.
+  // validity_generation_ is advanced (under the global lock, from any thread)
+  // whenever a page becomes invalid or the hot set or a hot page shadow
+  // changes.
+  std::atomic<uint64_t> validity_generation_{1};
+  void AdvanceValidityGeneration() {
+    validity_generation_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  struct RequestCacheEntry {
+    uint32_t start = 0;
+    uint32_t length = 0;
+    uint64_t generation = 0;
+    uint32_t epoch = 0;
+    bool covers_hot = false;
+  };
+  static constexpr uint32_t kRequestCacheSizeLog2 = 12;
+  std::unique_ptr<RequestCacheEntry[]> request_cache_;
+  bool RangeCoversHotPages(uint32_t start, uint32_t length) const;
   void FilterUnchangedHotPages(const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(

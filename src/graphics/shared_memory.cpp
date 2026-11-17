@@ -54,6 +54,10 @@ REXCVAR_DEFINE_BOOL(shared_memory_widen_into_watched_pages, false, "GPU",
                     "so a write next to a texture doesn't reload it; the texture's pages stay "
                     "protected and still catch writes to them.");
 
+REXCVAR_DEFINE_BOOL(shared_memory_request_cache, true, "GPU",
+                    "Skip repeated single-range shared memory requests while nothing in the "
+                    "shared memory has become invalid (and, for ranges with hot pages, within "
+                    "the same hot page check epoch).");
 REXCVAR_DEFINE_BOOL(shared_memory_hot_page_epoch_on_gpu_signals, false, "GPU",
                     "With shared_memory_hot_page_check_epochs, also start a new check epoch at "
                     "every GPU fence or memory write (stricter, far less effective).");
@@ -131,6 +135,7 @@ void SharedMemory::ShutdownCommon() {
 
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
+  AdvanceValidityGeneration();
 
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
@@ -272,6 +277,7 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
           hot = true;
           block &= ~bit;
           hot_page_shadows_.erase(page);
+          AdvanceValidityGeneration();
         }
       }
       if (hot) {
@@ -413,6 +419,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
             // alternates between two states) would skip its upload and keep
             // the in-between content: stale vertices (IU title-screen flicker).
             hot_page_shadows_.erase((i << 6) + bit);
+            AdvanceValidityGeneration();
           }
         }
         if (hot) {
@@ -455,6 +462,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         while (rex::bit_scan_forward(written, &written_bit)) {
           written &= ~(uint64_t(1) << written_bit);
           hot_page_shadows_.erase((i << 6) + written_bit);
+          AdvanceValidityGeneration();
         }
       }
       system_page_flags_valid_[i] |= valid_bits;
@@ -536,6 +544,7 @@ void SharedMemory::OnFrameSwapped() {
   std::fill(hot_pages_.begin(), hot_pages_.end(), uint64_t(0));
   std::fill(hot_block_invalidations_.begin(), hot_block_invalidations_.end(), uint8_t(0));
   hot_page_shadows_.clear();
+  AdvanceValidityGeneration();
 }
 
 void SharedMemory::AdvanceHotCheckEpoch(GuestSyncPoint kind) {
@@ -875,9 +884,61 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   return successful;
 }
 
+bool SharedMemory::RangeCoversHotPages(uint32_t start, uint32_t length) const {
+  if (!length || hot_pages_.empty()) {
+    return false;
+  }
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6, block_last = page_last >> 6;
+  for (uint32_t i = block_first; i <= block_last && i < hot_pages_.size(); ++i) {
+    uint64_t bits = hot_pages_[i];
+    if (i == block_first) {
+      bits &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (bits) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
-  return RequestRanges(&range, 1);
+  if (!length || !REXCVAR_GET(shared_memory_request_cache)) {
+    return RequestRanges(&range, 1);
+  }
+  if (!request_cache_) {
+    request_cache_ = std::make_unique<RequestCacheEntry[]>(size_t(1) << kRequestCacheSizeLog2);
+  }
+  const uint32_t hash = uint32_t((uint64_t(start) * 0x9E3779B97F4A7C15ull ^ length) >>
+                                 (64 - kRequestCacheSizeLog2));
+  RequestCacheEntry& entry = request_cache_[hash & ((1u << kRequestCacheSizeLog2) - 1)];
+  // Read before the request, so a page invalidated during or after it makes
+  // the entry stale.
+  const uint64_t generation = validity_generation_.load(std::memory_order_acquire);
+  if (entry.start == start && entry.length == length && entry.generation == generation &&
+      (!entry.covers_hot || entry.epoch == hot_check_epoch_)) {
+    RangeAccessedByGpu(start, length);
+#if REX_PLATFORM_PS5
+    rex::ps5prof::counters().request_cache_hits[uint32_t(request_source_)].fetch_add(
+        1, std::memory_order_relaxed);
+#endif
+    return true;
+  }
+  if (!RequestRanges(&range, 1)) {
+    entry.length = 0;
+    return false;
+  }
+  entry.start = start;
+  entry.length = length;
+  entry.generation = generation;
+  entry.epoch = hot_check_epoch_;
+  entry.covers_hot = RangeCoversHotPages(start, length);
+  return true;
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
@@ -951,6 +1012,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
     system_page_flags_valid_[i] &= ~invalidate_bits;
+    AdvanceValidityGeneration();
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
     if (REXCVAR_GET(shared_memory_hot_pages) && i < hot_block_invalidations_.size()) {
       uint8_t& count = hot_block_invalidations_[i];

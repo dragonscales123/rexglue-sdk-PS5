@@ -78,7 +78,8 @@ struct Counters {
   std::atomic<uint64_t> request_bytes[6] = {};
   std::atomic<uint64_t> request_hot_compared[6] = {};
   std::atomic<uint64_t> request_uploaded[6] = {};
-  std::atomic<uint64_t> request_tsc[6] = {};  // time in RequestRanges, TSC ticks
+  std::atomic<uint64_t> request_tsc[6] = {};
+  std::atomic<uint64_t> request_cache_hits[6] = {};  // RequestRange calls skipped (cached)  // time in RequestRanges, TSC ticks
   // Registers found different in the draw encoding register file copy check.
   std::atomic<uint64_t> encode_register_mismatches{0};  // since the last profile interval
 };
