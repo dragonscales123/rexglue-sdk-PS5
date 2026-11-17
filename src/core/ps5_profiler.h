@@ -85,7 +85,12 @@ struct Counters {
   std::atomic<uint64_t> encode_requests_tsc{0};
   std::atomic<uint64_t> encode_draw_tsc{0};
   std::atomic<uint64_t> encode_lock_wait_tsc{0};
-  std::atomic<uint64_t> encode_lock_waits{0};  // RequestRange calls skipped (cached)  // time in RequestRanges, TSC ticks
+  std::atomic<uint64_t> encode_lock_waits{0};
+  // EncodeDraw sections, TSC ticks: render targets, pipeline, (pipeline bind
+  // to) dynamic state, system constants, bindings, (bindings to) barrier
+  // submission and render pass, draw and the rest.
+  std::atomic<uint64_t> encode_section_tsc[8] = {};
+  std::atomic<uint64_t> encode_append_tsc{0};  // AppendPrepCommandsToMain  // RequestRange calls skipped (cached)  // time in RequestRanges, TSC ticks
   // Registers found different in the draw encoding register file copy check.
   std::atomic<uint64_t> encode_register_mismatches{0};  // since the last profile interval
 };

@@ -4078,9 +4078,14 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
       CheckEncodeRegisters();
     }
   }
+#if REX_PLATFORM_PS5
+  const uint64_t append_start = __rdtsc();
+#endif
   AppendPrepCommandsToMain(packet.prep_commands);
 #if REX_PLATFORM_PS5
   const uint64_t requests_start = __rdtsc();
+  rex::ps5prof::counters().encode_append_tsc.fetch_add(requests_start - append_start,
+                                                       std::memory_order_relaxed);
 #endif
   if (packet.has_draw) {
     for (const SharedMemory::DeferredRequest& request : packet.deferred_requests) {
@@ -5069,11 +5074,23 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
                    : 0;
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+#if REX_PLATFORM_PS5
+  uint64_t encode_section_time = __rdtsc();
+  auto encode_section_mark = [&encode_section_time](uint32_t section) {
+    const uint64_t now = __rdtsc();
+    rex::ps5prof::counters().encode_section_tsc[section].fetch_add(
+        now - encode_section_time, std::memory_order_relaxed);
+    encode_section_time = now;
+  };
+#endif
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
+#if REX_PLATFORM_PS5
+  encode_section_mark(0);
+#endif
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
@@ -5100,6 +5117,9 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
     return draw_fail("pipeline_lookup");
   }
 
+#if REX_PLATFORM_PS5
+  encode_section_mark(1);
+#endif
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
@@ -5198,16 +5218,25 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
     }
   }
 
+#if REX_PLATFORM_PS5
+  encode_section_mark(2);
+#endif
   // Update system constants before uploading them.
   UpdateSystemConstantValues(packet, primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
 
+#if REX_PLATFORM_PS5
+  encode_section_mark(3);
+#endif
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
   if (!UpdateBindings(packet, vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
+#if REX_PLATFORM_PS5
+  encode_section_mark(4);
+#endif
 
 
   ScratchBufferAcquisition guest_dma_index_scratch_buffer;
@@ -5269,9 +5298,15 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
+#if REX_PLATFORM_PS5
+  encode_section_mark(5);
+#endif
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+#if REX_PLATFORM_PS5
+  encode_section_mark(6);
+#endif
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -5331,6 +5366,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   }
 
 #if REX_PLATFORM_PS5
+  encode_section_mark(7);
   rex::ps5prof::counters().draws.fetch_add(1, std::memory_order_relaxed);
 #endif
   if (const uint32_t submit_every = REXCVAR_GET(vulkan_submit_every_draws)) {

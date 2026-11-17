@@ -380,6 +380,22 @@ void Dump(int fd, double seconds) {
                  "waits %.0f (%.1f ms)\n",
                  etd[0] / tsc_per_ms, etd[1] / tsc_per_ms, etd[3], etd[2] / tsc_per_ms);
     write(fd, header, size_t(n));
+    static uint64_t previous_append = 0;
+    const uint64_t append_now = counters_now.encode_append_tsc.load();
+    const double append_ms = double(append_now - previous_append) * inv / tsc_per_ms;
+    previous_append = append_now;
+    static uint64_t previous_sections[8] = {};
+    double sec[8];
+    for (int k = 0; k < 8; ++k) {
+      const uint64_t now_k = counters_now.encode_section_tsc[k].load();
+      sec[k] = double(now_k - previous_sections[k]) * inv / tsc_per_ms;
+      previous_sections[k] = now_k;
+    }
+    n = snprintf(header, sizeof(header),
+                 "encode-draw/s ms: prep append %.1f | rt %.1f, pipeline %.1f, dynamic %.1f, sysconst %.1f, "
+                 "bindings %.1f, mid %.1f, barriers+pass %.1f, draw+rest %.1f\n",
+                 append_ms, sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7]);
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;
