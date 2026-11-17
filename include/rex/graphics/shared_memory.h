@@ -122,6 +122,12 @@ class SharedMemory {
     deferred_requests_ = deferred_requests;
   }
   bool RequestRangeImmediate(uint32_t start, uint32_t length);
+  // For callers that need the global critical region around a GPU write
+  // marking (RangeWrittenByGpu): take this first - the lock order is this,
+  // then the global critical region.
+  std::unique_lock<std::recursive_mutex> LockRequests() {
+    return std::unique_lock<std::recursive_mutex>(request_mutex_);
+  }
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -259,7 +265,10 @@ class SharedMemory {
   // Requests from the draw preparation and the encoding threads: the upload
   // state (upload_ranges_, the backend's upload buffers and upload command
   // buffer, submission access tracking) and the request cache.
-  std::mutex request_mutex_;
+  std::recursive_mutex request_mutex_;
+  // Hot pages whose shadow must not be used (a watch was put on them); cleared
+  // by the next snapshot.
+  std::vector<uint64_t> hot_shadow_stale_;
   std::vector<DeferredRequest>* deferred_requests_ = nullptr;
   bool RequestRangesLocked(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRangeCachedLocked(uint32_t start, uint32_t length);

@@ -78,6 +78,7 @@ void SharedMemory::InitializeCommon() {
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
   hot_pages_.assign(num_system_page_flags_, 0);
   hot_block_invalidations_.assign(num_system_page_flags_, 0);
+  hot_shadow_stale_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -276,7 +277,10 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
         if (block & bit) {
           hot = true;
           block &= ~bit;
-          hot_page_shadows_.erase(page);
+          // Not erased here (the shadows only change under request_mutex_,
+          // which can't be taken inside the global critical region): marked
+          // stale, so it isn't used again before the next snapshot.
+          hot_shadow_stale_[page >> 6] |= bit;
           AdvanceValidityGeneration();
         }
       }
@@ -341,6 +345,9 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
     return;
   }
   BeforeNonDeferredAccess(start, length);
+  // MakeRangeValid changes hot page shadows, RangeAccessedByGpu the upload
+  // state.
+  std::lock_guard<std::recursive_mutex> request_lock(request_mutex_);
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
   uint32_t page_first = start >> page_size_log2_;
@@ -439,6 +446,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
             }
             std::memcpy(shadow.data.get(), memory().TranslatePhysical(page << page_size_log2_),
                         page_bytes);
+            hot_shadow_stale_[page >> 6] &= ~(uint64_t(1) << (page & 63));
             // The whole page equals guest memory as of now.
             shadow.verified_epoch = hot_check_epoch_.load(std::memory_order_relaxed);
             shadow.verified_lines = UINT64_MAX;
@@ -541,10 +549,12 @@ void SharedMemory::OnFrameSwapped() {
     return;
   }
   hot_frames_ = 0;
+  std::lock_guard<std::recursive_mutex> request_lock(request_mutex_);
   auto global_lock = global_critical_region_.Acquire();
   std::fill(hot_pages_.begin(), hot_pages_.end(), uint64_t(0));
   std::fill(hot_block_invalidations_.begin(), hot_block_invalidations_.end(), uint8_t(0));
   hot_page_shadows_.clear();
+  std::fill(hot_shadow_stale_.begin(), hot_shadow_stale_.end(), uint64_t(0));
   AdvanceValidityGeneration();
 }
 
@@ -565,7 +575,8 @@ void SharedMemory::AdvanceHotCheckEpoch(GuestSyncPoint kind) {
 
 void SharedMemory::FilterUnchangedHotPages(
     const std::vector<std::pair<uint32_t, uint32_t>>& byte_ranges) {
-  // Call in the global critical region, with upload_ranges_ filled from
+  // Call with request_mutex_ held (the shadows only change under it), with
+  // upload_ranges_ filled from
   // byte_ranges (sorted, non-overlapping). Only the requested bytes of a hot
   // page are compared: the shadow always equals the GPU copy, so if those
   // bytes match, the GPU copy is correct for this request; the rest of the
@@ -592,7 +603,7 @@ void SharedMemory::FilterUnchangedHotPages(
   };
   for (const auto& range : upload_ranges_) {
     for (uint32_t page = range.first; page < range.first + range.second; ++page) {
-      if ((hot_pages_[page >> 6] >> (page & 63)) & 1) {
+      if (((hot_pages_[page >> 6] & ~hot_shadow_stale_[page >> 6]) >> (page & 63)) & 1) {
         auto it = hot_page_shadows_.find(page);
         if (it != hot_page_shadows_.end()) {
           const uint32_t page_start = page << page_size_log2_;
@@ -735,7 +746,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   for (size_t i = 0; i < count; ++i) {
     BeforeNonDeferredAccess(ranges[i].first, ranges[i].second);
   }
-  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  std::lock_guard<std::recursive_mutex> request_lock(request_mutex_);
   return RequestRangesLocked(ranges, count);
 }
 
@@ -829,7 +840,11 @@ bool SharedMemory::RequestRangesLocked(const std::pair<uint32_t, uint32_t>* rang
     upload_ranges_.emplace_back(page_start, page_count);
   };
   {
-    auto global_lock = global_critical_region_.Acquire();
+    // Without the global critical region (shared with the guest's threads,
+    // contended now that two threads request): the page flags are only read
+    // here - a page invalidated by a guest thread at the same time is just as
+    // if the write came after this request - and the hot page shadows are
+    // only changed under request_mutex_, which is held.
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
@@ -929,12 +944,12 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
     return true;
   }
   BeforeNonDeferredAccess(start, length);
-  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  std::lock_guard<std::recursive_mutex> request_lock(request_mutex_);
   return RequestRangeCachedLocked(start, length);
 }
 
 bool SharedMemory::RequestRangeImmediate(uint32_t start, uint32_t length) {
-  std::lock_guard<std::mutex> request_lock(request_mutex_);
+  std::lock_guard<std::recursive_mutex> request_lock(request_mutex_);
   return RequestRangeCachedLocked(start, length);
 }
 

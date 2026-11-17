@@ -5518,6 +5518,8 @@ void VulkanCommandProcessor::DeliverCompletedMemexportReadbacks() {
     {
       // Under the global lock so a guest thread can't write these pages
       // between the check and the copy.
+      // Lock order: shared memory requests, then the global critical region.
+      auto request_lock = shared_memory_->LockRequests();
       auto global_lock = rex::thread::global_critical_region::AcquireDirect();
       for (const draw_util::MemExportRange& memexport_range : pending.ranges) {
         const uint32_t start = memexport_range.base_address_dwords << 2;
