@@ -365,6 +365,21 @@ void Dump(int fd, double seconds) {
     if (w > 0) {
       write(fd, request_line, std::min(size_t(w), sizeof(request_line) - 1));
     }
+    static uint64_t previous_encode_thread[4] = {};
+    const uint64_t encode_thread_now[4] = {
+        counters_now.encode_requests_tsc.load(), counters_now.encode_draw_tsc.load(),
+        counters_now.encode_lock_wait_tsc.load(), counters_now.encode_lock_waits.load()};
+    double etd[4];
+    for (int k = 0; k < 4; ++k) {
+      etd[k] = double(encode_thread_now[k] - previous_encode_thread[k]) * inv;
+      previous_encode_thread[k] = encode_thread_now[k];
+    }
+    const double tsc_per_ms = tsc_mhz > 0.0 ? tsc_mhz * 1000.0 : 1.6e6;
+    n = snprintf(header, sizeof(header),
+                 "encode-thread/s: deferred requests %.1f ms, EncodeDraw %.1f ms, request lock "
+                 "waits %.0f (%.1f ms)\n",
+                 etd[0] / tsc_per_ms, etd[1] / tsc_per_ms, etd[3], etd[2] / tsc_per_ms);
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;

@@ -16,6 +16,9 @@
 #include <rex/memory/bytes_equal.h>
 #include <chrono>
 #include <algorithm>
+#if REX_PLATFORM_PS5
+#include <x86intrin.h>
+#endif
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -4076,6 +4079,9 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
     }
   }
   AppendPrepCommandsToMain(packet.prep_commands);
+#if REX_PLATFORM_PS5
+  const uint64_t requests_start = __rdtsc();
+#endif
   if (packet.has_draw) {
     for (const SharedMemory::DeferredRequest& request : packet.deferred_requests) {
       SharedMemory::ScopedRequestSource request_source(*shared_memory_, request.source);
@@ -4088,11 +4094,23 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
       }
     }
   }
+#if REX_PLATFORM_PS5
+  const uint64_t draw_start = __rdtsc();
+#endif
   if (packet.has_draw) {
     encoding_ = true;
     EncodeDraw(packet);
     encoding_ = false;
   }
+#if REX_PLATFORM_PS5
+  {
+    const uint64_t draw_end = __rdtsc();
+    auto& counters = rex::ps5prof::counters();
+    counters.encode_requests_tsc.fetch_add(draw_start - requests_start,
+                                           std::memory_order_relaxed);
+    counters.encode_draw_tsc.fetch_add(draw_end - draw_start, std::memory_order_relaxed);
+  }
+#endif
   packet.prep_commands.clear();
 }
 

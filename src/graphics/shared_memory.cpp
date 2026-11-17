@@ -949,7 +949,18 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 }
 
 bool SharedMemory::RequestRangeImmediate(uint32_t start, uint32_t length) {
-  std::lock_guard<std::recursive_mutex> request_lock(request_mutex_);
+  std::unique_lock<std::recursive_mutex> request_lock(request_mutex_, std::try_to_lock);
+  if (!request_lock.owns_lock()) {
+#if REX_PLATFORM_PS5
+    const uint64_t wait_start = __rdtsc();
+#endif
+    request_lock.lock();
+#if REX_PLATFORM_PS5
+    rex::ps5prof::counters().encode_lock_wait_tsc.fetch_add(__rdtsc() - wait_start,
+                                                            std::memory_order_relaxed);
+    rex::ps5prof::counters().encode_lock_waits.fetch_add(1, std::memory_order_relaxed);
+#endif
+  }
   return RequestRangeCachedLocked(start, length);
 }
 
