@@ -16,6 +16,7 @@
 #include <rex/memory/bytes_equal.h>
 #include <chrono>
 #include <algorithm>
+#include <ctime>
 #if REX_PLATFORM_PS5
 #include <x86intrin.h>
 #endif
@@ -5076,11 +5077,32 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
 #if REX_PLATFORM_PS5
   uint64_t encode_section_time = __rdtsc();
-  auto encode_section_mark = [&encode_section_time](uint32_t section) {
+  // Every 16th draw, also the thread's CPU time per section, so the time spent
+  // blocked (wall minus CPU) can be told apart.
+  const bool encode_cpu_sample = !(++encode_cpu_sample_counter_ & 15);
+  auto thread_cpu_ns = []() {
+    timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+  };
+  uint64_t encode_section_cpu = encode_cpu_sample ? thread_cpu_ns() : 0;
+  uint64_t encode_section_sample_tsc = encode_cpu_sample ? __rdtsc() : 0;
+  auto encode_section_mark = [&](uint32_t section) {
     const uint64_t now = __rdtsc();
-    rex::ps5prof::counters().encode_section_tsc[section].fetch_add(
-        now - encode_section_time, std::memory_order_relaxed);
+    auto& counters = rex::ps5prof::counters();
+    counters.encode_section_tsc[section].fetch_add(now - encode_section_time,
+                                                   std::memory_order_relaxed);
     encode_section_time = now;
+    if (encode_cpu_sample) {
+      const uint64_t cpu = thread_cpu_ns();
+      const uint64_t tsc = __rdtsc();
+      counters.encode_section_sample_cpu_ns[section].fetch_add(cpu - encode_section_cpu,
+                                                              std::memory_order_relaxed);
+      counters.encode_section_sample_tsc[section].fetch_add(tsc - encode_section_sample_tsc,
+                                                           std::memory_order_relaxed);
+      encode_section_cpu = cpu;
+      encode_section_sample_tsc = tsc;
+    }
   };
 #endif
   // Set up the render targets - this may perform dispatches and draws.

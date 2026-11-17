@@ -1224,6 +1224,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkDescriptorImageInfo> image_infos[2];
   };
   TextureMemo texture_memo_;
+  uint32_t encode_cpu_sample_counter_ = 0;  // encoding thread profiling
 
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE

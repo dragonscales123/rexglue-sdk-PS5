@@ -396,6 +396,22 @@ void Dump(int fd, double seconds) {
                  "bindings %.1f, mid %.1f, barriers+pass %.1f, draw+rest %.1f\n",
                  append_ms, sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6], sec[7]);
     write(fd, header, size_t(n));
+    // Share of each section's wall time spent running (sampled draws).
+    static uint64_t previous_sample_cpu[8] = {}, previous_sample_tsc[8] = {};
+    double busy[8];
+    for (int k = 0; k < 8; ++k) {
+      const uint64_t cpu_k = counters_now.encode_section_sample_cpu_ns[k].load();
+      const uint64_t tsc_k = counters_now.encode_section_sample_tsc[k].load();
+      const double wall_ns = double(tsc_k - previous_sample_tsc[k]) / (tsc_per_ms / 1e6);
+      busy[k] = wall_ns > 0.0 ? 100.0 * double(cpu_k - previous_sample_cpu[k]) / wall_ns : 0.0;
+      previous_sample_cpu[k] = cpu_k;
+      previous_sample_tsc[k] = tsc_k;
+    }
+    n = snprintf(header, sizeof(header),
+                 "encode-draw running %%: rt %.0f, pipeline %.0f, dynamic %.0f, sysconst %.0f, "
+                 "bindings %.0f, mid %.0f, barriers+pass %.0f, draw+rest %.0f\n",
+                 busy[0], busy[1], busy[2], busy[3], busy[4], busy[5], busy[6], busy[7]);
+    write(fd, header, size_t(n));
   }
 
   size_t shown = 0;
