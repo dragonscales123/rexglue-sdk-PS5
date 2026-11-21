@@ -2391,13 +2391,19 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
         register_file_->values + start_index, base, num_registers,
         [&](uint32_t first_dword, uint32_t lane_mask) {
           MarkEncodeRegistersDirty(start_index + first_dword, 8);
-          while (lane_mask) {
-            uint32_t lane = uint32_t(std::countr_zero(lane_mask));
-            lane_mask &= lane_mask - 1;
-            uint32_t float_constant = (first_float_dword + first_dword + lane) >> 2;
-            pending_float_constants_written_[float_constant >> 8]
-                                            [(float_constant >> 6) & 3] |=
-                uint64_t(1) << (float_constant & 63);
+          // 8 dwords span at most 3 float constants (4 dwords each): mark the
+          // ones with a changed lane, not lane by lane.
+          const uint32_t group_dword = first_float_dword + first_dword;
+          const uint32_t shift = group_dword & 3;
+          const uint32_t first_constant = group_dword >> 2;
+          const uint32_t shifted_mask = lane_mask << shift;
+          for (uint32_t i = 0; i < 3; ++i) {
+            if ((shifted_mask >> (i * 4)) & 0xF) {
+              const uint32_t float_constant = first_constant + i;
+              pending_float_constants_written_[float_constant >> 8]
+                                              [(float_constant >> 6) & 3] |=
+                  uint64_t(1) << (float_constant & 63);
+            }
           }
         });
 #if REX_PLATFORM_PS5

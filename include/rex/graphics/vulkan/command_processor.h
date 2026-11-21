@@ -1027,13 +1027,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IsEncodeRingEmpty() const {
     return encode_ring_tail_.load(std::memory_order_acquire) == encode_ring_head_prepared_;
   }
-  bool encoding_ = false;
+  // Written by the encoding thread for every packet: a cache line of its own,
+  // not shared with the preparation's per-draw fields around it.
+  alignas(64) bool encoding_ = false;
   std::atomic<bool> encode_end_submission_requested_{false};
   // vulkan_draw_encode_thread: packets are encoded on encode_thread_, which
   // spins briefly, then sleeps on encode_work_cv_ when the ring is empty; the
   // preparation sleeps on encode_done_cv_ when it's full or draining. The
   // sleeping flags let the other side signal only when needed.
-  bool encode_thread_enabled_ = false;
+  alignas(64) bool encode_thread_enabled_ = false;
   std::unique_ptr<rex::thread::Thread> encode_thread_;
   std::thread::id encode_thread_id_;
   // The encoding thread's stack range [low, high) for IsEncodeThread, or
