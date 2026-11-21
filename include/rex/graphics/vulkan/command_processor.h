@@ -1030,12 +1030,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Written by the encoding thread for every packet: a cache line of its own,
   // not shared with the preparation's per-draw fields around it.
   alignas(64) bool encoding_ = false;
-  std::atomic<bool> encode_end_submission_requested_{false};
   // vulkan_draw_encode_thread: packets are encoded on encode_thread_, which
   // spins briefly, then sleeps on encode_work_cv_ when the ring is empty; the
   // preparation sleeps on encode_done_cv_ when it's full or draining. The
   // sleeping flags let the other side signal only when needed.
   alignas(64) bool encode_thread_enabled_ = false;
+  // Read by the preparation for every packet, set rarely by the encoding.
+  std::atomic<bool> encode_end_submission_requested_{false};
   std::unique_ptr<rex::thread::Thread> encode_thread_;
   std::thread::id encode_thread_id_;
   // The encoding thread's stack range [low, high) for IsEncodeThread, or
@@ -1047,7 +1048,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::mutex encode_mutex_;
   std::condition_variable encode_work_cv_;
   std::condition_variable encode_done_cv_;
-  std::atomic<bool> encode_thread_sleeping_{false};
+  // Each side reads the other's flag for every packet: a line of their own,
+  // away from fields either writes per draw.
+  alignas(64) std::atomic<bool> encode_thread_sleeping_{false};
   std::atomic<bool> encode_producer_sleeping_{false};
   std::atomic<bool> encode_thread_exit_{false};
   // Waits (spinning, then sleeping) until the ring has fewer than
@@ -1055,7 +1058,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void WaitForEncodeRing(uint64_t max_waiting);
   // Whether the preparation thread is recording a preparation chunk (only it
   // ever does - the encoding thread never records one).
-  std::atomic<bool> prep_recording_active_{false};
+  alignas(64) std::atomic<bool> prep_recording_active_{false};
   // transient_descriptor_allocator_uniform_buffer_ / _storage_buffer_ and the
   // single transient descriptor lists are used by both draw preparation and
   // encoding.

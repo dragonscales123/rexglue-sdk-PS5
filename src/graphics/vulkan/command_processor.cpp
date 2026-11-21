@@ -3554,10 +3554,12 @@ bool VulkanCommandProcessor::IsPrepRecording() const {
   // being recorded, any thread but the encoding thread is the preparation
   // thread. (No thread_local: on the PS5 it goes through emulated TLS, slow
   // for something checked on every barrier and command.)
-  if (!prep_recording_active_.load(std::memory_order_relaxed)) {
+  // The encoding thread asks first, without touching the flag the preparation
+  // writes for every draw.
+  if (IsEncodeThread()) {
     return false;
   }
-  return !IsEncodeThread();
+  return prep_recording_active_.load(std::memory_order_relaxed);
 }
 
 VulkanCommandProcessor::RecordingContext* VulkanCommandProcessor::CurrentRecording() {
