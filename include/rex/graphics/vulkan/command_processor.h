@@ -905,7 +905,9 @@ class VulkanCommandProcessor : public CommandProcessor {
       (RegisterFile::kRegisterCount + (size_t(1) << kEncodeRegisterBlockShift) - 1) >>
       kEncodeRegisterBlockShift;
   RegisterFile encode_register_file_;
-  uint64_t encode_register_dirty_[(kEncodeRegisterBlockCount + 63) / 64] = {};
+  // (Not on a line with the end of encode_register_file_, which the encoding
+  // writes.)
+  alignas(64) uint64_t encode_register_dirty_[(kEncodeRegisterBlockCount + 63) / 64] = {};
   uint32_t encode_register_check_countdown_ = 0;
   uint32_t encode_register_mismatches_logged_ = 0;
   void MarkEncodeRegistersDirty(uint32_t start_index, uint32_t count) {
@@ -1210,7 +1212,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool dynamic_stencil_reference_back_update_needed_;
 
   // Currently used samplers.
-  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
+  // Preparation fields from here (the dynamic state flags before are the
+  // encoding's, written for every draw).
+  alignas(64) std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>
+      current_samplers_vertex_;
   // Per stage (vertex, pixel): the samplers in current_samplers_* are reused
   // for the next draw if the shader and submission are the same and none of
   // the texture fetch constants they were built from changed since.
@@ -1236,7 +1241,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkDescriptorImageInfo> image_infos[2];
   };
   TextureMemo texture_memo_;
-  uint32_t encode_cpu_sample_counter_ = 0;  // encoding thread profiling
+  alignas(64) uint32_t encode_cpu_sample_counter_ = 0;  // encoding thread profiling
 
   // Cache render pass currently started in the command buffer with the
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
