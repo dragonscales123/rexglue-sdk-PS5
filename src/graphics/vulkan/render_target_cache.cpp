@@ -1128,22 +1128,92 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
                                       uint32_t& written_address_out, uint32_t& written_length_out) {
-  written_address_out = 0;
-  written_length_out = 0;
-
-  bool draw_resolution_scaled = IsDrawResolutionScaled();
-
-  draw_util::ResolveInfo resolve_info;
-  if (!draw_util::GetResolveInfo(register_file(), memory, draw_resolution_scale_x(),
-                                 draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
-                                 IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+  PreparedResolve prepared;
+  bool has_work;
+  if (!PrepareResolve(register_file(), memory, shared_memory, texture_cache, prepared, has_work,
+                      written_address_out, written_length_out)) {
     return false;
   }
+  if (!has_work) {
+    return true;
+  }
+  return ExecuteResolve(prepared, shared_memory, texture_cache);
+}
+
+bool VulkanRenderTargetCache::PrepareResolve(const RegisterFile& regs,
+                                             const memory::Memory& memory,
+                                             VulkanSharedMemory& shared_memory,
+                                             VulkanTextureCache& texture_cache,
+                                             PreparedResolve& prepared, bool& has_work_out,
+                                             uint32_t& written_address_out,
+                                             uint32_t& written_length_out) {
+  written_address_out = 0;
+  written_length_out = 0;
+  has_work_out = false;
+  prepared.copy_dest_committed = false;
+  prepared.copy_shader = draw_util::ResolveCopyShaderIndex::kUnknown;
+
+  if (!draw_util::GetResolveInfo(regs, memory, draw_resolution_scale_x(),
+                                 draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
+                                 IsFixedRGBA16TruncatedToMinus1To1(), prepared.info)) {
+    return false;
+  }
+  const draw_util::ResolveInfo& resolve_info = prepared.info;
 
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
   }
+  has_work_out = true;
+
+  if (!resolve_info.copy_dest_extent_length) {
+    return true;
+  }
+  draw_util::ResolveCopyShaderConstants copy_shader_constants;
+  uint32_t copy_group_count_x, copy_group_count_y;
+  prepared.copy_shader =
+      resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
+                                 copy_shader_constants, copy_group_count_x, copy_group_count_y);
+  if (prepared.copy_shader == draw_util::ResolveCopyShaderIndex::kUnknown) {
+    return true;
+  }
+  const draw_util::ResolveCopyShaderInfo& copy_shader_info =
+      draw_util::resolve_copy_shader_info[size_t(prepared.copy_shader)];
+
+  // Make sure there is memory to write to.
+  if (IsDrawResolutionScaled()) {
+    uint32_t copy_dest_range_unscaled = resolve_info.copy_dest_extent_start -
+                                        resolve_info.copy_dest_base +
+                                        resolve_info.copy_dest_extent_length;
+    prepared.copy_dest_committed = texture_cache.CommitScaledResolveRange(
+        resolve_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
+  } else {
+    SharedMemory::ScopedRequestSource request_source(shared_memory,
+                                                     SharedMemory::RequestSource::kResolve);
+    prepared.copy_dest_committed = shared_memory.RequestRange(
+        resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length);
+  }
+  if (!prepared.copy_dest_committed) {
+    REXGPU_ERROR(
+        "VulkanRenderTargetCache: Failed to obtain the resolve destination "
+        "memory region");
+    return true;
+  }
+  // Invalidate textures and mark the range as scaled if needed - here, in
+  // preparation order, so the textures of the draws prepared after this see it
+  // (the copy itself is recorded before their commands).
+  texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                    resolve_info.copy_dest_extent_length);
+  written_address_out = resolve_info.copy_dest_extent_start;
+  written_length_out = resolve_info.copy_dest_extent_length;
+  return true;
+}
+
+bool VulkanRenderTargetCache::ExecuteResolve(const PreparedResolve& prepared,
+                                             VulkanSharedMemory& shared_memory,
+                                             VulkanTextureCache& texture_cache) {
+  const draw_util::ResolveInfo& resolve_info = prepared.info;
+  bool draw_resolution_scaled = IsDrawResolutionScaled();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1210,22 +1280,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         }
       }
 
-      // Make sure there is memory to write to.
-      bool copy_dest_committed;
-      if (draw_resolution_scaled) {
-        copy_dest_committed = texture_cache.CommitScaledResolveRange(
-            resolve_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
-      } else {
-        SharedMemory::ScopedRequestSource request_source(shared_memory,
-                                                         SharedMemory::RequestSource::kResolve);
-        copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
-                                                         resolve_info.copy_dest_extent_length);
-      }
-      if (!copy_dest_committed) {
-        REXGPU_ERROR(
-            "VulkanRenderTargetCache: Failed to obtain the resolve destination "
-            "memory region");
-      } else {
+      if (prepared.copy_dest_committed) {
         // TODO(Triang3l): Switching between descriptors if exceeding
         // maxStorageBufferRange.
         // TODO(Triang3l): Use a single 512 MB shared memory binding if
@@ -1287,11 +1342,6 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_processor_.SubmitBarriers(true);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
-          // Invalidate textures and mark the range as scaled if needed.
-          texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
-          written_address_out = resolve_info.copy_dest_extent_start;
-          written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
         }
       }

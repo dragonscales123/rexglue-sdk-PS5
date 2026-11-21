@@ -109,6 +109,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
 
+  // Resolve in two parts, for doing it on the draw encoding thread:
+  // PrepareResolve, in preparation order with the preparation's registers -
+  // the resolve info, the destination request and the texture cache marking;
+  // ExecuteResolve, in encoding order - the render target dumps, the copy and
+  // the clears. has_work_out is false if there is nothing to copy or clear.
+  struct PreparedResolve {
+    draw_util::ResolveInfo info;
+    draw_util::ResolveCopyShaderIndex copy_shader = draw_util::ResolveCopyShaderIndex::kUnknown;
+    bool copy_dest_committed = false;
+  };
+  bool PrepareResolve(const RegisterFile& regs, const memory::Memory& memory,
+                      VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
+                      PreparedResolve& prepared, bool& has_work_out,
+                      uint32_t& written_address_out, uint32_t& written_length_out);
+  bool ExecuteResolve(const PreparedResolve& prepared, VulkanSharedMemory& shared_memory,
+                      VulkanTextureCache& texture_cache);
+
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
   // Binding information for the last successful update.

@@ -933,6 +933,10 @@ class VulkanCommandProcessor : public CommandProcessor {
     // Vertex and index buffer shared memory requests, made by the encoding
     // (vulkan_encode_buffer_requests) right before the draw.
     std::vector<SharedMemory::DeferredRequest> deferred_requests;
+    // A resolve (vulkan_encode_resolves) - executed after the preparation
+    // commands (the destination request's upload), instead of a draw.
+    bool has_resolve = false;
+    VulkanRenderTargetCache::PreparedResolve resolve;
     // Register changes since the previous packet, as (first register, count)
     // runs with their values, applied to encode_register_file_.
     // Only the first register_run_count / register_value_count elements are

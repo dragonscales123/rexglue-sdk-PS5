@@ -62,6 +62,10 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_BOOL(vulkan_encode_resolves, true, "GPU/Vulkan",
+                    "With the draw encoding thread, do the render target part of resolves "
+                    "(dumps, copy, clears) on that thread in draw order, instead of waiting for "
+                    "it to finish every queued draw first.");
 REXCVAR_DEFINE_BOOL(vulkan_encode_buffer_requests, true, "GPU/Vulkan",
                     "With the draw encoding thread, make the vertex and index buffer shared "
                     "memory requests (residency checks, hot page checks, uploads) on that thread "
@@ -3705,6 +3709,7 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
   packet.prep_commands.clear();
   packet.image_infos.clear();
   packet.deferred_requests.clear();
+  packet.has_resolve = false;
   return packet;
 }
 
@@ -4108,6 +4113,9 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
 #if REX_ENCODE_PROFILING
   const uint64_t draw_start = __rdtsc();
 #endif
+  if (packet.has_resolve) {
+    render_target_cache_->ExecuteResolve(packet.resolve, *shared_memory_, *texture_cache_);
+  }
   if (packet.has_draw) {
     encoding_ = true;
     EncodeDraw(packet);
@@ -5895,6 +5903,34 @@ bool VulkanCommandProcessor::IssueCopy() {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+
+  if (encode_thread_enabled_ && REXCVAR_GET(vulkan_encode_resolves) &&
+      readback_mode == ReadbackResolveMode::kDisabled &&
+      !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE]) &&
+      !render_target_cache_->IsDrawResolutionScaled()) {
+    // The memory and texture side here, in preparation order (later draws'
+    // preparation sees the resolved range); the render target side on the
+    // encoding thread, after the draws before it and with the registers as of
+    // now (carried by the packet).
+    if (!BeginSubmission(true)) {
+      return false;
+    }
+    EncodeDrawPacket& packet = AcquireEncodeDrawPacket();
+    BeginPrepRecording();
+    bool has_work = false;
+    uint32_t written_address, written_length;
+    bool prepared = render_target_cache_->PrepareResolve(*register_file_, *memory_,
+                                                         *shared_memory_, *texture_cache_,
+                                                         packet.resolve, has_work,
+                                                         written_address, written_length);
+    EndPrepRecording(&packet.prep_commands);
+    packet.has_draw = false;
+    packet.has_resolve = prepared && has_work;
+    QueueEncodeDrawPacket();
+    return prepared;
+  }
+
   // Resolves use the render target cache (encoding side) with the current
   // registers, and change memory that later draws' preparation reads.
   DrainEncodeQueue(DrainSource::kCopy);
@@ -5904,7 +5940,6 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled &&
       !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE])) {
     uint32_t written_address, written_length;
