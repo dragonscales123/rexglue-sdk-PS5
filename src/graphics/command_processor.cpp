@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+
+#include <immintrin.h>
 #include <string>
 #include <string_view>
 
@@ -38,7 +40,15 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#if REX_PLATFORM_PS5
+#include "../core/ps5_profiler.h"
+#endif
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(gpu_parse_thread, true, "GPU",
+                    "Parse the PM4 command stream on a separate thread, which drops rewrites of "
+                    "unchanged shader constants and forwards everything else, in order, to the "
+                    "command processor thread.");
 REXCVAR_DEFINE_BOOL(hot_page_epoch_on_coherency_waits, true, "GPU",
                     "Start a new hot page check epoch at WAIT_REG_MEMs on COHER_STATUS_HOST "
                     "(GPU cache coherency requests). Off: only other waits, batches, "
@@ -337,6 +347,12 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 void CommandProcessor::WorkerThreadMain() {
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
+    return;
+  }
+
+  if (REXCVAR_GET(gpu_parse_thread)) {
+    RunWithParseThread();
+    ShutdownContext();
     return;
   }
 
@@ -1819,6 +1835,526 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
   }
 
   return true;
+}
+
+
+// PM4 parse thread.
+
+void CommandProcessor::RunWithParseThread() {
+  parse_ring_ = std::make_unique<uint32_t[]>(kParseRingDwords);
+  parse_head_.store(0, std::memory_order_relaxed);
+  parse_tail_.store(0, std::memory_order_relaxed);
+  parse_head_local_ = 0;
+  parse_head_published_ = 0;
+  parse_tail_cached_ = 0;
+  parse_head_cached_ = 0;
+  parse_read_ptr_index_ = read_ptr_index_;
+  parse_bin_select_ = bin_select_;
+  parse_bin_mask_ = bin_mask_;
+  std::memcpy(parse_constants_, register_file_->values + kParseConstantsFirst,
+              sizeof(parse_constants_));
+  parse_thread_exit_.store(false);
+  rex::thread::Thread::CreationParameters parse_thread_params;
+  parse_thread_params.stack_size = 1024 * 1024;
+  parse_thread_ =
+      rex::thread::Thread::Create(parse_thread_params, [this]() { ParseThreadMain(); });
+  if (!parse_thread_) {
+    parse_ring_.reset();
+    rex::FatalError("Unable to create the PM4 parse thread (set gpu_parse_thread = false)");
+    return;
+  }
+  parse_thread_->set_name("GPU Parse");
+  parse_thread_enabled_ = true;
+  REXGPU_INFO("PM4 command stream parsed on a separate thread");
+
+  while (worker_running_) {
+    while (!pending_fns_.empty()) {
+      auto fn = std::move(pending_fns_.front());
+      pending_fns_.pop();
+      fn();
+    }
+    if (ConsumeParsedCommands()) {
+      continue;
+    }
+    // Nothing parsed to execute - don't hold back prepared work.
+    PrepareForWait();
+    bool available = false;
+    for (uint32_t i = 0; i < 4096; ++i) {
+      if (parse_head_.load(std::memory_order_acquire) !=
+          parse_tail_.load(std::memory_order_relaxed)) {
+        available = true;
+        break;
+      }
+      _mm_pause();
+    }
+    if (!available) {
+      std::unique_lock<std::mutex> lock(parse_mutex_);
+      parse_consumer_sleeping_.store(true, std::memory_order_seq_cst);
+      while (worker_running_ && pending_fns_.empty() &&
+             parse_head_.load(std::memory_order_seq_cst) ==
+                 parse_tail_.load(std::memory_order_relaxed)) {
+        parse_consumer_cv_.wait_for(lock, std::chrono::milliseconds(5));
+      }
+      parse_consumer_sleeping_.store(false, std::memory_order_relaxed);
+    }
+    ReturnFromWait();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(parse_mutex_);
+    parse_thread_exit_.store(true);
+  }
+  parse_producer_cv_.notify_all();
+  write_ptr_index_event_->Set();
+  rex::thread::Wait(parse_thread_.get(), false);
+  parse_thread_.reset();
+  parse_thread_enabled_ = false;
+  parse_ring_.reset();
+}
+
+bool CommandProcessor::ConsumeParsedCommands() {
+  uint64_t tail = parse_tail_.load(std::memory_order_relaxed);
+  if (tail == parse_head_cached_) {
+    parse_head_cached_ = parse_head_.load(std::memory_order_acquire);
+    if (tail == parse_head_cached_) {
+      return false;
+    }
+  }
+  uint32_t* const ring = parse_ring_.get();
+  uint32_t executed = 0;
+  while (tail != parse_head_cached_) {
+    const uint32_t position = uint32_t(tail & (kParseRingDwords - 1));
+    const uint32_t header = ring[position];
+    const uint32_t length = header & 0xFFFFFF;
+    switch (ParsedCommandType(header >> 24)) {
+      case ParsedCommandType::kWrap:
+        break;
+      case ParsedCommandType::kRegisters:
+        WriteRegistersFromMem(ring[position + 1], ring + position + 2, length - 2);
+        break;
+      case ParsedCommandType::kPacket: {
+        const uint32_t packet_bytes = (length - 1) * uint32_t(sizeof(uint32_t));
+        memory::RingBuffer reader(reinterpret_cast<uint8_t*>(ring + position + 1), packet_bytes);
+        reader.set_write_offset(packet_bytes);
+        if (!ExecutePacket(&reader)) {
+          REXGPU_ERROR("**** PARSED PACKET: Failed to execute packet.");
+        }
+      } break;
+      case ParsedCommandType::kPrimaryEnd:
+        read_ptr_index_ = ring[position + 1];
+        OnPrimaryBufferEnd();
+        if (read_ptr_writeback_ptr_) {
+          memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                           read_ptr_index_);
+        }
+        break;
+      case ParsedCommandType::kBatch:
+        OnGuestSyncPoint(GuestSyncPoint::kBatch);
+        break;
+    }
+    tail += length;
+    // The parse thread may be waiting for this command (a synchronous packet)
+    // or for room.
+    parse_tail_.store(tail, std::memory_order_seq_cst);
+    if (parse_producer_sleeping_.load(std::memory_order_seq_cst)) {
+      std::lock_guard<std::mutex> lock(parse_mutex_);
+      parse_producer_cv_.notify_one();
+    }
+    if (tail == parse_head_cached_) {
+      parse_head_cached_ = parse_head_.load(std::memory_order_acquire);
+    }
+    if (!(++executed & 255) && !pending_fns_.empty()) {
+      break;
+    }
+  }
+  return true;
+}
+
+uint32_t* CommandProcessor::ParseReserve(uint32_t dword_count) {
+  assert_true(dword_count < kParseRingDwords / 4);
+  uint32_t position = uint32_t(parse_head_local_ & (kParseRingDwords - 1));
+  uint32_t needed = dword_count;
+  const bool wrap = position + dword_count > kParseRingDwords;
+  if (wrap) {
+    needed += uint32_t(kParseRingDwords) - position;
+  }
+  if (parse_head_local_ + needed - parse_tail_cached_ > kParseRingDwords) {
+    parse_tail_cached_ = parse_tail_.load(std::memory_order_acquire);
+    if (parse_head_local_ + needed - parse_tail_cached_ > kParseRingDwords) {
+      ParsePublish();
+      for (uint32_t i = 0; i < 4096; ++i) {
+        parse_tail_cached_ = parse_tail_.load(std::memory_order_acquire);
+        if (parse_head_local_ + needed - parse_tail_cached_ <= kParseRingDwords) {
+          break;
+        }
+        _mm_pause();
+      }
+      if (parse_head_local_ + needed - parse_tail_cached_ > kParseRingDwords) {
+        std::unique_lock<std::mutex> lock(parse_mutex_);
+        parse_producer_sleeping_.store(true, std::memory_order_seq_cst);
+        while (!parse_thread_exit_.load() &&
+               parse_head_local_ + needed -
+                       (parse_tail_cached_ = parse_tail_.load(std::memory_order_seq_cst)) >
+                   kParseRingDwords) {
+          parse_producer_cv_.wait_for(lock, std::chrono::milliseconds(5));
+        }
+        parse_producer_sleeping_.store(false, std::memory_order_relaxed);
+      }
+    }
+  }
+  if (wrap) {
+    parse_ring_[position] =
+        (uint32_t(ParsedCommandType::kWrap) << 24) | (uint32_t(kParseRingDwords) - position);
+    parse_head_local_ += uint32_t(kParseRingDwords) - position;
+    position = 0;
+  }
+  return parse_ring_.get() + position;
+}
+
+void CommandProcessor::ParsePublish() {
+  if (parse_head_published_ == parse_head_local_) {
+    return;
+  }
+  parse_head_published_ = parse_head_local_;
+  parse_head_.store(parse_head_local_, std::memory_order_seq_cst);
+  if (parse_consumer_sleeping_.load(std::memory_order_seq_cst)) {
+    std::lock_guard<std::mutex> lock(parse_mutex_);
+    parse_consumer_cv_.notify_one();
+  }
+}
+
+void CommandProcessor::ParseWaitForConsumer() {
+  ParsePublish();
+  const uint64_t target = parse_head_local_;
+  for (uint32_t i = 0; i < 4096; ++i) {
+    if (parse_tail_.load(std::memory_order_acquire) == target) {
+      parse_tail_cached_ = target;
+      return;
+    }
+    _mm_pause();
+  }
+  std::unique_lock<std::mutex> lock(parse_mutex_);
+  parse_producer_sleeping_.store(true, std::memory_order_seq_cst);
+  while (!parse_thread_exit_.load() && parse_tail_.load(std::memory_order_seq_cst) != target) {
+    parse_producer_cv_.wait_for(lock, std::chrono::milliseconds(5));
+  }
+  parse_producer_sleeping_.store(false, std::memory_order_relaxed);
+  parse_tail_cached_ = parse_tail_.load(std::memory_order_acquire);
+}
+
+void CommandProcessor::ParseEmitRegisters(uint32_t start, const uint32_t* source_be,
+                                          uint32_t count) {
+  constexpr uint32_t kMaxRun = 16384;
+  while (count) {
+    const uint32_t run = std::min(count, kMaxRun);
+    uint32_t* record = ParseReserve(2 + run);
+    record[0] = (uint32_t(ParsedCommandType::kRegisters) << 24) | (2 + run);
+    record[1] = start;
+    std::memcpy(record + 2, source_be, sizeof(uint32_t) * run);
+    ParseCommit(2 + run);
+    start += run;
+    source_be += run;
+    count -= run;
+  }
+}
+
+void CommandProcessor::ParseWriteRange(uint32_t start, const uint32_t* source_be, uint32_t count) {
+  if (!count) {
+    return;
+  }
+  const uint32_t end = start + count;
+  if (end <= kParseConstantsFirst || start >= kParseConstantsEnd) {
+    ParseEmitRegisters(start, source_be, count);
+    return;
+  }
+  if (start < kParseConstantsFirst) {
+    const uint32_t before = kParseConstantsFirst - start;
+    ParseEmitRegisters(start, source_be, before);
+    start += before;
+    source_be += before;
+    count -= before;
+  }
+  const uint32_t inside = std::min(end, kParseConstantsEnd) - start;
+  // Only the groups of 8 constants with a changed value are forwarded.
+  uint32_t* shadow = parse_constants_ + (start - kParseConstantsFirst);
+  uint32_t run_begin = UINT32_MAX, run_end = 0;
+  for (uint32_t i = 0; i < inside; i += 8) {
+    const uint32_t group = std::min(inside - i, uint32_t(8));
+    bool changed = false;
+#if defined(__AVX2__)
+    if (group == 8) {
+      const __m256i swap_shuffle =
+          _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6,
+                           5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+      const __m256i value = _mm256_shuffle_epi8(
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(source_be + i)), swap_shuffle);
+      const __m256i old_value = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(shadow + i));
+      if (uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi32(value, old_value))) != 0xFFFFFFFFu) {
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(shadow + i), value);
+        changed = true;
+      }
+    } else
+#endif
+    {
+      for (uint32_t j = 0; j < group; ++j) {
+        const uint32_t value = rex::byte_swap(source_be[i + j]);
+        if (shadow[i + j] != value) {
+          shadow[i + j] = value;
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      if (run_begin == UINT32_MAX) {
+        run_begin = i;
+      }
+      run_end = i + group;
+    } else if (run_begin != UINT32_MAX) {
+      ParseEmitRegisters(start + run_begin, source_be + run_begin, run_end - run_begin);
+      run_begin = UINT32_MAX;
+    }
+  }
+  if (run_begin != UINT32_MAX) {
+    ParseEmitRegisters(start + run_begin, source_be + run_begin, run_end - run_begin);
+  }
+  if (count > inside) {
+    ParseEmitRegisters(start + inside, source_be + inside, count - inside);
+  }
+}
+
+void CommandProcessor::ParseWriteRangeFromRing(memory::RingBuffer* reader, uint32_t start,
+                                               uint32_t count) {
+  if (!count) {
+    return;
+  }
+  memory::RingBuffer::ReadRange range = reader->BeginRead(size_t(count) * sizeof(uint32_t));
+  if (range.first_length) {
+    const uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
+    ParseWriteRange(start, reinterpret_cast<const uint32_t*>(range.first), first_count);
+    start += first_count;
+  }
+  if (range.second_length) {
+    ParseWriteRange(start, reinterpret_cast<const uint32_t*>(range.second),
+                    uint32_t(range.second_length / sizeof(uint32_t)));
+  }
+  reader->EndRead(range);
+}
+
+void CommandProcessor::ParseForwardPacket(memory::RingBuffer* reader, uint32_t packet,
+                                          uint32_t count, bool sync, bool refresh_constants) {
+  uint32_t* record = ParseReserve(2 + count);
+  record[0] = (uint32_t(ParsedCommandType::kPacket) << 24) | (2 + count);
+  record[1] = rex::byte_swap(packet);
+  if (count) {
+    memory::RingBuffer::ReadRange range = reader->BeginRead(size_t(count) * sizeof(uint32_t));
+    std::memcpy(record + 2, range.first, range.first_length);
+    if (range.second_length) {
+      std::memcpy(reinterpret_cast<uint8_t*>(record + 2) + range.first_length, range.second,
+                  range.second_length);
+    }
+    reader->EndRead(range);
+  }
+  ParseCommit(2 + count);
+  if (sync) {
+    ParseWaitForConsumer();
+    if (refresh_constants) {
+      std::memcpy(parse_constants_, register_file_->values + kParseConstantsFirst,
+                  sizeof(parse_constants_));
+    }
+  } else {
+    ParsePublish();
+  }
+}
+
+bool CommandProcessor::ParseExecutePacket(memory::RingBuffer* reader) {
+  const uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  if (!packet) {
+    return true;
+  }
+  switch (packet >> 30) {
+    case 0: {
+      const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+      if (reader->read_count() < count * sizeof(uint32_t)) {
+        REXGPU_ERROR("ParseExecutePacket type 0 overflow");
+        return false;
+      }
+      const uint32_t base_index = packet & 0x7FFF;
+      if (!((packet >> 15) & 0x1)) {
+        ParseWriteRangeFromRing(reader, base_index, count);
+      } else {
+        for (uint32_t m = 0; m < count; ++m) {
+          const uint32_t value = reader->Read<uint32_t>();
+          ParseWriteRange(base_index, &value, 1);
+        }
+      }
+      return true;
+    }
+    case 1: {
+      const uint32_t value_1 = reader->Read<uint32_t>();
+      const uint32_t value_2 = reader->Read<uint32_t>();
+      ParseWriteRange(packet & 0x7FF, &value_1, 1);
+      ParseWriteRange((packet >> 11) & 0x7FF, &value_2, 1);
+      return true;
+    }
+    case 2:
+      return true;
+    default:
+      break;
+  }
+  const uint32_t opcode = (packet >> 8) & 0x7F;
+  const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+  const auto data_start_offset = reader->read_offset();
+  if (reader->read_count() < count * sizeof(uint32_t)) {
+    REXGPU_ERROR("ParseExecutePacket type 3 overflow");
+    return false;
+  }
+  if (packet & 1) {
+    const bool any_pass = (parse_bin_select_ & parse_bin_mask_) != 0;
+    if (!any_pass || opcode == xenos::PM4_XE_SWAP) {
+      reader->AdvanceRead(count * sizeof(uint32_t));
+      return true;
+    }
+  }
+  static constexpr uint32_t kConstantTypeBases[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+  switch (opcode) {
+    case xenos::PM4_NOP:
+      break;
+    case xenos::PM4_INDIRECT_BUFFER:
+    case xenos::PM4_INDIRECT_BUFFER_PFD: {
+      const uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
+      const uint32_t list_length = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
+      ParseIndirectBuffer(GpuToCpu(list_ptr), list_length);
+    } break;
+    case xenos::PM4_SET_CONSTANT: {
+      const uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+      const uint32_t type = (offset_type >> 16) & 0xFF;
+      if (type < 5) {
+        ParseWriteRangeFromRing(reader, kConstantTypeBases[type] + (offset_type & 0x7FF),
+                                count - 1);
+      }
+    } break;
+    case xenos::PM4_SET_CONSTANT2:
+    case xenos::PM4_SET_SHADER_CONSTANTS: {
+      const uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+      ParseWriteRangeFromRing(reader, offset_type & 0xFFFF, count - 1);
+    } break;
+    case xenos::PM4_LOAD_ALU_CONSTANT: {
+      const uint32_t address = reader->ReadAndSwap<uint32_t>() & 0x3FFFFFFF;
+      const uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+      const uint32_t size_dwords = reader->ReadAndSwap<uint32_t>() & 0xFFF;
+      const uint32_t type = (offset_type >> 16) & 0xFF;
+      if (type < 5) {
+        ParseWriteRange(kConstantTypeBases[type] + (offset_type & 0x7FF),
+                        memory_->TranslatePhysical<const uint32_t*>(address), size_dwords);
+      }
+    } break;
+    case xenos::PM4_SET_BIN_MASK_LO:
+    case xenos::PM4_SET_BIN_MASK_HI:
+    case xenos::PM4_SET_BIN_SELECT_LO:
+    case xenos::PM4_SET_BIN_SELECT_HI:
+    case xenos::PM4_SET_BIN_MASK:
+    case xenos::PM4_SET_BIN_SELECT: {
+      // Followed here (for the predicated packets parsed here) and forwarded.
+      memory::RingBuffer peek = *reader;
+      const uint32_t value_0 = peek.ReadAndSwap<uint32_t>();
+      const uint32_t value_1 = count >= 2 ? peek.ReadAndSwap<uint32_t>() : 0;
+      switch (opcode) {
+        case xenos::PM4_SET_BIN_MASK_LO:
+          parse_bin_mask_ = (parse_bin_mask_ & 0xFFFFFFFF00000000ull) | value_0;
+          break;
+        case xenos::PM4_SET_BIN_MASK_HI:
+          parse_bin_mask_ = (parse_bin_mask_ & 0xFFFFFFFFull) | (uint64_t(value_0) << 32);
+          break;
+        case xenos::PM4_SET_BIN_SELECT_LO:
+          parse_bin_select_ = (parse_bin_select_ & 0xFFFFFFFF00000000ull) | value_0;
+          break;
+        case xenos::PM4_SET_BIN_SELECT_HI:
+          parse_bin_select_ = (parse_bin_select_ & 0xFFFFFFFFull) | (uint64_t(value_0) << 32);
+          break;
+        case xenos::PM4_SET_BIN_MASK:
+          parse_bin_mask_ = (uint64_t(value_0) << 32) | value_1;
+          break;
+        default:
+          parse_bin_select_ = (uint64_t(value_0) << 32) | value_1;
+          break;
+      }
+      ParseForwardPacket(reader, packet, count, false, false);
+    } break;
+    case xenos::PM4_WAIT_REG_MEM:
+      // May wait for the CPU to write data the following packets load.
+      ParseForwardPacket(reader, packet, count, true, false);
+      break;
+    case xenos::PM4_REG_RMW:
+    case xenos::PM4_COND_WRITE:
+      // Read registers the parse thread doesn't follow, or write them.
+      ParseForwardPacket(reader, packet, count, true, true);
+      break;
+    default:
+      ParseForwardPacket(reader, packet, count, false, false);
+      break;
+  }
+  reader->set_read_offset((data_start_offset + count * sizeof(uint32_t)) % reader->capacity());
+  return true;
+}
+
+void CommandProcessor::ParseIndirectBuffer(uint32_t ptr, uint32_t count) {
+  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  reader.set_write_offset(count * sizeof(uint32_t));
+  do {
+    if (!ParseExecutePacket(&reader)) {
+      REXGPU_ERROR("**** INDIRECT RINGBUFFER (parse): Failed to execute packet.");
+      break;
+    }
+  } while (reader.read_count());
+}
+
+void CommandProcessor::ParseThreadMain() {
+#if REX_PLATFORM_PS5
+  rex::ps5prof::RegisterCurrentThread("GPU Parse");
+#endif
+  while (!parse_thread_exit_.load(std::memory_order_relaxed)) {
+    uint32_t write_ptr_index = write_ptr_index_.load();
+    if (write_ptr_index == 0xBAADF00D || parse_read_ptr_index_ == write_ptr_index) {
+      ParsePublish();
+      uint32_t loop_count = 0;
+      do {
+        if (loop_count > 500) {
+          rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
+        }
+        rex::thread::MaybeYield();
+        loop_count++;
+        write_ptr_index = write_ptr_index_.load();
+      } while (!parse_thread_exit_.load(std::memory_order_relaxed) &&
+               (write_ptr_index == 0xBAADF00D || parse_read_ptr_index_ == write_ptr_index));
+      if (parse_thread_exit_.load(std::memory_order_relaxed)) {
+        break;
+      }
+    }
+    {
+      uint32_t* record = ParseReserve(1);
+      record[0] = (uint32_t(ParsedCommandType::kBatch) << 24) | 1;
+      ParseCommit(1);
+    }
+    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_),
+                              primary_buffer_size_);
+    reader.set_read_offset(parse_read_ptr_index_ * sizeof(uint32_t));
+    reader.set_write_offset(write_ptr_index * sizeof(uint32_t));
+    do {
+      if (!ParseExecutePacket(&reader)) {
+        REXGPU_ERROR("**** PRIMARY RINGBUFFER (parse): Failed to execute packet.");
+        break;
+      }
+    } while (reader.read_count());
+    parse_read_ptr_index_ = write_ptr_index;
+    {
+      uint32_t* record = ParseReserve(2);
+      record[0] = (uint32_t(ParsedCommandType::kPrimaryEnd) << 24) | 2;
+      record[1] = write_ptr_index;
+      ParseCommit(2);
+    }
+    ParsePublish();
+  }
+  ParsePublish();
 }
 
 }  // namespace rex::graphics

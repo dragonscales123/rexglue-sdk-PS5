@@ -12,6 +12,8 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -178,6 +180,70 @@ class CommandProcessor {
   virtual void OnGuestSyncPoint(GuestSyncPoint kind) {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
+
+  // PM4 parse thread (gpu_parse_thread): a second thread reads the ring and
+  // indirect buffers, applies the register writes to a copy of the shader
+  // constants (dropping rewrites of unchanged ones), and forwards register
+  // writes and every other packet, in order, through parse_ring_ to the
+  // command processor thread, which executes them as before - so draw
+  // preparation doesn't wait for packet parsing. Packets that may depend on
+  // the guest CPU (WAIT_REG_MEM) or change registers in ways the parse thread
+  // can't follow (REG_RMW, COND_WRITE) are forwarded synchronously.
+  enum class ParsedCommandType : uint32_t {
+    kWrap = 0,
+    // start, then the big-endian register values.
+    kRegisters = 1,
+    // The raw (big-endian) packet, header included.
+    kPacket = 2,
+    // The new primary buffer read index (rptr writeback, OnPrimaryBufferEnd).
+    kPrimaryEnd = 3,
+    // New commands from the CPU (GuestSyncPoint::kBatch).
+    kBatch = 4,
+  };
+  static constexpr uint32_t kParseRingDwordsLog2 = 20;
+  static constexpr uint64_t kParseRingDwords = uint64_t(1) << kParseRingDwordsLog2;
+  void RunWithParseThread();
+  // Executes the parsed commands available. False if there were none.
+  bool ConsumeParsedCommands();
+  void ParseThreadMain();
+  bool ParseExecutePacket(memory::RingBuffer* reader);
+  void ParseIndirectBuffer(uint32_t ptr, uint32_t count);
+  void ParseWriteRange(uint32_t start, const uint32_t* source_be, uint32_t count);
+  void ParseWriteRangeFromRing(memory::RingBuffer* reader, uint32_t start, uint32_t count);
+  void ParseEmitRegisters(uint32_t start, const uint32_t* source_be, uint32_t count);
+  void ParseForwardPacket(memory::RingBuffer* reader, uint32_t packet, uint32_t count,
+                          bool sync, bool refresh_constants);
+  uint32_t* ParseReserve(uint32_t dword_count);
+  void ParseCommit(uint32_t dword_count) { parse_head_local_ += dword_count; }
+  void ParsePublish();
+  // Waits until the command processor thread has executed everything
+  // committed.
+  void ParseWaitForConsumer();
+  std::unique_ptr<uint32_t[]> parse_ring_;
+  bool parse_thread_enabled_ = false;
+  std::unique_ptr<rex::thread::Thread> parse_thread_;
+  std::mutex parse_mutex_;
+  std::condition_variable parse_consumer_cv_;
+  std::condition_variable parse_producer_cv_;
+  std::atomic<bool> parse_consumer_sleeping_{false};
+  std::atomic<bool> parse_producer_sleeping_{false};
+  std::atomic<bool> parse_thread_exit_{false};
+  alignas(64) std::atomic<uint64_t> parse_head_{0};
+  alignas(64) std::atomic<uint64_t> parse_tail_{0};
+  // Parse thread only.
+  alignas(64) uint64_t parse_head_local_ = 0;
+  uint64_t parse_tail_cached_ = 0;
+  uint64_t parse_head_published_ = 0;
+  uint32_t parse_read_ptr_index_ = 0;
+  uint64_t parse_bin_select_ = 0xFFFFFFFFull;
+  uint64_t parse_bin_mask_ = 0xFFFFFFFFull;
+  // Shader constants (float, fetch, bool, loop) as written by the parsed
+  // packets - only the parse and the command processor thread write them.
+  static constexpr uint32_t kParseConstantsFirst = 0x4000;
+  static constexpr uint32_t kParseConstantsEnd = 0x4928;
+  uint32_t parse_constants_[kParseConstantsEnd - kParseConstantsFirst] = {};
+  // Command processor thread only.
+  alignas(64) uint64_t parse_head_cached_ = 0;
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
