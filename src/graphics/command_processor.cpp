@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
-#include <immintrin.h>
 #include <string>
 #include <string_view>
 
@@ -40,12 +39,6 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
-REXCVAR_DEFINE_BOOL(gpu_pm4_prefetch, true, "GPU",
-                    "While executing an indirect buffer, scan its packet headers ahead and "
-                    "prefetch the command data and the memory LOAD_ALU_CONSTANT packets load "
-                    "constants from (written by the CPU shortly before - often not in this "
-                    "core's caches).")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(hot_page_epoch_on_coherency_waits, true, "GPU",
                     "Start a new hot page check epoch at WAIT_REG_MEMs on COHER_STATUS_HOST "
                     "(GPU cache coherency requests). Off: only other waits, batches, "
@@ -784,95 +777,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
-namespace {
-// Scans PM4 packet headers of a linear command buffer ahead of execution and
-// prefetches the command data and constant loads' sources.
-class Pm4Prefetcher {
- public:
-  Pm4Prefetcher(memory::Memory* memory, const uint8_t* buffer, uint32_t dword_count)
-      : memory_(memory),
-        buffer_(reinterpret_cast<const uint32_t*>(buffer)),
-        dword_count_(dword_count) {}
-  // read_dword: the execution position.
-  void Advance(uint32_t read_dword) {
-    const uint32_t target = std::min(read_dword + kAheadDwords, dword_count_);
-    // The command data itself, further ahead than the header scan, so the
-    // scan's own loads hit.
-    const uint32_t data_target = std::min(target + kDataAheadDwords, dword_count_);
-    while (data_prefetched_ < data_target) {
-      _mm_prefetch(reinterpret_cast<const char*>(buffer_ + data_prefetched_), _MM_HINT_T0);
-      data_prefetched_ += 16;
-    }
-    while (scan_ < target) {
-      const uint32_t packet = rex::byte_swap(buffer_[scan_]);
-      if (!packet) {
-        ++scan_;
-        continue;
-      }
-      switch (packet >> 30) {
-        case 0:
-          scan_ += 1 + ((packet >> 16) & 0x3FFF) + 1;
-          break;
-        case 1:
-          scan_ += 3;
-          break;
-        case 2:
-          ++scan_;
-          break;
-        default: {
-          const uint32_t opcode = (packet >> 8) & 0x7F;
-          const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-          if (opcode == xenos::PM4_LOAD_ALU_CONSTANT && scan_ + 3 < dword_count_) {
-            const uint32_t address = rex::byte_swap(buffer_[scan_ + 1]) & 0x3FFFFFFF;
-            const uint32_t size_bytes =
-                std::min((rex::byte_swap(buffer_[scan_ + 3]) & 0xFFF) * uint32_t(sizeof(uint32_t)),
-                         kMaxConstantPrefetchBytes);
-            const char* source = memory_->TranslatePhysical<const char*>(address);
-            for (uint32_t offset = 0; offset < size_bytes; offset += 64) {
-              _mm_prefetch(source + offset, _MM_HINT_T0);
-            }
-            if (size_bytes) {
-              _mm_prefetch(source + size_bytes - 1, _MM_HINT_T0);
-            }
-          }
-          scan_ += 1 + count;
-          break;
-        }
-      }
-    }
-  }
-
- private:
-  static constexpr uint32_t kAheadDwords = 384;
-  static constexpr uint32_t kDataAheadDwords = 128;
-  static constexpr uint32_t kMaxConstantPrefetchBytes = 4096;
-  memory::Memory* memory_;
-  const uint32_t* buffer_;
-  uint32_t dword_count_;
-  uint32_t scan_ = 0;
-  uint32_t data_prefetched_ = 0;
-};
-}  // namespace
-
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
-  uint8_t* const buffer = memory_->TranslatePhysical(ptr);
-  memory::RingBuffer reader(buffer, count * sizeof(uint32_t));
+  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
-  if (REXCVAR_GET(gpu_pm4_prefetch)) {
-    Pm4Prefetcher prefetcher(memory_, buffer, count);
-    do {
-      prefetcher.Advance(reader.read_offset() / sizeof(uint32_t));
-      if (!ExecutePacket(&reader)) {
-        REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
-        assert_always();
-        break;
-      }
-    } while (reader.read_count());
-    return;
-  }
   do {
     if (!ExecutePacket(&reader)) {
       // Return up a level if we encounter a bad packet.
