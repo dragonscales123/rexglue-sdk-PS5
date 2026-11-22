@@ -1877,6 +1877,9 @@ void CommandProcessor::RunWithParseThread() {
       continue;
     }
     // Nothing parsed to execute - don't hold back prepared work.
+#if REX_PLATFORM_PS5
+    const auto idle_start = std::chrono::steady_clock::now();
+#endif
     PrepareForWait();
     bool available = false;
     for (uint32_t i = 0; i < 4096; ++i) {
@@ -1898,6 +1901,13 @@ void CommandProcessor::RunWithParseThread() {
       parse_consumer_sleeping_.store(false, std::memory_order_relaxed);
     }
     ReturnFromWait();
+#if REX_PLATFORM_PS5
+    rex::ps5prof::counters().parse_consumer_idle_ns.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - idle_start)
+                     .count()),
+        std::memory_order_relaxed);
+#endif
   }
 
   {
@@ -2026,6 +2036,20 @@ void CommandProcessor::ParsePublish() {
 void CommandProcessor::ParseWaitForConsumer() {
   ParsePublish();
   const uint64_t target = parse_head_local_;
+#if REX_PLATFORM_PS5
+  struct WaitTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~WaitTimer() {
+      auto& counters = rex::ps5prof::counters();
+      counters.parse_sync_waits.fetch_add(1, std::memory_order_relaxed);
+      counters.parse_sync_wait_ns.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+  } wait_timer;
+#endif
   for (uint32_t i = 0; i < 4096; ++i) {
     if (parse_tail_.load(std::memory_order_acquire) == target) {
       parse_tail_cached_ = target;
@@ -2141,7 +2165,8 @@ void CommandProcessor::ParseWriteRangeFromRing(memory::RingBuffer* reader, uint3
 }
 
 void CommandProcessor::ParseForwardPacket(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count, bool sync, bool refresh_constants) {
+                                          uint32_t count, bool sync, bool refresh_constants,
+                                          uint32_t first_dword_override) {
   uint32_t* record = ParseReserve(2 + count);
   record[0] = (uint32_t(ParsedCommandType::kPacket) << 24) | (2 + count);
   record[1] = rex::byte_swap(packet);
@@ -2153,6 +2178,9 @@ void CommandProcessor::ParseForwardPacket(memory::RingBuffer* reader, uint32_t p
                   range.second_length);
     }
     reader->EndRead(range);
+    if (first_dword_override != UINT32_MAX) {
+      record[2] = rex::byte_swap(first_dword_override);
+    }
   }
   ParseCommit(2 + count);
   if (sync) {
@@ -2280,15 +2308,73 @@ bool CommandProcessor::ParseExecutePacket(memory::RingBuffer* reader) {
       }
       ParseForwardPacket(reader, packet, count, false, false);
     } break;
-    case xenos::PM4_WAIT_REG_MEM:
-      // May wait for the CPU to write data the following packets load.
-      ParseForwardPacket(reader, packet, count, true, false);
-      break;
+    case xenos::PM4_WAIT_REG_MEM: {
+      // May wait for the CPU to write data the following packets load - the
+      // parse thread mustn't run ahead of an unsatisfied memory wait.
+      memory::RingBuffer peek = *reader;
+      const uint32_t wait_info = peek.ReadAndSwap<uint32_t>();
+      const uint32_t poll_reg_addr = peek.ReadAndSwap<uint32_t>();
+      const uint32_t ref = peek.ReadAndSwap<uint32_t>();
+      const uint32_t mask = peek.ReadAndSwap<uint32_t>();
+      if (!(wait_info & 0x10)) {
+        // Register waits: COHER_STATUS_HOST (cleared by MakeCoherent when
+        // executed) needs nothing from here; others may depend on the CPU.
+        ParseForwardPacket(reader, packet, count,
+                           poll_reg_addr != XE_GPU_REG_COHER_STATUS_HOST, false);
+        break;
+      }
+      uint32_t value = *reinterpret_cast<const uint32_t*>(
+          memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+      value &= mask;
+      bool matched = false;
+      switch (wait_info & 0x7) {
+        case 0x1:
+          matched = value < ref;
+          break;
+        case 0x2:
+          matched = value <= ref;
+          break;
+        case 0x3:
+          matched = value == ref;
+          break;
+        case 0x4:
+          matched = value != ref;
+          break;
+        case 0x5:
+          matched = value >= ref;
+          break;
+        case 0x6:
+          matched = value > ref;
+          break;
+        case 0x7:
+          matched = true;
+          break;
+        default:
+          break;
+      }
+      if (matched) {
+        // Already satisfied: forwarded as an "always" wait (the value may
+        // change again before it's executed).
+        ParseForwardPacket(reader, packet, count, false, false, (wait_info & ~uint32_t(0x7)) | 0x7);
+      } else {
+        ParseForwardPacket(reader, packet, count, true, false);
+      }
+    } break;
     case xenos::PM4_REG_RMW:
-    case xenos::PM4_COND_WRITE:
-      // Read registers the parse thread doesn't follow, or write them.
-      ParseForwardPacket(reader, packet, count, true, true);
+      // Only registers below the constants (0x1FFF mask) - executed in order.
+      ParseForwardPacket(reader, packet, count, false, false);
       break;
+    case xenos::PM4_COND_WRITE: {
+      memory::RingBuffer peek = *reader;
+      const uint32_t wait_info = peek.ReadAndSwap<uint32_t>();
+      peek.AdvanceRead(3 * sizeof(uint32_t));
+      const uint32_t write_reg_addr = peek.ReadAndSwap<uint32_t>();
+      const bool writes_constant = !(wait_info & 0x100) &&
+                                   write_reg_addr >= kParseConstantsFirst &&
+                                   write_reg_addr < kParseConstantsEnd;
+      ParseForwardPacket(reader, packet, count, writes_constant, writes_constant);
+    } break;
     default:
       ParseForwardPacket(reader, packet, count, false, false);
       break;

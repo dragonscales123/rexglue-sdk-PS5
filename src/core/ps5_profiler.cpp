@@ -347,6 +347,19 @@ void Dump(int fd, double seconds) {
                    "%.1f ms\n",
                    pd[0], pd[1], pd[2], pd[3] / 1e6);
       write(fd, header, size_t(n));
+      static uint64_t previous_parse[3] = {};
+      const uint64_t parse_now[3] = {counters_now.parse_sync_waits.load(),
+                                     counters_now.parse_sync_wait_ns.load(),
+                                     counters_now.parse_consumer_idle_ns.load()};
+      double qd[3];
+      for (int k = 0; k < 3; ++k) {
+        qd[k] = double(parse_now[k] - previous_parse[k]) * inv;
+        previous_parse[k] = parse_now[k];
+      }
+      n = snprintf(header, sizeof(header),
+                   "parse/s: sync waits %.0f, %.1f ms | command processor idle %.1f ms\n",
+                   qd[0], qd[1] / 1e6, qd[2] / 1e6);
+      write(fd, header, size_t(n));
     }
     static uint64_t previous_request[36] = {};
     double rq[36];

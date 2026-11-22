@@ -211,8 +211,11 @@ class CommandProcessor {
   void ParseWriteRange(uint32_t start, const uint32_t* source_be, uint32_t count);
   void ParseWriteRangeFromRing(memory::RingBuffer* reader, uint32_t start, uint32_t count);
   void ParseEmitRegisters(uint32_t start, const uint32_t* source_be, uint32_t count);
+  // first_dword_override (host order): replaces the first dword after the
+  // header, unless UINT32_MAX.
   void ParseForwardPacket(memory::RingBuffer* reader, uint32_t packet, uint32_t count,
-                          bool sync, bool refresh_constants);
+                          bool sync, bool refresh_constants,
+                          uint32_t first_dword_override = UINT32_MAX);
   uint32_t* ParseReserve(uint32_t dword_count);
   void ParseCommit(uint32_t dword_count) { parse_head_local_ += dword_count; }
   void ParsePublish();

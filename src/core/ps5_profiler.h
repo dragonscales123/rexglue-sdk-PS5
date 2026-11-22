@@ -76,6 +76,12 @@ struct Counters {
   // memexport readback copy; preparation thread waits for them (count, time).
   std::atomic<uint64_t> partial_submits[2] = {};
   std::atomic<uint64_t> partial_waits{0};
+  // PM4 parse thread: synchronous packets (waits for the command processor
+  // thread, count and time) and time the command processor thread found
+  // nothing parsed.
+  std::atomic<uint64_t> parse_sync_waits{0};
+  std::atomic<uint64_t> parse_sync_wait_ns{0};
+  std::atomic<uint64_t> parse_consumer_idle_ns{0};
   std::atomic<uint64_t> partial_wait_ns{0};
   // Shared memory requests by source (SharedMemory::RequestSource): calls,
   // requested bytes, hot-page bytes compared, bytes uploaded.
