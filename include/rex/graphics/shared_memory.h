@@ -122,9 +122,6 @@ class SharedMemory {
     deferred_requests_ = deferred_requests;
   }
   bool RequestRangeImmediate(uint32_t start, uint32_t length);
-  // All of a draw's deferred requests under one request lock. Returns the
-  // index of the first that failed, or count if all succeeded.
-  size_t RequestDeferredRanges(const DeferredRequest* requests, size_t count);
   // For callers that need the global critical region around a GPU write
   // marking (RangeWrittenByGpu): take this first - the lock order is this,
   // then the global critical region.

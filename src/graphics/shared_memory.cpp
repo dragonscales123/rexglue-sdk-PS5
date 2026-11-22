@@ -964,34 +964,6 @@ bool SharedMemory::RequestRangeImmediate(uint32_t start, uint32_t length) {
   return RequestRangeCachedLocked(start, length);
 }
 
-size_t SharedMemory::RequestDeferredRanges(const DeferredRequest* requests, size_t count) {
-  if (!count) {
-    return 0;
-  }
-  std::unique_lock<std::recursive_mutex> request_lock(request_mutex_, std::try_to_lock);
-  if (!request_lock.owns_lock()) {
-#if REX_PLATFORM_PS5
-    const uint64_t wait_start = __rdtsc();
-#endif
-    request_lock.lock();
-#if REX_PLATFORM_PS5
-    rex::ps5prof::counters().encode_lock_wait_tsc.fetch_add(__rdtsc() - wait_start,
-                                                            std::memory_order_relaxed);
-    rex::ps5prof::counters().encode_lock_waits.fetch_add(1, std::memory_order_relaxed);
-#endif
-  }
-  const RequestSource previous_source = request_source_;
-  size_t i = 0;
-  for (; i < count; ++i) {
-    request_source_ = requests[i].source;
-    if (!RequestRangeCachedLocked(requests[i].start, requests[i].length)) {
-      break;
-    }
-  }
-  request_source_ = previous_source;
-  return i;
-}
-
 bool SharedMemory::RequestRangeCachedLocked(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   if (!length || !REXCVAR_GET(shared_memory_request_cache)) {
