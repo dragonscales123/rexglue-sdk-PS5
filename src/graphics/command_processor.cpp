@@ -1966,7 +1966,8 @@ bool CommandProcessor::ConsumeParsedCommands() {
     // The parse thread may be waiting for this command (a synchronous packet)
     // or for room.
     parse_tail_.store(tail, std::memory_order_seq_cst);
-    if (parse_producer_sleeping_.load(std::memory_order_seq_cst)) {
+    if (parse_producer_sleeping_.load(std::memory_order_seq_cst) &&
+        tail >= parse_producer_wake_tail_.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lock(parse_mutex_);
       parse_producer_cv_.notify_one();
     }
@@ -2001,6 +2002,8 @@ uint32_t* CommandProcessor::ParseReserve(uint32_t dword_count) {
       }
       if (parse_head_local_ + needed - parse_tail_cached_ > kParseRingDwords) {
         std::unique_lock<std::mutex> lock(parse_mutex_);
+        parse_producer_wake_tail_.store(parse_head_local_ + needed - kParseRingDwords,
+                                        std::memory_order_relaxed);
         parse_producer_sleeping_.store(true, std::memory_order_seq_cst);
         while (!parse_thread_exit_.load() &&
                parse_head_local_ + needed -
@@ -2058,6 +2061,7 @@ void CommandProcessor::ParseWaitForConsumer() {
     _mm_pause();
   }
   std::unique_lock<std::mutex> lock(parse_mutex_);
+  parse_producer_wake_tail_.store(target, std::memory_order_relaxed);
   parse_producer_sleeping_.store(true, std::memory_order_seq_cst);
   while (!parse_thread_exit_.load() && parse_tail_.load(std::memory_order_seq_cst) != target) {
     parse_producer_cv_.wait_for(lock, std::chrono::milliseconds(5));

@@ -230,6 +230,8 @@ class CommandProcessor {
   std::condition_variable parse_producer_cv_;
   std::atomic<bool> parse_consumer_sleeping_{false};
   std::atomic<bool> parse_producer_sleeping_{false};
+  // The tail the sleeping parse thread waits for (woken only once reached).
+  std::atomic<uint64_t> parse_producer_wake_tail_{0};
   std::atomic<bool> parse_thread_exit_{false};
   alignas(64) std::atomic<uint64_t> parse_head_{0};
   alignas(64) std::atomic<uint64_t> parse_tail_{0};
