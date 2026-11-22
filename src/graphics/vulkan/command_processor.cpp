@@ -2552,6 +2552,27 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     counters.state_dwords_written.fetch_add(register_write_counts_[4], std::memory_order_relaxed);
     counters.state_dwords_changed.fetch_add(register_write_counts_[5], std::memory_order_relaxed);
     std::memset(register_write_counts_, 0, sizeof(register_write_counts_));
+    {
+      // Wait times are in TSC ticks - the rate from the time between swaps.
+      static std::chrono::steady_clock::time_point previous_swap_time;
+      static uint64_t previous_swap_tsc = 0;
+      const auto swap_time = std::chrono::steady_clock::now();
+      const uint64_t swap_tsc = __rdtsc();
+      if (previous_swap_tsc && swap_tsc > previous_swap_tsc) {
+        const double ns_per_tick =
+            double(std::chrono::duration_cast<std::chrono::nanoseconds>(swap_time -
+                                                                        previous_swap_time)
+                       .count()) /
+            double(swap_tsc - previous_swap_tsc);
+        encode_wait_counts_[2] = uint64_t(double(encode_wait_counts_[2]) * ns_per_tick);
+        encode_wait_counts_[5] = uint64_t(double(encode_wait_counts_[5]) * ns_per_tick);
+      } else {
+        encode_wait_counts_[2] = 0;
+        encode_wait_counts_[5] = 0;
+      }
+      previous_swap_time = swap_time;
+      previous_swap_tsc = swap_tsc;
+    }
     for (size_t k = 0; k < rex::countof(encode_wait_counts_); ++k) {
       counters.encode_wait[k].fetch_add(encode_wait_counts_[k], std::memory_order_relaxed);
     }
@@ -3803,7 +3824,10 @@ void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
     return;
   }
   const bool is_drain = max_waiting <= 1;
-  const auto wait_start = std::chrono::steady_clock::now();
+  // TSC, not steady_clock: on the PS5 a clock read is a slow call, and these
+  // waits are thousands per second and usually microseconds long (converted to
+  // ns in IssueSwap).
+  const uint64_t wait_start = __rdtsc();
   if (is_drain) {
     ++encode_wait_counts_[0];
     encode_wait_counts_[1] += encode_ring_head_prepared_ -
@@ -3811,12 +3835,7 @@ void VulkanCommandProcessor::WaitForEncodeRing(uint64_t max_waiting) {
   } else {
     ++encode_wait_counts_[4];
   }
-  auto account_wait = [&]() {
-    uint64_t wait_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - wait_start)
-                                    .count());
-    encode_wait_counts_[is_drain ? 2 : 5] += wait_ns;
-  };
+  auto account_wait = [&]() { encode_wait_counts_[is_drain ? 2 : 5] += __rdtsc() - wait_start; };
   for (uint32_t i = 0; i < 4096; ++i) {
     if (ready()) {
       account_wait();
