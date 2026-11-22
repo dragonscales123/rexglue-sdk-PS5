@@ -120,6 +120,19 @@ REXCVAR_DEFINE_UINT32(vulkan_submit_every_draws, REX_VULKAN_SUBMIT_EVERY_DRAWS_D
                       "memexport) has less queued work to wait for.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_partial_submissions, true, "GPU/Vulkan",
+                    "With the draw encoding and submit threads: after a fast memexport readback "
+                    "copy, the encoding thread submits what it has encoded so far (a partial "
+                    "submission with its own fence), so the readback waits only for that part "
+                    "on the GPU instead of the preparation thread ending the submission.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_partial_submit_every, true, "GPU/Vulkan",
+                    "With vulkan_partial_submissions support: vulkan_submit_every_draws submits "
+                    "a partial submission from the encoding thread instead of draining the "
+                    "draw queue and ending the submission on the preparation thread.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 #if REX_PLATFORM_PS5
 // Measured at Fable II's heavy Bowerstone spot: 25.8 -> 28.2 fps.
 #define REX_VULKAN_SUBMIT_THREAD_DEFAULT true
@@ -2026,6 +2039,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   texture_memo_.valid = false;
   AwaitAllQueueOperationsCompletion();
   StopSubmitThread();
+  DestroyPartialSubmissions();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2508,6 +2522,8 @@ void VulkanCommandProcessor::SparseBindBuffer(VkBuffer buffer, uint32_t bind_cou
   sparse_memory_binds_.reserve(sparse_memory_binds_.size() + bind_count);
   sparse_memory_binds_.insert(sparse_memory_binds_.end(), binds, binds + bind_count);
   sparse_bind_wait_stage_mask_ |= wait_stage_mask;
+  // Seen by the encoding before the draws queued after this.
+  sparse_binds_pending_.store(true, std::memory_order_release);
 }
 
 void VulkanCommandProcessor::OnGammaRamp256EntryTableValueWritten() {
@@ -3718,6 +3734,7 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
   packet.image_infos.clear();
   packet.deferred_requests.clear();
   packet.has_resolve = false;
+  packet.partial_flush_seq = 0;
   return packet;
 }
 
@@ -4139,6 +4156,260 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
   }
 #endif
   packet.prep_commands.clear();
+  // Before the tail moves past this packet - the preparation thread may end
+  // the submission once it has.
+  if (packet.partial_flush_seq || partial_flush_every_requested_) {
+    const uint64_t seq = packet.partial_flush_seq;
+    packet.partial_flush_seq = 0;
+    const bool every = partial_flush_every_requested_;
+    partial_flush_every_requested_ = false;
+    if (FlushPartialSubmission(seq)) {
+      draws_in_submission_ = 0;
+    } else if (every) {
+      // The preparation thread ends the submission instead.
+      encode_end_submission_requested_.store(true, std::memory_order_relaxed);
+    }
+  }
+}
+
+bool VulkanCommandProcessor::FlushPartialSubmission(uint64_t seq) {
+  bool submitted = false;
+  VkFence fence = VK_NULL_HANDLE;
+  CommandBuffer command_buffer = {};
+  // Occlusion query state only changes with the encoding drained, and sparse
+  // binds are flagged before the draws that may need them are queued.
+  if (partial_submissions_supported_ && submit_thread_enabled_ && IsEncodeThread() &&
+      !submit_thread_device_lost_.load() && !active_occlusion_query_.valid &&
+      !sparse_binds_pending_.load(std::memory_order_acquire)) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    ReclaimPartialSubmissions(false);
+    bool resources_ok = true;
+    if (partial_fences_free_.empty()) {
+      VkFenceCreateInfo fence_create_info = {};
+      fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+      VkFence new_fence;
+      if (dfn.vkCreateFence(device, &fence_create_info, nullptr, &new_fence) == VK_SUCCESS) {
+        partial_fences_free_.push_back(new_fence);
+      } else {
+        resources_ok = false;
+      }
+    }
+    if (resources_ok && partial_command_buffers_free_.empty()) {
+      CommandBuffer new_command_buffer;
+      VkCommandPoolCreateInfo command_pool_create_info = {};
+      command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+      command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+      command_pool_create_info.queueFamilyIndex = vulkan_device->queue_family_graphics_compute();
+      if (dfn.vkCreateCommandPool(device, &command_pool_create_info, nullptr,
+                                  &new_command_buffer.pool) == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo command_buffer_allocate_info = {};
+        command_buffer_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        command_buffer_allocate_info.commandPool = new_command_buffer.pool;
+        command_buffer_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        command_buffer_allocate_info.commandBufferCount = 1;
+        if (dfn.vkAllocateCommandBuffers(device, &command_buffer_allocate_info,
+                                         &new_command_buffer.buffer) == VK_SUCCESS) {
+          partial_command_buffers_free_.push_back(new_command_buffer);
+        } else {
+          dfn.vkDestroyCommandPool(device, new_command_buffer.pool, nullptr);
+          resources_ok = false;
+        }
+      } else {
+        resources_ok = false;
+      }
+    }
+    if (resources_ok && dfn.vkResetFences(device, 1, &partial_fences_free_.back()) != VK_SUCCESS) {
+      resources_ok = false;
+    }
+    if (resources_ok) {
+      fence = partial_fences_free_.back();
+      partial_fences_free_.pop_back();
+      command_buffer = partial_command_buffers_free_.back();
+      partial_command_buffers_free_.pop_back();
+
+      EndRenderPass();
+      SubmitBarriers(true);
+      uniform_buffer_pool_->FlushWrites();
+      render_target_cache_->EndSubmission();
+
+      SubmitJob job;
+      {
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        if (!submit_upload_streams_free_.empty()) {
+          job.upload_stream = std::move(submit_upload_streams_free_.back());
+          submit_upload_streams_free_.pop_back();
+        }
+        if (!submit_streams_free_.empty()) {
+          job.deferred_stream = std::move(submit_streams_free_.back());
+          submit_streams_free_.pop_back();
+        }
+      }
+      shared_memory_->TakeUploadStreamForPartial(job.upload_stream);
+      deferred_command_buffer_.SwapStream(job.deferred_stream);
+      job.command_buffer = command_buffer;
+      job.fence = fence;
+      // Not a whole submission - submissions_queued_ stays.
+      job.submission = 0;
+      job.partial = true;
+      job.queued_time = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        submit_jobs_.push_back(std::move(job));
+      }
+      submit_cv_.notify_one();
+
+      // A new command buffer - like BeginSubmission.
+      dynamic_viewport_update_needed_ = true;
+      dynamic_scissor_update_needed_ = true;
+      dynamic_depth_bias_update_needed_ = true;
+      dynamic_blend_constants_update_needed_ = true;
+      dynamic_stencil_compare_mask_front_update_needed_ = true;
+      dynamic_stencil_compare_mask_back_update_needed_ = true;
+      dynamic_stencil_write_mask_front_update_needed_ = true;
+      dynamic_stencil_write_mask_back_update_needed_ = true;
+      dynamic_stencil_reference_front_update_needed_ = true;
+      dynamic_stencil_reference_back_update_needed_ = true;
+      current_render_pass_ = VK_NULL_HANDLE;
+      current_framebuffer_ = nullptr;
+      in_render_pass_ = false;
+      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+      main_recording_.compute_pipeline = VK_NULL_HANDLE;
+      current_guest_graphics_pipeline_layout_ = nullptr;
+      current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+      submitted = true;
+#if REX_PLATFORM_PS5
+      rex::ps5prof::counters().partial_submits[seq ? 1 : 0].fetch_add(
+          1, std::memory_order_relaxed);
+#endif
+    }
+  }
+  if (submitted || seq) {
+    {
+      std::lock_guard<std::mutex> lock(partial_mutex_);
+      if (seq) {
+        partial_seq_processed_ = std::max(partial_seq_processed_, seq);
+      }
+      if (submitted) {
+        // Covers every copy encoded so far (a skipped one's too).
+        partial_in_flight_.push_back(
+            PartialSubmission{partial_seq_processed_, fence, command_buffer, 0});
+      }
+    }
+    if (seq) {
+      partial_cv_.notify_all();
+    }
+  }
+  return submitted;
+}
+
+void VulkanCommandProcessor::ReclaimPartialSubmissions(bool all) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  std::lock_guard<std::mutex> lock(partial_mutex_);
+  while (!partial_in_flight_.empty()) {
+    const PartialSubmission& partial = partial_in_flight_.front();
+    if (!all && (partial.waiters ||
+                 dfn.vkGetFenceStatus(device, partial.fence) != VK_SUCCESS)) {
+      break;
+    }
+    partial_seq_reclaimed_ = std::max(partial_seq_reclaimed_, partial.seq);
+    partial_fences_free_.push_back(partial.fence);
+    partial_command_buffers_free_.push_back(partial.command_buffer);
+    partial_in_flight_.pop_front();
+  }
+}
+
+void VulkanCommandProcessor::DestroyPartialSubmissions() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  {
+    std::lock_guard<std::mutex> lock(partial_mutex_);
+    for (const PartialSubmission& partial : partial_in_flight_) {
+      if (!submit_thread_device_lost_.load()) {
+        dfn.vkWaitForFences(device, 1, &partial.fence, VK_TRUE, 1000000000ull);
+      }
+    }
+  }
+  ReclaimPartialSubmissions(true);
+  for (VkFence fence : partial_fences_free_) {
+    dfn.vkDestroyFence(device, fence, nullptr);
+  }
+  partial_fences_free_.clear();
+  for (const CommandBuffer& command_buffer : partial_command_buffers_free_) {
+    dfn.vkDestroyCommandPool(device, command_buffer.pool, nullptr);
+  }
+  partial_command_buffers_free_.clear();
+  partial_seq_processed_ = 0;
+  partial_seq_reclaimed_ = 0;
+  partial_seq_next_ = 0;
+  partial_flush_every_requested_ = false;
+}
+
+bool VulkanCommandProcessor::AwaitPartialSubmission(uint64_t seq) {
+  if (!seq) {
+    return false;
+  }
+  // The encoding thread has to get to the copy first.
+  PublishEncodeRing();
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+#if REX_PLATFORM_PS5
+  const auto wait_start = std::chrono::steady_clock::now();
+#endif
+  VkFence fence = VK_NULL_HANDLE;
+  {
+    std::unique_lock<std::mutex> lock(partial_mutex_);
+    while (partial_seq_processed_ < seq) {
+      if (submit_thread_device_lost_.load()) {
+        return false;
+      }
+      partial_cv_.wait_for(lock, std::chrono::milliseconds(100));
+    }
+    // The first part submitted after the copy was encoded.
+    for (PartialSubmission& partial : partial_in_flight_) {
+      if (partial.seq >= seq) {
+        ++partial.waiters;
+        fence = partial.fence;
+        break;
+      }
+    }
+    if (fence == VK_NULL_HANDLE) {
+      // Reclaimed (completed), or not in any part submitted yet.
+      return partial_seq_reclaimed_ >= seq;
+    }
+  }
+  VkResult result;
+  while (true) {
+    result = dfn.vkWaitForFences(device, 1, &fence, VK_TRUE, 100000000ull);
+    if (result != VK_TIMEOUT || submit_thread_device_lost_.load()) {
+      break;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(partial_mutex_);
+    for (PartialSubmission& partial : partial_in_flight_) {
+      if (partial.fence == fence) {
+        --partial.waiters;
+        break;
+      }
+    }
+  }
+#if REX_PLATFORM_PS5
+  auto& counters = rex::ps5prof::counters();
+  counters.partial_waits.fetch_add(1, std::memory_order_relaxed);
+  counters.partial_wait_ns.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - wait_start)
+                   .count()),
+      std::memory_order_relaxed);
+#endif
+  return result == VK_SUCCESS;
 }
 
 
@@ -5421,9 +5692,15 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
       draws_in_submission_ = 0;
     }
     if (++draws_in_submission_ >= submit_every) {
-      // Ended by IssueDraw once nothing prepared is waiting for encoding (the
-      // preparation of queued draws belongs to this submission).
-      encode_end_submission_requested_ = true;
+      if (encode_thread_enabled_ && IsEncodeThread() && partial_submissions_supported_ &&
+          REXCVAR_GET(vulkan_partial_submit_every)) {
+        // Submitted by the encoding right after this draw.
+        partial_flush_every_requested_ = true;
+      } else {
+        // Ended by IssueDraw once nothing prepared is waiting for encoding (the
+        // preparation of queued draws belongs to this submission).
+        encode_end_submission_requested_ = true;
+      }
     }
   }
 
@@ -5733,6 +6010,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     readback.mapped_data[index] = new_mapping;
     readback.sizes[index] = size;
     readback.submission_written[index] = 0;
+    readback.partial_seq[index] = 0;
     readback.written_size[index] = 0;
     return true;
   };
@@ -5766,6 +6044,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
   readback.submission_written[write_index] = GetCurrentSubmission();
+  readback.partial_seq[write_index] = 0;
   readback.written_size[write_index] = total_size;
 
   CheckSubmissionFenceAndDeviceLoss(0);
@@ -5856,7 +6135,16 @@ bool VulkanCommandProcessor::TryPrepareMemexportReadbackFast(uint32_t total_size
                                       FenceWaitReason::kMemexport);
     readback.submit_after_copy = true;
   }
-  if (!previous_slot_written || readback.submission_written[read_index] > submission_completed_) {
+  bool previous_slot_ready =
+      previous_slot_written && readback.submission_written[read_index] <= submission_completed_;
+  if (!previous_slot_ready && previous_slot_written && REXCVAR_GET(readback_memexport_fast_wait) &&
+      readback.submission_written[read_index] == GetCurrentSubmission() &&
+      readback.partial_seq[read_index]) {
+    // Still in the open submission, but submitted by the encoding in a part
+    // right after the copy - wait for that part only.
+    previous_slot_ready = AwaitPartialSubmission(readback.partial_seq[read_index]);
+  }
+  if (!previous_slot_ready) {
     return false;
   }
 
@@ -5879,9 +6167,17 @@ bool VulkanCommandProcessor::TryPrepareMemexportReadbackFast(uint32_t total_size
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
   readback.submission_written[write_index] = GetCurrentSubmission();
+  readback.partial_seq[write_index] = 0;
   readback.written_size[write_index] = total_size;
   EndPrepRecording(&encode_packet_preparing_->prep_commands);
   encode_packet_preparing_->has_draw = false;
+  if (encode_thread_enabled_ && submit_thread_enabled_ && partial_submissions_supported_ &&
+      REXCVAR_GET(vulkan_partial_submissions)) {
+    // The encoding submits the part with the copy right after it.
+    const uint64_t seq = ++partial_seq_next_;
+    encode_packet_preparing_->partial_flush_seq = seq;
+    readback.partial_seq[write_index] = seq;
+  }
   if (readback.submit_after_copy && REXCVAR_GET(vulkan_readback_memexport_fast_submit)) {
     // QueueEncodeDrawPacket then drains and ends the submission.
     encode_end_submission_requested_.store(true, std::memory_order_relaxed);
@@ -7004,7 +7300,7 @@ void VulkanCommandProcessor::SubmitThreadMain() {
     }
     {
       std::lock_guard<std::mutex> lock(submit_mutex_);
-      if (result == VK_SUCCESS) {
+      if (result == VK_SUCCESS && !job.partial) {
         submissions_queued_.store(job.submission, std::memory_order_release);
       }
       job.upload_stream.clear();
@@ -7067,6 +7363,15 @@ void VulkanCommandProcessor::StartSubmitThread() {
   submit_thread_exit_ = false;
   submit_thread_ = std::thread([this] { SubmitThreadMain(); });
   REXGPU_INFO("Vulkan: command buffers recorded and submitted on a separate thread");
+  // Partial submissions flush upload pools written by the preparation thread
+  // only at full submission ends - fine only if host-visible memory needs no
+  // flushing.
+  const ui::vulkan::VulkanDevice::MemoryTypes& memory_types = GetVulkanDevice()->memory_types();
+  partial_submissions_supported_ =
+      !(memory_types.host_visible & ~memory_types.host_coherent);
+  REXGPU_INFO("Vulkan: partial submissions {}",
+              partial_submissions_supported_ ? "supported"
+                                             : "not supported (non-coherent host memory)");
 }
 
 void VulkanCommandProcessor::StopSubmitThread() {
@@ -7246,6 +7551,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       sparse_buffer_binds_.clear();
       sparse_memory_binds_.clear();
     }
+    sparse_binds_pending_.store(false, std::memory_order_relaxed);
 
     SubmitBarriers(true);
 

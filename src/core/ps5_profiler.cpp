@@ -332,6 +332,22 @@ void Dump(int fd, double seconds) {
                  sd[1] ? sd[3] / sd[1] / 1e6 : 0.0, sd[3] / 1e6, sd[4], sd[5] / 1e6,
                  sd[4] ? sd[6] / sd[4] : 0.0);
     write(fd, header, size_t(n));
+    {
+      static uint64_t previous_partial[4] = {};
+      const uint64_t partial_now[4] = {
+          counters_now.partial_submits[0].load(), counters_now.partial_submits[1].load(),
+          counters_now.partial_waits.load(), counters_now.partial_wait_ns.load()};
+      double pd[4];
+      for (int k = 0; k < 4; ++k) {
+        pd[k] = double(partial_now[k] - previous_partial[k]) * inv;
+        previous_partial[k] = partial_now[k];
+      }
+      n = snprintf(header, sizeof(header),
+                   "partial-submits/s: every %.0f, memexport %.0f | memexport waits %.0f, "
+                   "%.1f ms\n",
+                   pd[0], pd[1], pd[2], pd[3] / 1e6);
+      write(fd, header, size_t(n));
+    }
     static uint64_t previous_request[36] = {};
     double rq[36];
     for (int k = 0; k < 6; ++k) {

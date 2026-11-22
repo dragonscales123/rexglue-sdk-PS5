@@ -505,6 +505,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     // The fast memexport readback had to wait for the GPU with this buffer -
     // end the submission right after its copies from then on.
     bool submit_after_copy = false;
+    // Memexport readback partial submission number of each slot's copy (0 if
+    // none) - waited for when the copy is still in the open submission.
+    uint64_t partial_seq[kReadbackSlots] = {};
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
@@ -629,6 +632,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkPipelineStageFlags> wait_stage_masks;
     uint64_t submission = 0;
     std::chrono::steady_clock::time_point queued_time;
+    // A partial submission (FlushPartialSubmission): part of the still open
+    // submission, so submissions_queued_ isn't advanced for it.
+    bool partial = false;
   };
   bool submit_thread_enabled_ = false;
   // Waits until the submit thread has put submission (and everything before)
@@ -652,6 +658,51 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandStream> submit_upload_streams_free_;
   void SubmitThreadMain();
   void DrainSubmitThread();
+
+  // Partial submissions (vulkan_partial_submissions): the encoding thread
+  // submits what it has encoded of the open submission so far, in its own
+  // command buffer with its own fence, without the preparation thread
+  // draining the queue - after a memexport readback copy (so the readback can
+  // be waited for without ending the submission) and every
+  // vulkan_submit_every_draws draws. Resources stay tracked with the open
+  // submission (its fence still signals after all of its parts).
+  struct PartialSubmission {
+    // The highest memexport readback partial submission number encoded before
+    // this part (whose copy is done once this part is).
+    uint64_t seq;
+    VkFence fence;
+    CommandBuffer command_buffer;
+    // Preparation thread waits on the fence in progress (not reclaimed then).
+    uint32_t waiters;
+  };
+  bool partial_submissions_supported_ = false;
+  // Guards partial_in_flight_, partial_seq_processed_, partial_seq_reclaimed_.
+  std::mutex partial_mutex_;
+  std::condition_variable partial_cv_;
+  std::deque<PartialSubmission> partial_in_flight_;
+  // Highest memexport partial submission number the encoding has processed
+  // (submitted or skipped).
+  uint64_t partial_seq_processed_ = 0;
+  // Highest PartialSubmission::seq reclaimed (completed).
+  uint64_t partial_seq_reclaimed_ = 0;
+  // Encoding thread only.
+  std::vector<VkFence> partial_fences_free_;
+  std::vector<CommandBuffer> partial_command_buffers_free_;
+  bool partial_flush_every_requested_ = false;
+  // Preparation thread only.
+  uint64_t partial_seq_next_ = 0;
+  // Sparse binds are queued for the end of the open submission (whose parts
+  // may depend on them) - no partial submissions until then.
+  std::atomic<bool> sparse_binds_pending_{false};
+  // On the encoding thread, after a packet. seq is the memexport readback
+  // partial submission number (0 if none). Returns whether submitted.
+  bool FlushPartialSubmission(uint64_t seq);
+  void ReclaimPartialSubmissions(bool all);
+  void DestroyPartialSubmissions();
+  // Preparation thread: waits for the memexport readback partial submission
+  // seq to be completed by the GPU. False if it wasn't submitted (or the
+  // device was lost) - then the readback has to end the submission.
+  bool AwaitPartialSubmission(uint64_t seq);
   void StartSubmitThread();
   void StopSubmitThread();
   // Resets the pool, records both streams and submits. Returns the result of
@@ -958,6 +1009,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     CommandStream prep_commands;
     // False if only the preparation commands are queued (dropped draw).
     bool has_draw = false;
+    // Non-zero: submit the encoded part of the submission right after this
+    // packet (memexport readback copy) - FlushPartialSubmission.
+    uint64_t partial_flush_seq = 0;
     bool memexport = false;
     // Memexport draw encoded right away with the preparation waiting (it reads
     // back the exported data or snapshots guest DMA indices).

@@ -72,6 +72,11 @@ struct Counters {
   std::atomic<uint64_t> submit_waits{0};
   std::atomic<uint64_t> submit_wait_ns{0};
   std::atomic<uint64_t> submit_wait_jobs{0};
+  // Partial submissions by the encoding thread: [0] submit-every, [1] after a
+  // memexport readback copy; preparation thread waits for them (count, time).
+  std::atomic<uint64_t> partial_submits[2] = {};
+  std::atomic<uint64_t> partial_waits{0};
+  std::atomic<uint64_t> partial_wait_ns{0};
   // Shared memory requests by source (SharedMemory::RequestSource): calls,
   // requested bytes, hot-page bytes compared, bytes uploaded.
   std::atomic<uint64_t> request_calls[6] = {};

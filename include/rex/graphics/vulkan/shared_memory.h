@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/memory.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
@@ -34,6 +35,11 @@ class VulkanSharedMemory : public SharedMemory {
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
+  // A partial submission (encoding thread): flushes the uploads, closes the
+  // upload-first part and swaps the upload command stream out into stream.
+  // The pages accessed in the submission stay marked (the submission
+  // continues).
+  void TakeUploadStreamForPartial(CommandStream& stream);
 
   enum class Usage {
     // Index buffer, vfetch, compute read, transfer source.

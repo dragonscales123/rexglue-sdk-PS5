@@ -227,6 +227,31 @@ void VulkanSharedMemory::EndSubmission() {
   std::fill(submission_accessed_pages_.begin(), submission_accessed_pages_.end(), 0);
 }
 
+void VulkanSharedMemory::TakeUploadStreamForPartial(CommandStream& stream) {
+  // Uploads are made by both threads under the request lock.
+  auto request_lock = LockRequests();
+  upload_buffer_pool_->FlushWrites();
+  if (upload_first_used_) {
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    GetAllUsagesMasks(stage_mask, access_mask);
+    VkBufferMemoryBarrier barrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                     nullptr,
+                                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     access_mask,
+                                     VK_QUEUE_FAMILY_IGNORED,
+                                     VK_QUEUE_FAMILY_IGNORED,
+                                     buffer_,
+                                     0,
+                                     VK_WHOLE_SIZE};
+    command_processor_.upload_command_buffer().CmdVkPipelineBarrier(
+        VK_PIPELINE_STAGE_TRANSFER_BIT, stage_mask, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+    // The next part's upload-first uploads are ordered after this part again.
+    upload_first_used_ = false;
+  }
+  command_processor_.upload_command_buffer().SwapStream(stream);
+}
+
 void VulkanSharedMemory::BeforeNonDeferredAccess(uint32_t start, uint32_t length) {
   command_processor_.SyncDeferredSharedMemoryRequests(start, length);
 }
