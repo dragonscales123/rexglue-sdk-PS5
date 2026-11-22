@@ -3738,6 +3738,7 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
   packet.deferred_requests.clear();
   packet.has_resolve = false;
   packet.partial_flush_seq = 0;
+  packet.partial_flush = false;
   return packet;
 }
 
@@ -4161,9 +4162,10 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
   packet.prep_commands.clear();
   // Before the tail moves past this packet - the preparation thread may end
   // the submission once it has.
-  if (packet.partial_flush_seq || partial_flush_every_requested_) {
+  if (packet.partial_flush_seq || packet.partial_flush || partial_flush_every_requested_) {
     const uint64_t seq = packet.partial_flush_seq;
     packet.partial_flush_seq = 0;
+    packet.partial_flush = false;
     const bool every = partial_flush_every_requested_;
     partial_flush_every_requested_ = false;
     if (FlushPartialSubmission(seq)) {
@@ -4729,6 +4731,17 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   PublishEncodeRing();
   if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_) {
+    if (encode_thread_enabled_ && submit_thread_enabled_ && partial_submissions_supported_ &&
+        REXCVAR_GET(vulkan_partial_submit_every) && !encode_packet_preparing_) {
+      // The encoding submits what is prepared so far once it gets there,
+      // without this thread waiting.
+      EncodeDrawPacket& packet = AcquireEncodeDrawPacket();
+      packet.has_draw = false;
+      packet.partial_flush = true;
+      QueueEncodeDrawPacket();
+      PublishEncodeRing();
+      return;
+    }
     DrainEncodeQueue(DrainSource::kPrimaryBufferEnd);
     if (CanEndSubmissionImmediately()) {
       EndSubmission(false);

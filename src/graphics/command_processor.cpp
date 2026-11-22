@@ -226,8 +226,13 @@ void CommandProcessor::InvalidateGpuMemory() {}
 ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
     bool legacy_readback_resolve_enabled) const {
   ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
-  bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
-                                      rex::cvar::HasNonDefaultValue("readback_resolve");
+  // HasNonDefaultValue locks the registry and formats the value as a string -
+  // rechecked only every 256 calls (resolves and memexport draws are frequent).
+  if (!(readback_cvar_check_counter_[0]++ & 255)) {
+    readback_resolve_non_default_ = rex::cvar::HasNonDefaultValue("readback_resolve");
+  }
+  bool shared_mode_overrides_legacy =
+      shared_mode != ReadbackResolveMode::kDisabled || readback_resolve_non_default_;
   if (shared_mode_overrides_legacy) {
     return shared_mode;
   }
@@ -309,9 +314,14 @@ bool CommandProcessor::ShouldForceReadbackResolve(uint32_t base) const {
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
-  if (legacy_readback_memexport_cvar_name_ &&
-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
-    return legacy_backend_flag;
+  if (legacy_readback_memexport_cvar_name_) {
+    if (!(readback_cvar_check_counter_[1]++ & 255)) {
+      legacy_readback_memexport_non_default_ =
+          rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_);
+    }
+    if (legacy_readback_memexport_non_default_) {
+      return legacy_backend_flag;
+    }
   }
   return REXCVAR_GET(readback_memexport);
 }

@@ -1012,6 +1012,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     // Non-zero: submit the encoded part of the submission right after this
     // packet (memexport readback copy) - FlushPartialSubmission.
     uint64_t partial_flush_seq = 0;
+    // Submit the encoded part right after this packet (primary buffer end).
+    bool partial_flush = false;
     bool memexport = false;
     // Memexport draw encoded right away with the preparation waiting (it reads
     // back the exported data or snapshots guest DMA indices).
