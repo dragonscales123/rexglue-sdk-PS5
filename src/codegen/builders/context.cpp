@@ -44,8 +44,18 @@ const FunctionGraph& BuilderContext::graph() const {
 
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
+//
+// The register save/restore helpers (__savegprlr_N / __restgprlr_N) keep working
+// on ctx: calls to them are elided from recompiled functions, but hand-written
+// overrides that work on ctx (strong-symbol copies of recompiled functions made
+// without the localization) still call them to preserve their callers' ctx
+// registers.
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  if (!config().nonVolatileRegistersAsLocalVariables || fn.sharesRegisters()) {
+    return false;
+  }
+  const auto& name = fn.name();
+  return name.rfind("__save", 0) != 0 && name.rfind("__rest", 0) != 0;
 }
 
 std::string BuilderContext::r(size_t index) {
