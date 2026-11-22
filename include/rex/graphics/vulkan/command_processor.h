@@ -1041,14 +1041,14 @@ class VulkanCommandProcessor : public CommandProcessor {
     size_t image_info_texture_offsets[2] = {};
     size_t image_info_sampler_offsets[2] = {};
   };
-  // 256: the encoding falls behind in bursts (the preparation hit a full
-  // 128-slot ring ~8,700 times/s at Bowerstone while the encoding idled 16%).
+  // 128: 256 measured no better at Bowerstone (41.3 vs 41.8 fps; the ring
+  // still filled ~9,000 times/s, and a packet is 624 bytes - more cache).
   // Prepared draws waiting for encoding: a single-producer (preparation),
   // single-consumer (encoding) ring of reused packets. Slots
   // [encode_ring_tail_, encode_ring_head_) are prepared and waiting; the
   // encoding advances the tail after finishing a packet, so tail == head means
   // the encoding is idle.
-  static constexpr uint64_t kEncodeRingSize = 256;
+  static constexpr uint64_t kEncodeRingSize = 128;
   std::unique_ptr<EncodeDrawPacket[]> encode_ring_;
   // Head (written by the preparation) and tail (written by the encoding) on
   // cache lines of their own, away from the fields either thread writes for
