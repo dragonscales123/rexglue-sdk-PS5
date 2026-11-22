@@ -4146,16 +4146,16 @@ void VulkanCommandProcessor::EncodeQueuedPacket(EncodeDrawPacket& packet) {
   rex::ps5prof::counters().encode_append_tsc.fetch_add(requests_start - append_start,
                                                        std::memory_order_relaxed);
 #endif
-  if (packet.has_draw) {
-    for (const SharedMemory::DeferredRequest& request : packet.deferred_requests) {
-      SharedMemory::ScopedRequestSource request_source(*shared_memory_, request.source);
-      if (!shared_memory_->RequestRangeImmediate(request.start, request.length)) {
-        REXGPU_ERROR("Failed to request a {} buffer at 0x{:08X} (size {}) in the shared memory",
-                     request.source == SharedMemory::RequestSource::kIndex ? "index" : "vertex",
-                     request.start, request.length);
-        packet.has_draw = false;
-        break;
-      }
+  if (packet.has_draw && !packet.deferred_requests.empty()) {
+    // One request lock for the whole draw (it was a lock per request).
+    const size_t failed = shared_memory_->RequestDeferredRanges(
+        packet.deferred_requests.data(), packet.deferred_requests.size());
+    if (failed < packet.deferred_requests.size()) {
+      const SharedMemory::DeferredRequest& request = packet.deferred_requests[failed];
+      REXGPU_ERROR("Failed to request a {} buffer at 0x{:08X} (size {}) in the shared memory",
+                   request.source == SharedMemory::RequestSource::kIndex ? "index" : "vertex",
+                   request.start, request.length);
+      packet.has_draw = false;
     }
   }
 #if REX_ENCODE_PROFILING
