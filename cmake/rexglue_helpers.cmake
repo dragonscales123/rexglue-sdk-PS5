@@ -47,7 +47,10 @@ endfunction()
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
         # Large executable support
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        if(PS5)
+            # Small code model (see the top-level CMakeLists.txt).
+            target_compile_options(${target_name} PRIVATE -mcmodel=small)
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")

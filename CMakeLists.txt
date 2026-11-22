@@ -116,7 +116,12 @@ endfunction()
 
 if(NOT WIN32)
     # Use appropriate code model based on architecture
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
+    if(PS5)
+        # The PS5 title is one ~160 MB position-independent image: the small
+        # model reaches all of it, and calls and global accesses become direct
+        # (large: a GOT load and an indirect call each).
+        add_compile_options(-mcmodel=small)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
         # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
         # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
         # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
