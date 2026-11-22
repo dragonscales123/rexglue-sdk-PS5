@@ -100,7 +100,10 @@ REXCVAR_DEFINE_BOOL(readback_memexport_async, false, "GPU",
                     "glowing trail disappears with late data).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 1, "GPU",
+// 2 with partial submissions: Fable II's glowing trail stays correct, and the
+// preparation thread's readback waits drop from ~94 to ~30 ms/s at Bowerstone
+// (38.8 -> 41.8 fps).
+REXCVAR_DEFINE_UINT32(readback_memexport_fast_latency, 2, "GPU",
                       "With readback_memexport_fast, how many memexport draws old the data the "
                       "guest reads back is (1-2). 1 waits for the GPU at almost every memexport "
                       "draw when the GPU thread runs ahead; 2 rarely has to wait.")
