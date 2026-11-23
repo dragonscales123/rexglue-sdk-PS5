@@ -175,6 +175,10 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(vulkan_trace_vertex_shader, "5181317CA0E65BE9", "GPU/Vulkan",
+                      "Diagnostic: vertex shader (ucode hash, hex) that vulkan_trace_trail_draws "
+                      "counts.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_trace_trail_draws, false, "GPU/Vulkan",
                     "Diagnostic: log per-second counts of Fable II's glowing trail draws.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -213,6 +217,8 @@ struct TrailDrawTrace {
   uint32_t min_indices = UINT32_MAX, max_indices = 0;
   uint64_t pixel_shader_hash = 0;
   uint32_t prim_type = 0;
+  uint32_t memexport_draws = 0;
+  uint32_t vfetch_address = 0, vfetch_size = 0, vfetch_changes = 0;
 };
 TrailDrawTrace trail_trace;
 // Shader pairs (vertex, pixel ucode hashes) drawn in the current and previous
@@ -2636,12 +2642,14 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     } else if (now - trail_trace.window_start_ns >= 1000000000ull) {
       REXGPU_INFO(
           "[trail] frames {} with-trail {} | draws issued {} queued {} no-raster {} "
-          "no-ps {} no-verts {} | indices {} (min {} max {}) prim {} ps {:016X}",
+          "no-ps {} no-verts {} | indices {} (min {} max {}) prim {} ps {:016X} | memexport {} "
+          "vfetch {:08X} size {} changes {}",
           trail_trace.frames, trail_trace.frames_with_trail, trail_trace.issued,
           trail_trace.queued, trail_trace.no_raster, trail_trace.no_pixel_shader,
           trail_trace.no_vertices, trail_trace.indices,
           trail_trace.issued ? trail_trace.min_indices : 0, trail_trace.max_indices,
-          trail_trace.prim_type, trail_trace.pixel_shader_hash);
+          trail_trace.prim_type, trail_trace.pixel_shader_hash, trail_trace.memexport_draws,
+          trail_trace.vfetch_address << 2, trail_trace.vfetch_size * 4, trail_trace.vfetch_changes);
       std::string appeared, gone;
       for (const auto& [pair, count] : shader_pairs_current) {
         if (!shader_pairs_previous.count(pair)) {
@@ -4962,8 +4970,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  static uint64_t trace_vs_hash = 0;
+  static std::string trace_vs_string;
+  if (REXCVAR_GET(vulkan_trace_trail_draws) &&
+      trace_vs_string != REXCVAR_GET(vulkan_trace_vertex_shader)) {
+    trace_vs_string = REXCVAR_GET(vulkan_trace_vertex_shader);
+    trace_vs_hash = std::strtoull(trace_vs_string.c_str(), nullptr, 16);
+  }
   const bool trace_trail = REXCVAR_GET(vulkan_trace_trail_draws) &&
-                           vertex_shader->ucode_data_hash() == kFable2TrailVertexShader;
+                           vertex_shader->ucode_data_hash() == trace_vs_hash;
+  if (trace_trail && !vertex_shader->vertex_bindings().empty()) {
+    xenos::xe_gpu_vertex_fetch_t fetch =
+        register_file_->GetVertexFetch(vertex_shader->vertex_bindings()[0].fetch_constant);
+    if (fetch.address != trail_trace.vfetch_address) {
+      ++trail_trace.vfetch_changes;
+    }
+    trail_trace.vfetch_address = fetch.address;
+    trail_trace.vfetch_size = fetch.size;
+  }
   if (trace_trail) {
     ++trail_trace.issued;
     ++trail_trace.issued_this_frame;
@@ -4989,6 +5013,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                written_length));
   }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+  if (trace_trail && memexport_used_vertex) {
+    ++trail_trace.memexport_draws;
+  }
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
       REXGPU_ERROR(
