@@ -200,6 +200,28 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 namespace rex::graphics::vulkan {
 
 namespace {
+// Diagnostic (cvar vulkan_trace_trail_draws): per-second counts for draws with
+// Fable II's glowing trail vertex shader, to tell whether the game stops
+// issuing them or the emulation drops them.
+constexpr uint64_t kFable2TrailVertexShader = 0x87D12B6DEC03F597ull;
+struct TrailDrawTrace {
+  uint64_t window_start_ns = 0;
+  uint32_t issued = 0, queued = 0, no_raster = 0, no_vertices = 0, no_pixel_shader = 0;
+  uint32_t frames = 0, frames_with_trail = 0, issued_this_frame = 0;
+  uint64_t indices = 0;
+  uint32_t min_indices = UINT32_MAX, max_indices = 0;
+  uint64_t pixel_shader_hash = 0;
+  uint32_t prim_type = 0;
+};
+TrailDrawTrace trail_trace;
+uint64_t TrailTraceNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
+
+namespace {
 
 // A rectangle replacing all depth and stencil from the top left across the
 // render target's width, whatever was there. Pitches are rounded up, so the
@@ -4869,28 +4891,6 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
-
-namespace {
-// Diagnostic (cvar vulkan_trace_trail_draws): per-second counts for draws with
-// Fable II's glowing trail vertex shader, to tell whether the game stops
-// issuing them or the emulation drops them.
-constexpr uint64_t kFable2TrailVertexShader = 0x87D12B6DEC03F597ull;
-struct TrailDrawTrace {
-  uint64_t window_start_ns = 0;
-  uint32_t issued = 0, queued = 0, no_raster = 0, no_vertices = 0, no_pixel_shader = 0;
-  uint32_t frames = 0, frames_with_trail = 0, issued_this_frame = 0;
-  uint64_t indices = 0;
-  uint32_t min_indices = UINT32_MAX, max_indices = 0;
-  uint64_t pixel_shader_hash = 0;
-  uint32_t prim_type = 0;
-};
-TrailDrawTrace trail_trace;
-uint64_t TrailTraceNowNs() {
-  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count());
-}
-}  // namespace
 
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
