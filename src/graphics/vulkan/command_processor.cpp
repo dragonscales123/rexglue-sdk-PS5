@@ -15,6 +15,7 @@
 #include <optional>
 #include <rex/memory/bytes_equal.h>
 #include <chrono>
+#include <map>
 #include <algorithm>
 // Per-draw timing of the encoding thread (encode-thread/s, encode-draw/s
 // profile lines) - costs about 0.2 us per draw, off normally.
@@ -214,6 +215,11 @@ struct TrailDrawTrace {
   uint32_t prim_type = 0;
 };
 TrailDrawTrace trail_trace;
+// Shader pairs (vertex, pixel ucode hashes) drawn in the current and previous
+// one-second windows: changes are logged, to find the pair that comes and goes
+// with an effect seen on screen.
+std::map<std::pair<uint64_t, uint64_t>, uint32_t> shader_pairs_current;
+std::map<std::pair<uint64_t, uint64_t>, uint32_t> shader_pairs_previous;
 uint64_t TrailTraceNowNs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
@@ -2636,6 +2642,20 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           trail_trace.no_vertices, trail_trace.indices,
           trail_trace.issued ? trail_trace.min_indices : 0, trail_trace.max_indices,
           trail_trace.prim_type, trail_trace.pixel_shader_hash);
+      std::string appeared, gone;
+      for (const auto& [pair, count] : shader_pairs_current) {
+        if (!shader_pairs_previous.count(pair)) {
+          appeared += fmt::format(" {:016X}/{:016X}x{}", pair.first, pair.second, count);
+        }
+      }
+      for (const auto& [pair, count] : shader_pairs_previous) {
+        if (!shader_pairs_current.count(pair)) {
+          gone += fmt::format(" {:016X}/{:016X}", pair.first, pair.second);
+        }
+      }
+      REXGPU_INFO("[shaders] pairs {} | +{} | -{}", shader_pairs_current.size(), appeared, gone);
+      shader_pairs_previous.swap(shader_pairs_current);
+      shader_pairs_current.clear();
       trail_trace = {};
       trail_trace.window_start_ns = now;
     }
@@ -5010,6 +5030,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       // This draw has no effect.
       return true;
     }
+  }
+  if (REXCVAR_GET(vulkan_trace_trail_draws)) {
+    ++shader_pairs_current[std::make_pair(vertex_shader->ucode_data_hash(),
+                                          pixel_shader ? pixel_shader->ucode_data_hash() : 0)];
   }
   if (trace_trail) {
     if (!is_rasterization_done) {
