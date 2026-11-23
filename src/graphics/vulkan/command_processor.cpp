@@ -2636,6 +2636,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
   }
+#if REX_PLATFORM_PS5
+  {
+    rex::ps5prof::Counters& prof = rex::ps5prof::counters();
+    prof.guest_output_width.store(frontbuffer_width, std::memory_order_relaxed);
+    prof.guest_output_height.store(frontbuffer_height, std::memory_order_relaxed);
+    prof.draw_scale_x.store(texture_cache_->draw_resolution_scale_x(), std::memory_order_relaxed);
+    prof.draw_scale_y.store(texture_cache_->draw_resolution_scale_y(), std::memory_order_relaxed);
+  }
+#endif
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
   // textures may be allocation-padded. Prefer the active frontbuffer region
   // from the swap packet, scaled proportionally to the actual source texture.

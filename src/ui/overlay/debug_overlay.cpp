@@ -14,6 +14,8 @@
 #include <rex/version.h>
 #include <imgui.h>
 #include <algorithm>
+#include <mutex>
+#include <string>
 #if REX_PLATFORM_PS5
 #include <time.h>
 
@@ -27,6 +29,16 @@
 #endif
 
 namespace rex::ui {
+
+namespace {
+std::mutex build_label_mutex;
+std::string build_label;
+}  // namespace
+
+void SetDebugOverlayBuildLabel(const char* label) {
+  std::lock_guard<std::mutex> lock(build_label_mutex);
+  build_label = label ? label : "";
+}
 
 DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProvider stats_provider)
     : ImGuiDialog(imgui_drawer), stats_provider_(std::move(stats_provider)) {}
@@ -42,7 +54,7 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   // viewed from across the room).
   const float tv_scale = std::max(1.0f, io.DisplaySize.y / 720.0f);
   ImGui::SetNextWindowPos(ImVec2(20 * tv_scale, 20 * tv_scale), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(360 * tv_scale, 200 * tv_scale), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(360 * tv_scale, 240 * tv_scale), ImGuiCond_FirstUseEver);
 #else
   ImGui::SetNextWindowSize(ImVec2(220, 60), ImGuiCond_FirstUseEver);
 #endif
@@ -50,6 +62,31 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   if (ImGui::Begin("Debug##overlay", nullptr, ImGuiWindowFlags_NoCollapse)) {
 #if REX_PLATFORM_PS5
     ImGui::SetWindowFontScale(tv_scale);
+#endif
+    {
+      std::lock_guard<std::mutex> lock(build_label_mutex);
+      if (!build_label.empty()) {
+        ImGui::Text("Build: %s", build_label.c_str());
+      }
+    }
+#if REX_PLATFORM_PS5
+    {
+      rex::ps5prof::Counters& prof = rex::ps5prof::counters();
+      const uint32_t guest_w = prof.guest_output_width.load(std::memory_order_relaxed);
+      const uint32_t guest_h = prof.guest_output_height.load(std::memory_order_relaxed);
+      const uint32_t scale_x = prof.draw_scale_x.load(std::memory_order_relaxed);
+      const uint32_t scale_y = prof.draw_scale_y.load(std::memory_order_relaxed);
+      if (guest_w && guest_h) {
+        if (scale_x == scale_y) {
+          ImGui::Text("Render: %ux%u (%ux of %ux%u)", guest_w * scale_x, guest_h * scale_y,
+                      scale_x, guest_w, guest_h);
+        } else {
+          ImGui::Text("Render: %ux%u (%ux%u of %ux%u)", guest_w * scale_x, guest_h * scale_y,
+                      scale_x, scale_y, guest_w, guest_h);
+        }
+      }
+      ImGui::Text("Output: %.0fx%.0f", io.DisplaySize.x, io.DisplaySize.y);
+    }
 #endif
     if (stats_provider_) {
       auto stats = stats_provider_();

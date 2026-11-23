@@ -23,6 +23,10 @@ struct FrameStats {
   uint64_t frame_count = 0;
 };
 
+// Title build identifier shown at the top of the debug overlay (for example
+// the title repository's commit). Copied; empty to show only the SDK stamp.
+void SetDebugOverlayBuildLabel(const char* label);
+
 class DebugOverlayDialog : public ImGuiDialog {
  public:
   using FrameStatsProvider = std::function<FrameStats()>;

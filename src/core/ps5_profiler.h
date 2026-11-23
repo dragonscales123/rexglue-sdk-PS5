@@ -11,6 +11,12 @@
 namespace rex::ps5prof {
 // Event counters, written to profile.txt (as per-second rates) each interval.
 struct Counters {
+  // Last presented frame: the guest's output size and the draw resolution
+  // scale it's rendered at (debug overlay).
+  std::atomic<uint32_t> guest_output_width{0};
+  std::atomic<uint32_t> guest_output_height{0};
+  std::atomic<uint32_t> draw_scale_x{1};
+  std::atomic<uint32_t> draw_scale_y{1};
   std::atomic<uint64_t> mprotect_calls{0};
   std::atomic<uint64_t> mprotect_bytes{0};
   std::atomic<uint64_t> invalidations{0};    // shared-memory invalidations (mostly write faults)
