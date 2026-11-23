@@ -21,10 +21,16 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_BOOL(spirv_clamp_relative_indices, true, "GPU/Shader",
+                    "Clamp relatively addressed float constant and register indices (c[a0+N], "
+                    "r[aL+N]) to the array so an out-of-range index reads defined data "
+                    "(applied at translation; delete the shader cache after changing it)");
 
 namespace rex::graphics {
 
@@ -3492,6 +3498,18 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
   if (storage_index) {
     index = builder_->createBinOp(spv::OpIAdd, type_int_, index,
                                   builder_->makeIntConstant(int(storage_index)));
+  }
+  if (REXCVAR_GET(spirv_clamp_relative_indices)) {
+    // a0 / aL + N can go outside the array (a0 is only clamped to [-256, 255]).
+    // An out-of-range access is undefined in SPIR-V: for the float constants it
+    // reads whatever follows in the uniform buffer (other draws' constants),
+    // for the registers anything at all. Clamp like the DXBC translator does
+    // (upstream #29 - Fable II's trail vertex shader 87D12B6DEC03F597 indexes
+    // the float constants out of range).
+    int max_index = is_float_constant ? 255 : int(std::max(register_count(), uint32_t(1))) - 1;
+    index = builder_->createTriBuiltinCall(type_int_, ext_inst_glsl_std_450_, GLSLstd450SClamp,
+                                           index, const_int_0_,
+                                           builder_->makeIntConstant(max_index));
   }
   return index;
 }
