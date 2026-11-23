@@ -193,10 +193,18 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     if (ps5_vrange_reserve(bytes, nullptr, kDirectUnit, &reserved) != 0 || !reserved) {
       return nullptr;
     }
-    if (allocation_type != AllocationType::kReserve &&
-        ps5_vrange_commit(reserved, bytes, int(ToPosixProtectFlags(access))) != 0) {
-      ps5_vrange_release(reserved, bytes);
-      return nullptr;
+    if (allocation_type != AllocationType::kReserve) {
+      // Committed with write access first so a fresh allocation can be cleared
+      // (callers expect anonymous memory to read as zero), then given the
+      // asked-for protection.
+      if (ps5_vrange_commit(reserved, bytes, PROT_READ | PROT_WRITE) != 0) {
+        ps5_vrange_release(reserved, bytes);
+        return nullptr;
+      }
+      std::memset(reserved, 0, bytes);
+      if (int(ToPosixProtectFlags(access)) != (PROT_READ | PROT_WRITE)) {
+        ps5_vrange_commit(reserved, bytes, int(ToPosixProtectFlags(access)));
+      }
     }
     return reserved;
   }
@@ -336,6 +344,20 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
         return nullptr;
       }
       m.created[chunk] = true;
+      // Direct memory comes with whatever it held before (often the previous
+      // run of the title: the console is not rebooted between runs). The
+      // guest expects new memory to read as zero, as Windows file mappings and
+      // the console's own allocations do, so clear the chunk once.
+      void* scratch = nullptr;
+      if (ps5_shm_map(&m.chunks[chunk], 0, kChunkBytes, nullptr, PS5_SHM_READ | PS5_SHM_WRITE, 0,
+                      &scratch) == 0 &&
+          scratch) {
+        std::memset(scratch, 0, kChunkBytes);
+        ps5_shm_unmap(scratch, kChunkBytes, 0);
+      } else {
+        REXSYS_WARN("PS5: couldn't clear direct memory for guest offsets 0x{:X}+64MiB",
+                    chunk * kChunkBytes);
+      }
     }
     void* view = nullptr;
     const int rc = ps5_shm_map(&m.chunks[chunk], in_chunk, piece, base + done, protection,
