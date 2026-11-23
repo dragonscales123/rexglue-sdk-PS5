@@ -174,6 +174,10 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_trace_trail_draws, false, "GPU/Vulkan",
+                    "Diagnostic: log per-second counts of Fable II's glowing trail draws.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skip_depth_clear_transfers, true, "GPU/Vulkan",
                     "Do not copy old depth into a render target for a rectangle that overwrites "
                     "all depth and stencil across its width, like a Direct3D 9 depth clear. "
@@ -2592,6 +2596,28 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  if (REXCVAR_GET(vulkan_trace_trail_draws)) {
+    ++trail_trace.frames;
+    if (trail_trace.issued_this_frame) {
+      ++trail_trace.frames_with_trail;
+    }
+    trail_trace.issued_this_frame = 0;
+    const uint64_t now = TrailTraceNowNs();
+    if (!trail_trace.window_start_ns) {
+      trail_trace.window_start_ns = now;
+    } else if (now - trail_trace.window_start_ns >= 1000000000ull) {
+      REXGPU_INFO(
+          "[trail] frames {} with-trail {} | draws issued {} queued {} no-raster {} "
+          "no-ps {} no-verts {} | indices {} (min {} max {}) prim {} ps {:016X}",
+          trail_trace.frames, trail_trace.frames_with_trail, trail_trace.issued,
+          trail_trace.queued, trail_trace.no_raster, trail_trace.no_pixel_shader,
+          trail_trace.no_vertices, trail_trace.indices,
+          trail_trace.issued ? trail_trace.min_indices : 0, trail_trace.max_indices,
+          trail_trace.prim_type, trail_trace.pixel_shader_hash);
+      trail_trace = {};
+      trail_trace.window_start_ns = now;
+    }
+  }
   SCOPE_profile_cpu_f("gpu");
   DrainEncodeQueue(DrainSource::kSwap);
   SyncEncodeRegisters();
@@ -4844,6 +4870,28 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
 }
 
 
+namespace {
+// Diagnostic (cvar vulkan_trace_trail_draws): per-second counts for draws with
+// Fable II's glowing trail vertex shader, to tell whether the game stops
+// issuing them or the emulation drops them.
+constexpr uint64_t kFable2TrailVertexShader = 0x87D12B6DEC03F597ull;
+struct TrailDrawTrace {
+  uint64_t window_start_ns = 0;
+  uint32_t issued = 0, queued = 0, no_raster = 0, no_vertices = 0, no_pixel_shader = 0;
+  uint32_t frames = 0, frames_with_trail = 0, issued_this_frame = 0;
+  uint64_t indices = 0;
+  uint32_t min_indices = UINT32_MAX, max_indices = 0;
+  uint64_t pixel_shader_hash = 0;
+  uint32_t prim_type = 0;
+};
+TrailDrawTrace trail_trace;
+uint64_t TrailTraceNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -4894,6 +4942,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  const bool trace_trail = REXCVAR_GET(vulkan_trace_trail_draws) &&
+                           vertex_shader->ucode_data_hash() == kFable2TrailVertexShader;
+  if (trace_trail) {
+    ++trail_trace.issued;
+    ++trail_trace.issued_this_frame;
+    trail_trace.indices += index_count;
+    trail_trace.min_indices = std::min(trail_trace.min_indices, index_count);
+    trail_trace.max_indices = std::max(trail_trace.max_indices, index_count);
+    trail_trace.prim_type = uint32_t(prim_type);
+  }
   // Fable II's terrain tessellation and skinning memexport shaders only read
   // data the CPU wrote, so the CPU gives the guest their output directly. The
   // draw still runs; only the wait to read the result back is skipped (from the
@@ -4951,6 +5009,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (!memexport_used_vertex) {
       // This draw has no effect.
       return true;
+    }
+  }
+  if (trace_trail) {
+    if (!is_rasterization_done) {
+      ++trail_trace.no_raster;
+    } else if (!pixel_shader) {
+      ++trail_trace.no_pixel_shader;
+    } else {
+      trail_trace.pixel_shader_hash = pixel_shader->ucode_data_hash();
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
@@ -5056,6 +5123,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
+      if (trace_trail) {
+        ++trail_trace.no_vertices;
+      }
       queue_packet(false);
       return true;
     }
@@ -5442,6 +5512,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Nothing prepared before may still be waiting when this is encoded on
     // the encoding thread (it may end the submission for the readback).
     DrainEncodeQueue(DrainSource::kMemexport);
+  }
+  if (trace_trail) {
+    ++trail_trace.queued;
   }
   queue_packet(true);
   if (memexport_sync) {
