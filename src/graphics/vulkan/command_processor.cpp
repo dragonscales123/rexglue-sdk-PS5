@@ -219,6 +219,7 @@ struct TrailDrawTrace {
   uint32_t prim_type = 0;
   uint32_t memexport_draws = 0;
   uint32_t vfetch_address = 0, vfetch_size = 0, vfetch_changes = 0;
+  std::string detail;  // vertex data and textures of the first draw this window
 };
 TrailDrawTrace trail_trace;
 // Shader pairs (vertex, pixel ucode hashes) drawn in the current and previous
@@ -2650,6 +2651,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           trail_trace.issued ? trail_trace.min_indices : 0, trail_trace.max_indices,
           trail_trace.prim_type, trail_trace.pixel_shader_hash, trail_trace.memexport_draws,
           trail_trace.vfetch_address << 2, trail_trace.vfetch_size * 4, trail_trace.vfetch_changes);
+      if (!trail_trace.detail.empty()) {
+        REXGPU_INFO("[trail] detail {}", trail_trace.detail);
+      }
       std::string appeared, gone;
       for (const auto& [pair, count] : shader_pairs_current) {
         if (!shader_pairs_previous.count(pair)) {
@@ -4987,6 +4991,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     trail_trace.vfetch_address = fetch.address;
     trail_trace.vfetch_size = fetch.size;
+    if (trail_trace.detail.empty()) {
+      const uint32_t* words =
+          memory_->TranslatePhysical<const uint32_t*>(fetch.address << 2);
+      std::string d = fmt::format("stride {} verts:",
+                                  vertex_shader->vertex_bindings()[0].stride_words);
+      for (uint32_t i = 0; words && i < std::min<uint32_t>(fetch.size, 12); ++i) {
+        uint32_t w = rex::byte_swap(words[i]);
+        float f;
+        std::memcpy(&f, &w, sizeof(f));
+        d += fmt::format(" {:08X}({:g})", w, f);
+      }
+      d += fmt::format(" | rt0 {:08X} pitch {} depth {:08X} zctl {:08X} blend0 {:08X} mask {:08X}",
+                       register_file_->values[XE_GPU_REG_RB_COLOR_INFO],
+                       register_file_->values[XE_GPU_REG_RB_SURFACE_INFO] & 0x3FFF,
+                       register_file_->values[XE_GPU_REG_RB_DEPTH_INFO],
+                       register_file_->values[XE_GPU_REG_RB_DEPTHCONTROL],
+                       register_file_->values[XE_GPU_REG_RB_BLENDCONTROL0],
+                       register_file_->values[XE_GPU_REG_RB_COLOR_MASK]);
+      trail_trace.detail = d;
+    }
   }
   if (trace_trail) {
     ++trail_trace.issued;
@@ -5069,6 +5093,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       ++trail_trace.no_pixel_shader;
     } else {
       trail_trace.pixel_shader_hash = pixel_shader->ucode_data_hash();
+      if (trail_trace.detail.find("tex") == std::string::npos) {
+        std::string d = " | tex";
+        for (const Shader::TextureBinding& binding : pixel_shader->texture_bindings()) {
+          xenos::xe_gpu_texture_fetch_t t = register_file_->GetTextureFetch(binding.fetch_constant);
+          d += fmt::format(" [{}: {:08X} {}x{} fmt {} dim {} tiled {}]", binding.fetch_constant,
+                           uint32_t(t.base_address) << 12, t.size_2d.width + 1,
+                           t.size_2d.height + 1, uint32_t(t.format), uint32_t(t.dimension),
+                           uint32_t(t.tiled));
+        }
+        trail_trace.detail += d;
+      }
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
