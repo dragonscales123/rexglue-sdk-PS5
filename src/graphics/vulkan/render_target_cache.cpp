@@ -1452,6 +1452,11 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
+      if (depth_overwritten_by_next_update_ && depth_and_color_render_targets[0]) {
+        // Slot 0 is depth, and the draw replaces it, so its old contents are not needed.
+        const_cast<std::vector<Transfer>*>(last_update_transfers())[0].clear();
+      }
+      depth_overwritten_by_next_update_ = false;
 
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());

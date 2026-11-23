@@ -174,6 +174,13 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(skip_depth_clear_transfers, true, "GPU/Vulkan",
+                    "Do not copy old depth into a render target for a rectangle that overwrites "
+                    "all depth and stencil across its width, like a Direct3D 9 depth clear. "
+                    "Only used with execute_unclipped_draw_vs_on_cpu, which limits the "
+                    "transfer to the rectangle's height")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
@@ -183,9 +190,55 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 #include "../../core/ps5_profiler.h"
 #endif
 
+#include "../fable2_skinning.h"
+#include "../fable2_terrain_tess.h"
+
 namespace rex::graphics::vulkan {
 
 namespace {
+
+// A rectangle replacing all depth and stencil from the top left across the
+// render target's width, whatever was there. Pitches are rounded up, so the
+// rectangle may stop slightly short of the pitch. (From the upstream Fable II
+// SDK fork's D3D12 command processor.)
+bool IsDepthClearRectangle(const RegisterFile& regs, const memory::Memory& memory,
+                           const Shader& vertex_shader) {
+  constexpr float kPitchMargin = 80.0f;
+  auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      initiator.source_select != xenos::SourceSelect::kAutoIndex || initiator.num_indices != 3 ||
+      !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable || vertex_shader.vertex_bindings().empty()) {
+    return false;
+  }
+  const reg::RB_DEPTHCONTROL depth = regs.Get<reg::RB_DEPTHCONTROL>();
+  if (!depth.z_enable || !depth.z_write_enable || depth.zfunc != xenos::CompareFunction::kAlways ||
+      !depth.stencil_enable || depth.stencilfunc != xenos::CompareFunction::kAlways ||
+      depth.stencilzpass != xenos::StencilOp::kReplace ||
+      regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0xFF) {
+    return false;
+  }
+  const Shader::VertexBinding& binding = vertex_shader.vertex_bindings()[0];
+  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(binding.fetch_constant);
+  const uint8_t* vertices = memory.TranslatePhysical<const uint8_t*>(fetch.address << 2);
+  if (!vertices || fetch.endian != xenos::Endian::k8in32) {
+    return false;
+  }
+  float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f;
+  for (uint32_t i = 0; i < 3; ++i) {
+    float position[2];
+    for (uint32_t axis = 0; axis < 2; ++axis) {
+      uint32_t raw;
+      std::memcpy(&raw, vertices + i * binding.stride_words * 4 + axis * 4, sizeof(raw));
+      raw = rex::byte_swap(raw);
+      std::memcpy(&position[axis], &raw, sizeof(raw));
+    }
+    min_x = std::min(min_x, position[0]);
+    max_x = std::max(max_x, position[0]);
+    min_y = std::min(min_y, position[1]);
+  }
+  const float pitch = float(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch);
+  return min_x <= 0.5f && min_y <= 0.5f && max_x >= pitch - 0.5f - kPitchMargin;
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -3762,6 +3815,8 @@ VulkanCommandProcessor::EncodeDrawPacket& VulkanCommandProcessor::AcquireEncodeD
   packet.has_draw = false;
   packet.memexport = false;
   packet.memexport_sync = false;
+  packet.memexport_readback_skipped = false;
+  packet.depth_overwritten = false;
   packet.host_index_buffer = {VK_NULL_HANDLE, 0};
   packet.prep_commands.clear();
   packet.image_infos.clear();
@@ -4839,6 +4894,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  // Fable II's terrain tessellation and skinning memexport shaders only read
+  // data the CPU wrote, so the CPU gives the guest their output directly. The
+  // draw still runs; only the wait to read the result back is skipped (from the
+  // upstream Fable II SDK fork, same as its D3D12 and Vulkan command processors).
+  bool memexport_computed_on_cpu = false;
+  {
+    uint32_t written_start = 0, written_length = 0;
+    const uint64_t vs_hash = vertex_shader->ucode_data_hash();
+    memexport_computed_on_cpu =
+        (vs_hash == kFable2TerrainTessShader && REXCVAR_GET(terrain_tess_cpu) &&
+         ComputeFable2TerrainTess(*register_file_, *memory_, *vertex_shader, written_start,
+                                  written_length)) ||
+        (vs_hash == kFable2SkinningShader && REXCVAR_GET(skinning_cpu) &&
+         ComputeFable2Skinning(*register_file_, *memory_, *vertex_shader, nullptr, written_start,
+                               written_length));
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -4907,6 +4978,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                    : 0;
 
   EncodeDrawPacket& packet = AcquireEncodeDrawPacket();
+  packet.memexport_readback_skipped = memexport_computed_on_cpu;
+  packet.depth_overwritten =
+      REXCVAR_GET(skip_depth_clear_transfers) && REXCVAR_GET(execute_unclipped_draw_vs_on_cpu) &&
+      IsDepthClearRectangle(*register_file_, *memory_, *vertex_shader);
   packet.memexport = memexport_writes_possible;
   packet.vertex_shader = vertex_shader;
   packet.pixel_shader = pixel_shader;
@@ -5337,7 +5412,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
       }
-      if (memexport_total_size &&
+      if (memexport_total_size && !memexport_computed_on_cpu &&
           IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
         if (!memexport_sync && !REXCVAR_GET(readback_memexport_async) &&
             REXCVAR_GET(readback_memexport_fast)) {
@@ -5442,6 +5517,7 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   };
 #endif
   // Set up the render targets - this may perform dispatches and draws.
+  render_target_cache_->SetDepthOverwrittenByNextUpdate(packet.depth_overwritten);
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
@@ -5706,8 +5782,8 @@ bool VulkanCommandProcessor::EncodeDraw(const EncodeDrawPacket& packet) {
   // The memexported memory was marked as GPU-written when preparing. The
   // readback is only done for draws encoded synchronously (memexport_sync),
   // for which memexport_ranges_ is still this draw's.
-  if (packet.memexport_sync && !memexport_ranges_.empty() &&
-      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
+  if (packet.memexport_sync && !packet.memexport_readback_skipped &&
+      !memexport_ranges_.empty() && IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;

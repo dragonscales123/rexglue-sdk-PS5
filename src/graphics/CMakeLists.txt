@@ -18,6 +18,8 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    fable2_skinning.cpp
+    fable2_terrain_tess.cpp
     frame_limiter.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp

@@ -1018,6 +1018,10 @@ class VulkanCommandProcessor : public CommandProcessor {
     // Memexport draw encoded right away with the preparation waiting (it reads
     // back the exported data or snapshots guest DMA indices).
     bool memexport_sync = false;
+    // The CPU computed the memexport output (terrain / skinning): no readback.
+    bool memexport_readback_skipped = false;
+    // A depth clear rectangle (skip_depth_clear_transfers): no old depth transfer.
+    bool depth_overwritten = false;
     VulkanShader* vertex_shader = nullptr;
     VulkanShader* pixel_shader = nullptr;
     VulkanShader::VulkanTranslation* vertex_shader_translation = nullptr;
