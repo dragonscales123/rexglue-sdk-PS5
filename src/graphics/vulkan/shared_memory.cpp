@@ -27,6 +27,9 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_zero_new_gpu_memory, true, "GPU/Vulkan",
+                    "Zero newly committed shared memory and scaled resolve memory instead of "
+                    "leaving the previous contents of the device memory in it.");
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -388,6 +391,24 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
     bind_wait_stage_mask |= VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
   }
   command_processor_.SparseBindBuffer(buffer_, 1, &bind, bind_wait_stage_mask);
+
+  // New device memory isn't guaranteed to be zeroed (on the PS5 it holds
+  // whatever was there before). Anything the guest reads before it's written
+  // (a partially written resolve tile, a feedback texture) must not be garbage
+  // that may be NaN.
+  if (REXCVAR_GET(vulkan_zero_new_gpu_memory)) {
+    command_processor_.SubmitBarriers(true);
+    command_processor_.deferred_command_buffer().CmdVkFillBuffer(buffer_, bind.resourceOffset,
+                                                                 bind.size, 0);
+    VkPipelineStageFlags dst_stage_mask;
+    VkAccessFlags dst_access_mask;
+    GetAllUsagesMasks(dst_stage_mask, dst_access_mask);
+    command_processor_.PushBufferMemoryBarrier(
+        buffer_, bind.resourceOffset, bind.size, VK_PIPELINE_STAGE_TRANSFER_BIT, dst_stage_mask,
+        VK_ACCESS_TRANSFER_WRITE_BIT, dst_access_mask, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
+    command_processor_.SubmitBarriers(true);
+  }
 
   return true;
 }

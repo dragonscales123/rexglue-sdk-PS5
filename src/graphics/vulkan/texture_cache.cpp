@@ -34,6 +34,7 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+REXCVAR_DECLARE(bool, vulkan_zero_new_gpu_memory);
 
 namespace rex::graphics::vulkan {
 
@@ -2279,6 +2280,21 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
     command_processor_.SparseBindBuffer(
         scaled_resolve_buffer_, 1, &bind,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (REXCVAR_GET(vulkan_zero_new_gpu_memory)) {
+      // New device memory may hold old contents (see shared_memory.cpp).
+      command_processor_.SubmitBarriers(true);
+      command_processor_.deferred_command_buffer().CmdVkFillBuffer(
+          scaled_resolve_buffer_, bind.resourceOffset, bind.size, 0);
+      command_processor_.PushBufferMemoryBarrier(
+          scaled_resolve_buffer_, bind.resourceOffset, bind.size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+              VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+      command_processor_.SubmitBarriers(true);
+    }
 
     rex::bit::SetRange(scaled_resolve_sparse_allocated_.data(), allocation_range.first,
                        allocation_range.second);

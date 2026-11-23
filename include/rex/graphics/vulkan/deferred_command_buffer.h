@@ -275,6 +275,16 @@ class DeferredCommandBuffer {
     args.group_count_z = group_count_z;
   }
 
+  void CmdVkFillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size,
+                       uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.dst_buffer = dst_buffer;
+    args.dst_offset = dst_offset;
+    args.size = size;
+    args.data = data;
+  }
+
   void CmdVkDraw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                  uint32_t first_instance) {
     auto& args = *reinterpret_cast<ArgsVkDraw*>(WriteCommand(Command::kVkDraw, sizeof(ArgsVkDraw)));
@@ -414,6 +424,7 @@ class DeferredCommandBuffer {
     kVkCopyBufferToImage,
     kVkCopyQueryPoolResults,
     kVkDispatch,
+    kVkFillBuffer,
     kVkDraw,
     kVkDrawIndexed,
     kVkEndQuery,
@@ -562,6 +573,13 @@ class DeferredCommandBuffer {
     uint32_t group_count_x;
     uint32_t group_count_y;
     uint32_t group_count_z;
+  };
+
+  struct ArgsVkFillBuffer {
+    VkBuffer dst_buffer;
+    VkDeviceSize dst_offset;
+    VkDeviceSize size;
+    uint32_t data;
   };
 
   struct ArgsVkDraw {

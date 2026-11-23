@@ -170,6 +170,12 @@ void DeferredCommandBuffer::ExecuteStream(const CommandStream& command_stream,
                           args.group_count_z);
       } break;
 
+      case Command::kVkFillBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
+        dfn.vkCmdFillBuffer(command_buffer, args.dst_buffer, args.dst_offset, args.size,
+                            args.data);
+      } break;
+
       case Command::kVkDraw: {
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
