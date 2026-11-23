@@ -27,6 +27,9 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_barrier_every_use, false, "GPU/Vulkan",
+                    "Diagnostic: a full shared memory barrier on every use (every draw). Very "
+                    "slow; for checking whether a missing barrier causes a rendering problem.");
 REXCVAR_DEFINE_BOOL(vulkan_zero_new_gpu_memory, true, "GPU/Vulkan",
                     "Zero newly committed shared memory and scaled resolve memory instead of "
                     "leaving the previous contents of the device memory in it.");
@@ -273,6 +276,26 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
+  if (REXCVAR_GET(vulkan_shared_memory_barrier_every_use)) {
+    // Diagnostic: synchronize everything with everything on every use, to rule
+    // out a missing shared memory barrier. Very slow.
+    VkPipelineStageFlags all_stage_mask;
+    VkAccessFlags all_access_mask;
+    GetAllUsagesMasks(all_stage_mask, all_access_mask);
+    command_processor_.PushBufferMemoryBarrier(buffer_, 0, VK_WHOLE_SIZE, all_stage_mask,
+                                               all_stage_mask, all_access_mask, all_access_mask,
+                                               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                                               false);
+    if (command_processor_.IsPrepRecording()) {
+      prep_usage_known_ = true;
+      prep_last_usage_ = usage;
+      prep_last_written_range_ = written_range;
+    } else {
+      last_usage_ = usage;
+      last_written_range_ = written_range;
+    }
+    return;
+  }
   if (command_processor_.IsPrepRecording()) {
     VkPipelineStageFlags dst_stage_mask;
     VkAccessFlags dst_access_mask;
@@ -544,7 +567,9 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
   switch (usage) {
     case Usage::kComputeWrite:
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      // Write, not only read: as the source of a barrier, the compute shader's
+      // writes (resolves) must be made available to what reads them next.
+      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
