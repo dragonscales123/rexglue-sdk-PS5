@@ -62,6 +62,10 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
 //     "always FB because the FSI path is much slower now).",
 //     "GPU");
 
+REXCVAR_DEFINE_BOOL(vulkan_clear_new_render_targets, true, "GPU/Vulkan",
+                    "Clear every new color render target to zero instead of leaving its "
+                    "memory's previous contents in it.");
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -1952,6 +1956,9 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (REXCVAR_GET(vulkan_clear_new_render_targets)) {
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
   }
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
@@ -2124,9 +2131,28 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   }
   dfn.vkUpdateDescriptorSets(device, key.is_depth ? 2 : 1, descriptor_set_write, 0, nullptr);
 
-  return new VulkanRenderTarget(key, *this, image, memory, view_depth_color, view_depth_stencil,
-                                view_stencil, view_srgb, view_color_transfer_separate,
-                                descriptor_set_index_transfer_source);
+  VulkanRenderTarget* render_target = new VulkanRenderTarget(
+      key, *this, image, memory, view_depth_color, view_depth_stencil, view_stencil, view_srgb,
+      view_color_transfer_separate, descriptor_set_index_transfer_source);
+  if (!key.is_depth && (image_create_info.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+    // New memory isn't zeroed (on the PS5 it holds whatever was there before),
+    // and a guest pass that reads or blends with a render target it never
+    // cleared - such as Fable II's eye adaptation, accumulating over frames -
+    // can pick up NaNs and stay broken for the whole run (the scene stays
+    // nearly black). Start every color render target at zero.
+    VkImageSubresourceRange clear_range = ui::vulkan::util::InitializeSubresourceRange();
+    command_processor_.PushImageMemoryBarrier(
+        image, clear_range, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    command_processor_.SubmitBarriers(true);
+    VkClearColorValue zero = {};
+    command_processor_.deferred_command_buffer().CmdVkClearColorImage(
+        image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &clear_range);
+    render_target->SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  }
+  return render_target;
 }
 
 bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(
