@@ -4373,7 +4373,12 @@ bool VulkanCommandProcessor::FlushPartialSubmission(uint64_t seq) {
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
-    ReclaimPartialSubmissions(false);
+    // Fence status checks and resets go through the kernel on the PS5: only
+    // look for completed parts when out of free ones (they're reset in a
+    // batch when reclaimed).
+    if (partial_fences_free_.empty() || partial_command_buffers_free_.empty()) {
+      ReclaimPartialSubmissions(false);
+    }
     bool resources_ok = true;
     if (partial_fences_free_.empty()) {
       VkFenceCreateInfo fence_create_info = {};
@@ -4408,9 +4413,6 @@ bool VulkanCommandProcessor::FlushPartialSubmission(uint64_t seq) {
       } else {
         resources_ok = false;
       }
-    }
-    if (resources_ok && dfn.vkResetFences(device, 1, &partial_fences_free_.back()) != VK_SUCCESS) {
-      resources_ok = false;
     }
     if (resources_ok) {
       fence = partial_fences_free_.back();
@@ -4499,6 +4501,7 @@ void VulkanCommandProcessor::ReclaimPartialSubmissions(bool all) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   std::lock_guard<std::mutex> lock(partial_mutex_);
+  const size_t fences_free_before = partial_fences_free_.size();
   while (!partial_in_flight_.empty()) {
     const PartialSubmission& partial = partial_in_flight_.front();
     if (!all && (partial.waiters ||
@@ -4509,6 +4512,11 @@ void VulkanCommandProcessor::ReclaimPartialSubmissions(bool all) {
     partial_fences_free_.push_back(partial.fence);
     partial_command_buffers_free_.push_back(partial.command_buffer);
     partial_in_flight_.pop_front();
+  }
+  // Free fences are unsignaled (new ones are created that way).
+  if (partial_fences_free_.size() > fences_free_before && !submit_thread_device_lost_.load()) {
+    dfn.vkResetFences(device, uint32_t(partial_fences_free_.size() - fences_free_before),
+                      partial_fences_free_.data() + fences_free_before);
   }
 }
 
