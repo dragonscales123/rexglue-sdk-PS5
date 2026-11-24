@@ -749,10 +749,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkDescriptorImageInfo> image_info;
     VkDescriptorSet set = VK_NULL_HANDLE;
   };
-  // Texture descriptor sets written this frame, per stage, by a hash of their
-  // contents, so draws alternating between materials reuse their sets.
-  static constexpr uint32_t kTextureSetCacheSize = 64;
-  LastTextureDescriptorSet last_texture_descriptor_sets_[2][kTextureSetCacheSize];
+  LastTextureDescriptorSet last_texture_descriptor_sets_[2];
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
