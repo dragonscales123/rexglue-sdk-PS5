@@ -592,7 +592,9 @@ void SharedMemory::FilterUnchangedHotPages(
   uint64_t compared_bytes = 0;
   uint64_t skipped_bytes = 0;
   size_t range_index = 0;
-  std::vector<std::pair<uint32_t, uint32_t>> kept;
+  // Reused (called with request_mutex_ held, never nested).
+  std::vector<std::pair<uint32_t, uint32_t>>& kept = hot_filter_kept_scratch_;
+  kept.clear();
   kept.reserve(upload_ranges_.size());
   auto keep = [&kept](uint32_t page) {
     if (!kept.empty() && kept.back().first + kept.back().second == page) {
@@ -767,7 +769,23 @@ bool SharedMemory::RequestRangesLocked(const std::pair<uint32_t, uint32_t>* rang
 #endif
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  // A reused buffer instead of an allocation per request (this runs hundreds
+  // of thousands of times a second); a nested request gets its own.
+  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges_nested;
+  const bool merged_scratch_owned = !merged_ranges_scratch_in_use_;
+  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges =
+      merged_scratch_owned ? merged_ranges_scratch_ : merged_ranges_nested;
+  struct ScratchRelease {
+    bool& in_use;
+    bool owned;
+    ~ScratchRelease() {
+      if (owned) {
+        in_use = false;
+      }
+    }
+  } scratch_release{merged_ranges_scratch_in_use_, merged_scratch_owned};
+  merged_ranges_scratch_in_use_ = true;
+  merged_ranges.clear();
   merged_ranges.reserve(count);
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;

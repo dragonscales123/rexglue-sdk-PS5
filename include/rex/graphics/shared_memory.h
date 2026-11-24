@@ -262,6 +262,10 @@ class SharedMemory {
     uint64_t verified_lines = 0;
   };
   std::unordered_map<uint32_t, HotPageShadow> hot_page_shadows_;
+  // Per-request scratch buffers (request_mutex_ held).
+  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges_scratch_;
+  bool merged_ranges_scratch_in_use_ = false;
+  std::vector<std::pair<uint32_t, uint32_t>> hot_filter_kept_scratch_;
   // Advanced at every point where the guest CPU may legitimately have changed
   // memory the GPU already read (see AdvanceHotCheckEpoch). 0 = never.
   std::atomic<uint32_t> hot_check_epoch_{1};
