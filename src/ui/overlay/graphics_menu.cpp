@@ -151,7 +151,7 @@ bool Save(const Values& v) {
   }
   const int scale = kScaleOptions[v.scale].value;
   std::fprintf(file,
-               "# Written by the in-game graphics menu (touchpad, or Create + Options).\n"
+               "# Written by the in-game graphics menu (touchpad + Options).\n"
                "# Loaded at startup after ps5-env.txt, so these settings win.\n"
                "REX_DRAW_RESOLUTION_SCALE_X=%d\n"
                "REX_DRAW_RESOLUTION_SCALE_Y=%d\n"
@@ -325,7 +325,7 @@ void GraphicsMenuDialog::OnDraw(ImGuiIO& io) {
       ImGui::TextColored(dim_color, "%s", state.status.c_str());
     }
     ImGui::Separator();
-    ImGui::TextColored(dim_color, "D-pad: choose and change    Circle / touchpad: close");
+    ImGui::TextColored(dim_color, "D-pad: choose and change    Circle: close");
   }
   ImGui::End();
 }

@@ -16,7 +16,7 @@ using OverlayComboCallback = void (*)(void* context);
 void SetOverlayComboCallback(OverlayComboCallback callback, void* context);
 void FireOverlayCombo();
 
-// The in-game settings menu (the DualSense touchpad, or Create + Options).
+// The in-game settings menu (Back + Start: on the PS5, touchpad click + Options).
 // Called on the input thread; the callback hands its work to the UI thread.
 using MenuButtonCallback = void (*)(void* context);
 void SetMenuButtonCallback(MenuButtonCallback callback, void* context);
