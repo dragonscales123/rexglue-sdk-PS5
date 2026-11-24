@@ -7981,8 +7981,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
-  for (LastTextureDescriptorSet& last : last_texture_descriptor_sets_) {
-    last.set = VK_NULL_HANDLE;
+  for (auto& stage_sets : last_texture_descriptor_sets_) {
+    for (LastTextureDescriptorSet& last : stage_sets) {
+      last.set = VK_NULL_HANDLE;
+    }
   }
   texture_transient_descriptor_sets_free_.clear();
   texture_transient_descriptor_sets_used_.clear();
@@ -9100,10 +9102,20 @@ bool VulkanCommandProcessor::UpdateBindings(const EncodeDrawPacket& packet,
   size_t stage_info_begin[2] = {vertex_texture_image_info_offset,
                                 pixel_texture_image_info_offset};
   size_t stage_info_end[2] = {pixel_texture_image_info_offset, image_info_end};
+  uint32_t texture_set_cache_slot[2];
   for (uint32_t stage = 0; stage < 2; ++stage) {
     const uint32_t set_bit = UINT32_C(1) << texture_set_indices[stage];
-    const LastTextureDescriptorSet& last = last_texture_descriptor_sets_[stage];
     const size_t info_count = stage_info_end[stage] - stage_info_begin[stage];
+    uint64_t set_hash = uint64_t(reinterpret_cast<uintptr_t>(texture_set_layouts[stage]));
+    for (size_t k = stage_info_begin[stage]; k < stage_info_end[stage]; ++k) {
+      const VkDescriptorImageInfo& info = descriptor_write_image_info_[k];
+      set_hash = (set_hash ^ uint64_t(reinterpret_cast<uintptr_t>(info.imageView)) ^
+                  (uint64_t(reinterpret_cast<uintptr_t>(info.sampler)) << 1)) *
+                 UINT64_C(0x9E3779B97F4A7C15);
+    }
+    texture_set_cache_slot[stage] = uint32_t(set_hash >> 58) & (kTextureSetCacheSize - 1);
+    const LastTextureDescriptorSet& last =
+        last_texture_descriptor_sets_[stage][texture_set_cache_slot[stage]];
     const bool same = info_count && last.set != VK_NULL_HANDLE && last.frame == frame_current_ &&
                       last.layout == texture_set_layouts[stage] &&
                       last.texture_count == stage_texture_counts[stage] &&
@@ -9218,7 +9230,8 @@ bool VulkanCommandProcessor::UpdateBindings(const EncodeDrawPacket& packet,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
         write_textures[0].dstSet;
-    LastTextureDescriptorSet& last = last_texture_descriptor_sets_[0];
+    LastTextureDescriptorSet& last =
+        last_texture_descriptor_sets_[0][texture_set_cache_slot[0]];
     last.frame = frame_current_;
     last.layout = texture_set_layouts[0];
     last.texture_count = texture_count_vertex;
@@ -9243,7 +9256,8 @@ bool VulkanCommandProcessor::UpdateBindings(const EncodeDrawPacket& packet,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
-    LastTextureDescriptorSet& last = last_texture_descriptor_sets_[1];
+    LastTextureDescriptorSet& last =
+        last_texture_descriptor_sets_[1][texture_set_cache_slot[1]];
     last.frame = frame_current_;
     last.layout = texture_set_layouts[1];
     last.texture_count = texture_count_pixel;
