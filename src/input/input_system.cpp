@@ -37,6 +37,11 @@ namespace rex::input {
 namespace {
 std::atomic<OverlayComboCallback> g_overlay_combo_callback{nullptr};
 std::atomic<void*> g_overlay_combo_context{nullptr};
+std::atomic<MenuButtonCallback> g_menu_button_callback{nullptr};
+std::atomic<void*> g_menu_button_context{nullptr};
+std::atomic<MenuNavCallback> g_menu_nav_callback{nullptr};
+std::atomic<void*> g_menu_nav_context{nullptr};
+std::atomic<bool> g_menu_input_captured{false};
 }  // namespace
 
 void SetOverlayComboCallback(OverlayComboCallback callback, void* context) {
@@ -47,6 +52,36 @@ void SetOverlayComboCallback(OverlayComboCallback callback, void* context) {
 void FireOverlayCombo() {
   if (OverlayComboCallback callback = g_overlay_combo_callback.load(std::memory_order_acquire)) {
     callback(g_overlay_combo_context.load(std::memory_order_relaxed));
+  }
+}
+
+void SetMenuButtonCallback(MenuButtonCallback callback, void* context) {
+  g_menu_button_context.store(context, std::memory_order_relaxed);
+  g_menu_button_callback.store(callback, std::memory_order_release);
+}
+
+void FireMenuButton() {
+  if (MenuButtonCallback callback = g_menu_button_callback.load(std::memory_order_acquire)) {
+    callback(g_menu_button_context.load(std::memory_order_relaxed));
+  }
+}
+
+void SetMenuNavCallback(MenuNavCallback callback, void* context) {
+  g_menu_nav_context.store(context, std::memory_order_relaxed);
+  g_menu_nav_callback.store(callback, std::memory_order_release);
+}
+
+void SetMenuInputCaptured(bool captured) {
+  g_menu_input_captured.store(captured, std::memory_order_release);
+}
+
+bool IsMenuInputCaptured() {
+  return g_menu_input_captured.load(std::memory_order_acquire);
+}
+
+void DispatchMenuNav(uint16_t xinput_button) {
+  if (MenuNavCallback callback = g_menu_nav_callback.load(std::memory_order_acquire)) {
+    callback(g_menu_nav_context.load(std::memory_order_relaxed), xinput_button);
   }
 }
 }  // namespace rex::input

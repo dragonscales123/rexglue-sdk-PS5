@@ -67,6 +67,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     DeviceId id;
     // Per pad rather than per guest user, so it survives reassignment.
     KeystrokeState keystroke;
+    // Buttons held when the settings menu let go of the pad: hidden from the
+    // game until released, so the button that closed the menu doesn't act.
+    uint16_t menu_suppressed_buttons;
   };
 
   // WindowListener

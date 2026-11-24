@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/assert.h>
+#include <rex/platform.h>
 #include <rex/cvar.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
@@ -26,6 +27,7 @@
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/overlay/graphics_menu.h>
 #include <rex/input/overlay_combo.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
@@ -255,6 +257,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     input_sys->SetActiveCallback([this]() {
       if (window_ && !window_->HasFocus())
         return false;
+      // The graphics menu has the controller.
+      if (rex::input::IsMenuInputCaptured())
+        return false;
       if (!imgui_drawer_ ||
           (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))
         return true;
@@ -430,6 +435,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
                         [this] { ToggleDebugOverlay(); });
   // Controllers (the PS5 has no keyboard): L3 + R3 toggles it too.
   rex::input::SetOverlayComboCallback(&ReXApp::OnOverlayCombo, this);
+#if REX_PLATFORM_PS5
+  rex::input::SetMenuNavCallback(&ReXApp::OnMenuNav, this);
+  rex::input::SetMenuButtonCallback(&ReXApp::OnMenuButton, this);
+#endif
   if (REXCVAR_GET(show_debug_overlay) && !debug_overlay_) {
     ToggleDebugOverlay();
   }
@@ -464,6 +473,35 @@ void ReXApp::ToggleDebugOverlay() {
   } else if (imgui_drawer_) {
     debug_overlay_ =
         std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
+  }
+}
+
+void ReXApp::OnMenuButton(void* context) {
+  auto* app = static_cast<ReXApp*>(context);
+  // Capture (or release) the controller at once, on the input thread, so no
+  // press slips through to the game while the UI thread catches up.
+  rex::input::SetMenuInputCaptured(!rex::input::IsMenuInputCaptured());
+  app->app_context().CallInUIThreadDeferred([app]() { app->SyncGraphicsMenu(); });
+}
+
+void ReXApp::OnMenuNav(void* context, uint16_t xinput_button) {
+  constexpr uint16_t kButtonB = 0x2000;  // Circle closes the menu.
+  if (xinput_button & kButtonB) {
+    OnMenuButton(context);
+    return;
+  }
+  ui::GraphicsMenuPushInput(xinput_button);
+}
+
+void ReXApp::SyncGraphicsMenu() {
+  if (shutting_down_ || !imgui_drawer_) {
+    return;
+  }
+  const bool want_open = rex::input::IsMenuInputCaptured();
+  if (want_open && !graphics_menu_) {
+    graphics_menu_ = std::make_unique<ui::GraphicsMenuDialog>(imgui_drawer_.get());
+  } else if (!want_open && graphics_menu_) {
+    graphics_menu_.reset();
   }
 }
 
@@ -605,6 +643,9 @@ void ReXApp::OnDestroy() {
 
   // Unregister overlay keybinds before destroying dialogs
   rex::input::SetOverlayComboCallback(nullptr, nullptr);
+  rex::input::SetMenuButtonCallback(nullptr, nullptr);
+  rex::input::SetMenuNavCallback(nullptr, nullptr);
+  rex::input::SetMenuInputCaptured(false);
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
@@ -620,6 +661,7 @@ void ReXApp::OnDestroy() {
   achievement_notification_.reset();
   achievements_overlay_.reset();
   settings_overlay_.reset();
+  graphics_menu_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();
   if (imgui_drawer_) {

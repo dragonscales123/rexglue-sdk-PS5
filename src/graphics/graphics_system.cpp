@@ -33,7 +33,7 @@
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -150,6 +150,14 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     return X_STATUS_UNSUCCESSFUL;
   }
   command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+  // Applied live (the in-game settings menu changes it). The callback runs
+  // under the cvar registry lock, so it only hands the value on.
+  rex::cvar::RegisterChangeCallback(
+      "swap_post_effect", [this](std::string_view, std::string_view value) {
+        if (command_processor_) {
+          command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(std::string(value)));
+        }
+      });
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF
@@ -196,6 +204,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 }
 
 void GraphicsSystem::Shutdown() {
+  rex::cvar::UnregisterChangeCallbacks("swap_post_effect");
   if (command_processor_) {
     command_processor_->Shutdown();
     command_processor_.reset();

@@ -273,6 +273,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void SetupOverlays(ui::Presenter* presenter, ui::ImmediateDrawer* drawer);
   void ToggleDebugOverlay();
   static void OnOverlayCombo(void* context);
+  // In-game graphics settings menu (touchpad, or Create + Options).
+  static void OnMenuButton(void* context);
+  static void OnMenuNav(void* context, uint16_t xinput_button);
+  void SyncGraphicsMenu();
 
   // WindowedApp overrides
   bool OnInitialize() override;
@@ -311,6 +315,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::DebugOverlayDialog> debug_overlay_;
   std::unique_ptr<ui::ConsoleDialog> console_overlay_;
   std::unique_ptr<ui::SettingsDialog> settings_overlay_;
+  std::unique_ptr<ui::ImGuiDialog> graphics_menu_;
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;

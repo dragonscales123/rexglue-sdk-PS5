@@ -347,11 +347,11 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
 }
 
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
-  if (swap_post_effect_desired_ == swap_post_effect) {
-    return;
-  }
-  swap_post_effect_desired_ = swap_post_effect;
-  CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
+  // An atomic store rather than CallInThread: this is called from the UI
+  // thread, and the pending function queue isn't thread-safe. The swap reads
+  // the effect once, so a change lands cleanly on the next frame.
+  swap_post_effect_desired_.store(swap_post_effect, std::memory_order_relaxed);
+  swap_post_effect_actual_.store(swap_post_effect, std::memory_order_relaxed);
 }
 
 void CommandProcessor::WorkerThreadMain() {

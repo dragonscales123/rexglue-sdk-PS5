@@ -354,6 +354,9 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   // Make sure packet_number is only incremented by 1, even if there have been
   // multiple updates between GetState calls. Also track `is_active` to
   // increment the packet number if it changed.
+  if (!is_active && rex::input::IsMenuInputCaptured()) {
+    controller->menu_suppressed_buttons = controller->state.gamepad.buttons;
+  }
   if ((is_active != controller->is_active) || (is_active && controller->state_changed)) {
     controller->state.packet_number++;
     controller->is_active = is_active;
@@ -364,6 +367,9 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.
     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
+  } else {
+    out_state->gamepad.buttons =
+        uint16_t(uint16_t(out_state->gamepad.buttons) & ~controller->menu_suppressed_buttons);
   }
   return X_ERROR_SUCCESS;
 }
@@ -459,7 +465,8 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
   // "unpressed". The algorithm will automatically send UP events when
   // 'is_active()' goes low and DOWN events when it goes high again.
   const uint64_t curr_butts =
-      is_active ? (static_cast<uint64_t>(static_cast<uint16_t>(controller->state.gamepad.buttons)) |
+      is_active ? (static_cast<uint64_t>(static_cast<uint16_t>(
+                       controller->state.gamepad.buttons & ~controller->menu_suppressed_buttons)) |
                    AnalogToKeyfield(controller->state.gamepad))
                 : uint64_t(0);
   KeystrokeState& last = controller->keystroke;
@@ -759,7 +766,19 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     REXLOG_INFO("SDL HID: Unknown button was pressed: {}.", event.gbutton.button);
     return;
   }
+  // The touchpad press opens and closes the settings menu; the game never
+  // sees it.
+  if (event.gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+    if (event.gbutton.down) {
+      REXLOG_INFO("[menu] touchpad pressed");
+      FireMenuButton();
+    }
+    return;
+  }
   auto xbutton = xbutton_lookup.at(event.gbutton.button);
+  if (!event.gbutton.down) {
+    controller.menu_suppressed_buttons &= ~xbutton;
+  }
   // Pressed or released?
   if (event.gbutton.down) {
     if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {
@@ -774,6 +793,18 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   if (event.gbutton.down && (xbutton & kThumbs) && (xbuttons & kThumbs) == kThumbs &&
       (controller.state.gamepad.buttons & kThumbs) != kThumbs) {
     FireOverlayCombo();
+  }
+  // Create + Options together also open the settings menu (for pads without
+  // a touchpad button).
+  constexpr uint16_t kMenuCombo = X_INPUT_GAMEPAD_BACK | X_INPUT_GAMEPAD_START;
+  const bool menu_combo = event.gbutton.down && (xbutton & kMenuCombo) &&
+                          (xbuttons & kMenuCombo) == kMenuCombo &&
+                          (controller.state.gamepad.buttons & kMenuCombo) != kMenuCombo;
+  if (event.gbutton.down && rex::input::IsMenuInputCaptured() && !menu_combo) {
+    DispatchMenuNav(xbutton);
+  }
+  if (menu_combo) {
+    FireMenuButton();
   }
   controller.state.gamepad.buttons = xbuttons;
   controller.state_changed = true;
