@@ -340,6 +340,9 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
+      if (add_bits & ~scaled_resolve_pages_[i]) {
+        scaled_resolve_generation_.fetch_add(1, std::memory_order_relaxed);
+      }
       scaled_resolve_pages_[i] |= add_bits;
       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
     }
@@ -810,6 +813,17 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
+    // Whether the texture's memory holds scaled resolves only changes when
+    // resolved pages are added or invalidated (the generation): remember the
+    // answer per key instead of working out the layout and taking the global
+    // lock every time (this runs for most texture binding changes at 2x).
+    const uint64_t generation = scaled_resolve_generation_.load(std::memory_order_relaxed);
+    ScaledResolveMemo& memo = scaled_resolve_memo_[RecentTextureIndex(key) &
+                                                   (scaled_resolve_memo_.size() - 1)];
+    if (memo.generation == generation && memo.key == key) {
+      key.scaled_resolve = memo.scaled ? 1 : 0;
+    } else {
+    const TextureKey memo_key = key;
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
          IsRangeScaledResolved(key.base_page << 12,
@@ -818,6 +832,10 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
          IsRangeScaledResolved(key.mip_page << 12,
                                scaled_resolve_guest_layout.mips_total_extent_bytes))) {
       key.scaled_resolve = 1;
+    }
+    memo.key = memo_key;
+    memo.generation = generation;
+    memo.scaled = key.scaled_resolve != 0;
     }
   }
 
@@ -1165,6 +1183,9 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       }
       if (resolve_block_index == resolve_block_last && (resolve_page_last & 31) != 31) {
         resolve_keep_bits |= ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
+      }
+      if (scaled_resolve_pages_[resolve_block_index] & ~resolve_keep_bits) {
+        scaled_resolve_generation_.fetch_add(1, std::memory_order_relaxed);
       }
       scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
       if (scaled_resolve_pages_[resolve_block_index] == 0) {

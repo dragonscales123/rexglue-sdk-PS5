@@ -661,6 +661,15 @@ class TextureCache {
 
   uint64_t textures_total_host_memory_usage_ = 0;
 
+  // FindOrCreateTexture's scaled resolve decisions (preparation thread only).
+  std::atomic<uint64_t> scaled_resolve_generation_{1};
+  struct ScaledResolveMemo {
+    TextureKey key;
+    uint64_t generation = 0;
+    bool scaled = false;
+  };
+  std::array<ScaledResolveMemo, 512> scaled_resolve_memo_{};
+
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;
 
