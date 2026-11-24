@@ -9061,7 +9061,8 @@ bool VulkanCommandProcessor::UpdateBindings(const EncodeDrawPacket& packet,
   // this frame where they are the same (most consecutive draws keep their
   // textures), instead of allocating, writing and binding a new one for every
   // draw.
-  descriptor_write_image_info_ = packet.image_infos;
+  // Read in place (no per-draw copy of the vector).
+  const std::vector<VkDescriptorImageInfo>& descriptor_write_image_info_ = packet.image_infos;
   size_t vertex_texture_image_info_offset = packet.image_info_texture_offsets[0];
   size_t vertex_sampler_image_info_offset = packet.image_info_sampler_offsets[0];
   size_t pixel_texture_image_info_offset = packet.image_info_texture_offsets[1];
