@@ -183,6 +183,11 @@ REXCVAR_DEFINE_BOOL(vulkan_trace_trail_draws, false, "GPU/Vulkan",
                     "Diagnostic: log per-second counts of Fable II's glowing trail draws.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_encode_scaled_resolves, true, "GPU/Vulkan",
+                    "With draw resolution scaling, still run resolves on the encoding thread "
+                    "(instead of draining it for every resolve). The scaled resolve buffer's "
+                    "barriers are recorded at preparation.");
+
 REXCVAR_DEFINE_BOOL(skip_depth_clear_transfers, true, "GPU/Vulkan",
                     "Do not copy old depth into a render target for a rectangle that overwrites "
                     "all depth and stencil across its width, like a Direct3D 9 depth clear. "
@@ -6491,7 +6496,8 @@ bool VulkanCommandProcessor::IssueCopy() {
   if (encode_thread_enabled_ && REXCVAR_GET(vulkan_encode_resolves) &&
       readback_mode == ReadbackResolveMode::kDisabled &&
       !ShouldForceReadbackResolve(register_file_->values[XE_GPU_REG_RB_COPY_DEST_BASE]) &&
-      !render_target_cache_->IsDrawResolutionScaled()) {
+      (!render_target_cache_->IsDrawResolutionScaled() ||
+       REXCVAR_GET(vulkan_encode_scaled_resolves))) {
     // The memory and texture side here, in preparation order (later draws'
     // preparation sees the resolved range); the render target side on the
     // encoding thread, after the draws before it and with the registers as of

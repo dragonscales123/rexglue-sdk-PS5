@@ -1156,6 +1156,7 @@ bool VulkanRenderTargetCache::PrepareResolve(const RegisterFile& regs,
   has_work_out = false;
   prepared.copy_dest_committed = false;
   prepared.copy_shader = draw_util::ResolveCopyShaderIndex::kUnknown;
+  prepared.scaled_write_recorded = false;
 
   if (!draw_util::GetResolveInfo(regs, memory, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
@@ -1202,6 +1203,19 @@ bool VulkanRenderTargetCache::PrepareResolve(const RegisterFile& regs,
         "VulkanRenderTargetCache: Failed to obtain the resolve destination "
         "memory region");
     return true;
+  }
+  if (IsDrawResolutionScaled() && command_processor_.IsPrepRecording()) {
+    // The scaled resolve buffer's usage is tracked on the preparation thread
+    // (texture loads read it there): record the write barrier here, into this
+    // resolve's preparation commands, which run right before the copy.
+    uint64_t use_start_scaled, use_length_scaled;
+    if (texture_cache.GetScaledResolveRange(resolve_info.copy_dest_extent_start,
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_shader_info.dest_bpe_log2, use_start_scaled,
+                                            use_length_scaled)) {
+      texture_cache.UseScaledResolveBufferForWrite(use_start_scaled, use_length_scaled);
+      prepared.scaled_write_recorded = true;
+    }
   }
   // Invalidate textures and mark the range as scaled if needed - here, in
   // preparation order, so the textures of the draws prepared after this see it
@@ -1314,7 +1328,10 @@ bool VulkanRenderTargetCache::ExecuteResolve(const PreparedResolve& prepared,
 
           // Submit the resolve.
           if (draw_resolution_scaled) {
-            texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
+            if (!prepared.scaled_write_recorded) {
+              texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start,
+                                                           copy_dest_use_length);
+            }
           } else {
             shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
                               std::pair<uint32_t, uint32_t>(uint32_t(copy_dest_use_start),

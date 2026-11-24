@@ -124,6 +124,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     draw_util::ResolveInfo info;
     draw_util::ResolveCopyShaderIndex copy_shader = draw_util::ResolveCopyShaderIndex::kUnknown;
     bool copy_dest_committed = false;
+    // The scaled resolve buffer's write barrier was recorded at preparation
+    // (with the texture loads' read barriers, in preparation order), so the
+    // encoding side doesn't touch the buffer's usage tracking.
+    bool scaled_write_recorded = false;
   };
   bool PrepareResolve(const RegisterFile& regs, const memory::Memory& memory,
                       VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
