@@ -4055,6 +4055,22 @@ void VulkanCommandProcessor::QueueEncodeDrawPacket() {
   // Publish.
   encode_packet_preparing_ = nullptr;
   uint64_t head = ++encode_ring_head_prepared_;
+  if (encode_thread_enabled_ && head - encode_ring_tail_cached_ < kEncodeRingSize - 8) {
+    // The next packet's slot was last used by the encoding thread a whole ring
+    // ago: pull it into this core's cache for writing now, instead of taking
+    // its misses one field at a time while the next draw is prepared.
+    const EncodeDrawPacket& next = encode_ring_[head & (kEncodeRingSize - 1)];
+    const char* next_bytes = reinterpret_cast<const char*>(&next);
+    for (size_t offset = 0; offset < sizeof(EncodeDrawPacket); offset += 64) {
+      __builtin_prefetch(next_bytes + offset, 1, 3);
+    }
+    if (!next.register_values.empty()) {
+      const char* values = reinterpret_cast<const char*>(next.register_values.data());
+      for (size_t offset = 0; offset < 512; offset += 64) {
+        __builtin_prefetch(values + offset, 1, 3);
+      }
+    }
+  }
   if (encode_thread_enabled_ && packet.has_draw && !packet.deferred_requests.empty()) {
     // Forget the requests made already (cached tail - never ahead), keeping
     // the list short.
